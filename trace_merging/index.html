@@ -70,42 +70,33 @@
 
 <main id="top">
 <h1>Trace merging lines up files from different machines well, but two files from one phone need care</h1>
-<p class="lead">Perfetto’s Trace Processor can load several trace files as one trace, on one timeline.
-Files from different machines line up through a measured offset or their wall clocks.
-Two files from the same phone can merge wrongly, and most of these failures load without any error.</p>
+<p class="lead">Modern systems debugging routinely crosses trace boundaries: an Android host and its guest VM, a phone and a companion watch or car head unit, or a continuous background ring buffer paired with a targeted profiling trace on the same phone.
+Trace Processor can merge all of them onto one timeline, yet cross-machine merges and same-device merges behave very differently—and most same-device pitfalls load without a single error.</p>
 <p class="m">Code excerpts are from the upstream Perfetto repository at commit <code>9843f023eb</code> (8 October 2026). Paths are relative to
 <code>src/trace_processor/</code> unless stated. Excerpts marked <em>shape</em> are simplified. The rest are quoted with comments trimmed.
 Symbols are given instead of line numbers.</p>
 
 <h2 id="glance">At a glance</h2>
 <ul>
-<li><b>What merging does.</b> It puts several files on one timeline and in one set of SQL tables, and keeps each event tied to its machine.</li>
-<li><b>Across machines.</b> Machines recorded together are aligned by a measured offset. Machines recorded apart are aligned through their wall clocks.</li>
-<li><b>On one phone.</b> Two files share thread identity, so they join. But scheduler data that both recorded is stored twice, and a reboot between them misplaces the second file.</li>
-<li><b>Usually silent.</b> Most of these failures load without an error. The queries in Section 17 catch them.</li>
-<li><b>What to do.</b> Merge one phone’s files onto one machine only if they share a boot and do not record the same kind of data. Otherwise give each file its own machine name.</li>
+<li><b>Why trace merging exists.</b> Virtualized guests (<code>pKVM</code>, Cuttlefish, ARCVM), multi-device interactions, and split ring-buffer + profiling sessions produce separate trace streams that engineers need on one timeline and one set of SQL tables.</li>
+<li><b>Cross-machine merges are cleanly isolated.</b> Machines recorded live via <code>traced_relay</code> align by round-trip offset measurements, while separately recorded devices align via wall clocks and keep separate PID/CPU namespaces.</li>
+<li><b>Same-phone merges share identity, not event trackers.</b> Loading two files onto one machine lets threads join via shared <code>utid</code>, but per-file trackers duplicate overlapping scheduler rows, split thread tracks, and misplace traces across reboots.</li>
+<li><b>Failures are mostly silent.</b> Overlapping ftrace streams and post-reboot clock collisions raise zero import errors; the SQL checks in Section 17 catch them.</li>
+<li><b>Practical rule.</b> Merge one phone’s files onto a single machine only when they come from the same boot and record disjoint data sources; otherwise isolate each file under its own manifest machine name.</li>
 </ul>
-<p><b>Terms.</b> <b>Trace time</b> is the one shared clock that every event is placed on.
-A <b>machine</b> is one device or VM as Trace Processor models it. Each file is assigned to one machine.
-An <b>archive</b> is a TAR or ZIP file whose members are the traces.
-A <b>manifest</b> is an optional JSON member of the archive that names each file’s machine and relates clocks.
-The <b>primary</b> file is the first file read on a machine. Later files on that machine are <b>secondary</b>.
-A <b>proto trace</b> is a trace in Perfetto’s own protobuf format, such as a <code>.pftrace</code> file.
-A <b>data source</b> is one kind of data a trace records, such as kernel scheduler events or stack samples.
-<code>traced</code> is Perfetto’s tracing service, and <code>traced_relay</code> forwards a guest machine’s (VM’s) trace data to the host’s <code>traced</code>.</p>
+<p><b>Terms.</b> <b>Trace time</b> is the single global timeline onto which Trace Processor converts every event.
+A <b>machine</b> is one OS instance (physical device or VM) with its own PID, TID, and CPU namespace; every imported file is assigned to one machine.
+An <b>archive</b> is a TAR or ZIP container bundling multiple traces, optionally paired with a JSON <b>manifest</b> (<code>perfetto_manifest.json</code>) that assigns machine names and clock pins.
+The first file parsed on a machine is its <b>primary</b> file; subsequent files on that machine are <b>secondary</b>.
+A <b>proto trace</b> is a binary file in Perfetto’s native protobuf wire format (<code>.pftrace</code>), and a <b>data source</b> is one producer stream such as kernel scheduler events or callstack samples.
+<code>traced</code> is Perfetto’s system tracing daemon, and <code>traced_relay</code> forwards a guest VM’s trace packets to the host’s <code>traced</code>.</p>
 
 <!-- ═════════════════════════ OVERVIEW ═════════════════════════ -->
-<h2 id="overview">Merging puts several files on one timeline and one set of tables</h2>
-<p>One trace is often not enough, so Trace Processor can merge several. A host and its VM, two phones talking to each other,
-or one phone recorded by two tracing sessions each produce their own file. <b>Trace Processor</b> is Perfetto’s engine that
-imports traces into SQL tables. Merging lets you follow cause and effect across the files.</p>
-<p>Merging has three jobs:</p>
-<ul>
-  <li>Place every event on trace time.</li>
-  <li>Keep every event tied to its machine, so that pid 1500 on a phone and on a VM stay different processes.</li>
-  <li>Keep state that belongs to one file inside that file. Examples are clocks private to one writer (Section 1) and
-  <b>interned strings</b>: strings sent once with a short id that later packets refer to.</li>
-</ul>
+<h2 id="overview">Why multi-trace merging exists—and why cross-machine and same-machine merges diverge</h2>
+<p>A single tracing session used to capture everything happening on a phone. Three everyday workflows broke that assumption: host-and-guest virtualization (such as Android hosts running <code>pKVM</code>, Cuttlefish, or ARCVM guests over <code>traced_relay</code>), multi-device interactions (a phone talking to a watch, headset, or car unit recorded separately), and concurrent sessions on one phone (a low-overhead background ring buffer capturing kernel scheduling alongside a targeted stack-sampling or app trace).</p>
+<p>Putting multiple trace files onto one SQL timeline has to solve two hard systems problems before a single cross-trace query works.</p>
+<p><b>First, raw timestamps cannot be compared across clock boundaries.</b> Most Android and Linux events record <code>CLOCK_BOOTTIME</code>—nanoseconds since the kernel booted. Two devices booted at different times have unrelated <code>CLOCK_BOOTTIME</code> origins, and independent crystal oscillators slowly drift apart even after alignment. Even on one device, user-space writers emit <code>CLOCK_MONOTONIC</code> (which pauses during suspend), <code>CLOCK_REALTIME</code> (which jumps on NTP adjustments), or private sequence-delta clocks. Trace Processor therefore maintains a global clock-snapshot graph that converts every domain onto one chosen <em>trace time</em> via periodic snapshots, four-timestamp round-trip measurements, or wall-clock fallbacks (Part I).</p>
+<p><b>Second, Trace Processor’s single-machine origins create a sharp split between multi-machine and same-machine merges.</b> Originally, one loaded trace meant one machine with one global PID, TID, and CPU namespace. Retrofitting <code>machine_id</code> plus per-file <code>trace_file_id</code> isolated separate machines cleanly: a phone and a VM get distinct process and CPU rows, so PID 1500 on each never collides. Merging two files onto the <em>same</em> machine had to compromise: Trace Processor shares per-machine process and CPU trackers so a thread gets one shared <code>utid</code> across both files, while keeping stateful event trackers—open scheduler slices, slice stacks, interned tracks, and secondary clock nodes—isolated per file. When two files on one phone record disjoint data sources during one boot, that split works as intended. When both record ftrace scheduler events or span a reboot, each file’s stateful trackers assume they own the sole event stream, silently duplicating <code>sched</code> rows, splitting tracks, or misplacing whole traces (Parts II and III).</p>
 
 <div class="cards">
   <div class="card"><div class="lbl">What works</div>
@@ -189,13 +180,12 @@ phone (Section 15). “ctx(trace 1, m 0)” is the context for trace file 1 on m
 <!-- ═════════════════════════ PART I ═════════════════════════ -->
 <div class="part">Part I · Clocks</div>
 
-<h2 id="clocks"><span class="n">1</span>A timestamp means nothing until you know its clock and its machine</h2>
-<p>Two files can share a timeline only once you know what their timestamps mean. A timestamp is a reading of some clock, and
-the number alone does not say which clock or which machine. Trace Processor calls each distinct clock it tracks a
-<b>clock domain</b>: one clock on one machine. For the private clocks in the table, the domain is also limited to one file or one sequence.</p>
-<p>Timestamps in the same domain compare directly. Timestamps in different domains cannot be compared until something relates them.
-Linux exposes several clocks, and Perfetto names them in <code>BuiltinClock</code>
-(<code>protos/perfetto/common/builtin_clock.proto</code>):</p>
+<h2 id="clocks"><span class="n">1</span>A timestamp means nothing until you know its clock domain and machine</h2>
+<p>Part I explains how Trace Processor aligns independent hardware and kernel clocks onto one shared timeline.
+Why doesn't every producer simply stamp events with one universal clock? Kernel subsystems, user-space libraries, and external JSON or systrace converters face different constraints: some clocks pause when CPUs suspend, wall clocks jump when NTP steps time, and high-throughput app writers emit compact varint deltas relative to a private per-thread sequence clock.</p>
+<p>A raw 64-bit integer therefore means nothing until qualified by its <b>clock domain</b>—one specific clock on one machine (and, for writer-local clocks, inside one trace file or sequence).
+Timestamps in the same domain compare directly; timestamps in different domains cannot be ordered until an explicit offset relates them.
+Linux exposes several hardware-backed and wall clocks, which Perfetto enumerates in <code>BuiltinClock</code> (<code>protos/perfetto/common/builtin_clock.proto</code>):</p>
 <table>
   <thead><tr><th>Clock</th><th>Id</th><th>What it counts</th></tr></thead>
   <tbody>
@@ -247,10 +237,9 @@ Two files from the same boot of the same device can share BOOTTIME directly. Two
 something different on each, and only a measured offset or the wall clock can relate them.
 </blockquote>
 
-<h2 id="graph"><span class="n">2</span>Clock snapshots link clocks into a graph that can convert any timestamp</h2>
-<p>Because offsets change, a trace records them as it goes, in clock snapshots. A <b>clock snapshot</b> is a set of clocks read
-back to back, close enough to count as the same instant. Each one says “when clock A read X, clock B read Y”. That gives the offset
-between A and B at that moment.</p>
+<h2 id="graph"><span class="n">2</span>Periodic snapshots link drifting clocks into a multi-hop conversion graph</h2>
+<p>A single startup offset between two clocks is not enough: as soon as a phone suspends or NTP steps the wall clock, static offsets go stale, and custom sequence clocks only ever snapshot against one builtin clock rather than all of them.
+Instead, a trace records time-varying relationships as a stream of <b>clock snapshots</b>—sets of clocks read back to back closely enough to represent one instant (“when clock A read X, clock B read Y”).</p>
 <p><code>traced</code> takes a snapshot when a session starts and writes it first in every trace. It also takes periodic snapshots
 into a small ring, a fixed-size buffer where each new entry replaces the oldest. It keeps a new one only if some clock drifted by at least 10 ms against BOOTTIME since the last one.
 Section 18 lists the code behind each of these rules.</p>
@@ -332,11 +321,9 @@ Between snapshots the offset is assumed constant. That is exact for BOOTTIME ↔
 MONOTONIC across a suspend until the next snapshot (Section 15).
 </blockquote>
 
-<h2 id="remote"><span class="n">3</span>Machines recorded together are aligned by timing a round trip</h2>
-<p>Machines recorded together through <code>traced_relay</code> are aligned by timing messages between them. Two machines cannot
-read each other’s clocks at one instant, because any message takes an unknown time to arrive. NTP solves this by timing a
-<b>round trip</b>: send a message, get the reply, and note both send and receive times. It assumes both directions take equally
-long, so the remote reading belongs at the midpoint.</p>
+<h2 id="remote"><span class="n">3</span>Host and guest machines align clocks by timing four-timestamp round trips</h2>
+<p>Local snapshots work because one CPU can read its own <code>BOOTTIME</code>, <code>MONOTONIC</code>, and <code>REALTIME</code> registers within nanoseconds. Across a VM boundary or IPC link, neither kernel can read the other’s clock directly, and every message crosses variable transport delay.
+When a host and guest record together via <code>traced_relay</code>, Perfetto solves that the same way NTP does—by timing symmetric <b>round trips</b> and placing the remote clock reading at the midpoint between send and receive.</p>
 <p><code>traced_relay</code> does this with four timestamps per round, and each timestamp is a full clock snapshot (Figure 5).
 The <b>client</b> is the guest machine running <code>traced_relay</code>. The <b>host</b> runs <code>traced</code>.</p>
 <ol>
@@ -398,10 +385,9 @@ A relay-recorded trace aligns machines by one constant offset. It is averaged ov
 with distance from those rounds.
 </blockquote>
 
-<h2 id="bridge"><span class="n">4</span>Files nothing measured are placed by the wall clock or by assuming one boot</h2>
-<p>A file with no measured link to trace time gets a fallback link: the wall clock if it is on another machine and both sides
-have one, otherwise a same-boot guess. Most merges are like this: two files recorded separately, with no <code>RemoteClockSync</code>
-between them.</p>
+<h2 id="bridge"><span class="n">4</span>Unmeasured files fall back to a wall-clock rendezvous or a same-boot identity assumption</h2>
+<p>Most multi-file merges have no live <code>RemoteClockSync</code> channel: a phone and a companion watch were recorded independently, or two separate tracing sessions on one phone were packed into a TAR archive after the fact.
+Without a measured link to trace time, Trace Processor has to synthesize a fallback bridge—joining wall clocks if the file belongs to another machine, or assuming shared boot time if it sits on the same machine.</p>
 <p>Trace Processor plans the fallback when it opens the file. It registers a <b>deferred clock sync</b>: a reminder to link the
 clock the format’s timestamps use, which is BOOTTIME for proto, to trace time later. The link is added only at the file’s first
 timestamp conversion, and only if nothing better relates the two clocks by then. At that point Trace Processor tries four things
@@ -461,9 +447,9 @@ is tied by Step 3. Both cases assume the files share one boot.
 <!-- ═════════════════════════ PART II ═════════════════════════ -->
 <div class="part">Part II · How Trace Processor merges</div>
 
-<h2 id="inputs"><span class="n">5</span>There are three ways to hand Trace Processor several machines’ data</h2>
-<p>How the files reach Trace Processor decides which machine each file belongs to. Part I showed how clocks get related. There
-are three shapes of input:</p>
+<h2 id="inputs"><span class="n">5</span>Three container paths pack multiple trace streams through a single-stream ingestion API</h2>
+<p>Part II traces how multi-file and multi-machine isolation was retrofitted onto an engine built to read one byte stream from one machine.
+Because Trace Processor’s public ingestion API accepts a single stream, multiple trace sources enter through one of three container shapes—and that choice governs both machine assignment and clock wiring:</p>
 <table>
   <thead><tr><th>Input</th><th>How machines are separated</th><th>How clocks are related</th></tr></thead>
   <tbody>
@@ -485,10 +471,9 @@ then runs a tokenize-only pass over the archive and warns if any events were dro
 and converts its timestamps but skips the parsing stage that fills the event tables. It does not detect the duplicate rows of
 Sections 11 and 12. Section 18 lists the stats it checks.</p>
 
-<h2 id="archive"><span class="n">6</span>File type and name, not archive order, decide which file anchors the others</h2>
-<p>Trace Processor reads archive members sorted by file type first and name second, not in the order they sit in the archive.
-Order matters for two reasons. The manifest must be read before the files it configures. And the first trace read on a machine
-becomes its anchor: the file whose clocks the others are tied to (Section 7).</p>
+<h2 id="archive"><span class="n">6</span>Archive members sort by format priority and name so manifests and anchor clocks run first</h2>
+<p>Reading TAR or ZIP entries in raw archive order would make merges brittle: a manifest packed at the end of a tarball would arrive after the files it configures, a secondary JSON file would fail to convert timestamps before the primary proto trace registered its snapshots, and symbol files would run before binary mappings existed.
+<code>TarTraceReader</code> therefore buffers the archive directory, classifies every member by format priority, and sorts by <code>(priority, name, index)</code> before parsing a single event.</p>
 <p>So <code>TarTraceReader</code> first reads the whole archive. It skips hidden members, where any part of the path starts with a dot, such as macOS <code>._foo</code> files.
 It records each other member, guesses its format from the first bytes and sorts it. At the end of the input it walks the sorted
 list. Each member is parsed completely before the next one starts. The sort key is (priority, name, position):</p>
@@ -546,9 +531,9 @@ To pick the anchor file, give all trace members the same compression and prefix 
 <code>.pftrace</code> with <code>.pftrace.gz</code> members makes the raw one primary whatever it is called.
 </blockquote>
 
-<h2 id="ids"><span class="n">7</span>Each clock is keyed by machine and file, and the first file to claim trace time sets it</h2>
-<p>All clocks of all files live in one graph, so each clock node needs a name that cannot collide. That name, <code>ClockId</code>,
-has four fields:</p>
+<h2 id="ids"><span class="n">7</span>Four-part ClockIds isolate per-file clocks while letting the first file claim trace time</h2>
+<p>Once multiple machines and multiple files share one global <code>ClockSynchronizer</code>, keying nodes by builtin clock ID alone would immediately collide: guest <code>BOOTTIME</code> would overwrite host <code>BOOTTIME</code>, and a secondary app trace on machine 0 could shift the system trace’s clock snapshots.
+Trace Processor avoids collisions by qualifying every graph node with a four-field <code>ClockId</code>:</p>
 <pre><code><span class="src">util/clock_synchronizer.h · ClockId (trimmed)</span>struct ClockId {
   uint32_t clock_id = 0;       <span class="c">// BuiltinClock, or 64..127 for sequence clocks</span>
   uint32_t seq_id = 0;         <span class="c">// trusted_packet_sequence_id, sequence clocks only</span>
@@ -663,9 +648,10 @@ A measured offset (RemoteClockSync) or an asserted one (written in a manifest) a
 </svg>
 </figure>
 
-<h2 id="scopes"><span class="n">8</span>Files on one machine share thread identity but keep separate bookkeeping</h2>
-<p>Two files on one machine share who each thread and CPU is, but each keeps its own record of what is in progress. That split
-decides what merges and what gets duplicated. Clocks are only half of merging. The other half is which importer state two files share.</p>
+<h2 id="scopes"><span class="n">8</span>Retrofitting MachineId and TraceId split importer state into four scopes—sharing threads while isolating trackers</h2>
+<p>Clock alignment is only half of merging. The other half is deciding which stateful C++ trackers two files share.
+Originally, one <code>TraceProcessorContext</code> owned one global set of trackers because one trace meant one machine.
+Supporting both multi-machine traces and multi-file archives forced a four-way split: two files on the <em>same</em> machine must share thread and CPU tables so cross-file SQL joins work on <code>utid</code> and <code>ucpu</code>, yet they cannot share per-stream parser state like sequence tables or open slice stacks—and that exact boundary decides what merges cleanly and what duplicates in Part III.</p>
 <p>Trace Processor turns parsed events into rows through <b>trackers</b>. Each tracker owns one kind of data and remembers state
 between events. For example, the process tracker maps a pid to a thread row. The slice tracker keeps the stack of open
 <b>slices</b>, the named, nestable intervals that trace sections become. Whether two files get the same tracker or separate ones
@@ -746,10 +732,9 @@ Putting two files on one machine is what lets a stack sample in one file join a 
 It is also what lets their per-file trackers write overlapping rows for that same utid or ucpu.
 </blockquote>
 
-<h2 id="secondary"><span class="n">9</span>A second file on one machine gets private clocks, and an early timestamp can cut it off</h2>
-<p>A secondary file moves to private clock nodes at its first snapshot, so that it cannot change how the primary file converts.
-Both files carry clock snapshots. If the second file’s snapshots went into the shared canonical nodes, they could shift the first
-file’s timestamps. The code comment gives the example of an in-app trace next to a system trace.</p>
+<h2 id="secondary"><span class="n">9</span>Lazy clock isolation protects the primary trace—unless an early timestamp consumes the bridge</h2>
+<p>When two files land on the same machine, a subtle tension arises in the clock graph: snapshot-less secondary formats (such as Chrome JSON or plain systrace text) need to borrow the primary file’s canonical clock snapshots, whereas a secondary proto trace carries its own snapshots that must not perturb the primary file’s conversions (for example, an in-app trace loaded alongside a system trace).
+<code>ClockTracker</code> resolves this lazily by starting every secondary file on canonical tag <code>0</code> and flipping it to private file tag <i>k</i> upon its first <code>ClockSnapshot</code>.</p>
 <p>The switch happens in <code>ClockTracker::AddSnapshot</code>, on the highlighted line:</p>
 <pre><code><span class="src">importers/common/clock_tracker.cc · AddSnapshot</span>if (PERFETTO_UNLIKELY(!is_primary_ &amp;&amp; current_file_tag_ == 0)) {
   if (PERFETTO_UNLIKELY(num_conversions_ &gt; 0)) {
@@ -849,13 +834,11 @@ Giving the file its own machine name in a manifest avoids the problem. It then b
 <!-- ═════════════════════════ PART III ═════════════════════════ -->
 <div class="part">Part III · Where same-machine merging breaks</div>
 
-<h2 id="cat"><span class="n">10</span>Joining traces with cat makes unrelated writers share state</h2>
-<p>Gluing two trace files together with <code>cat</code> gives a file that loads, but it is still one trace, and the two halves
-mix up their writers. This part lists where merging gives wrong or missing results when the files come from one device. Skipping
-the archive is the first trap.</p>
-<p>A Perfetto proto trace is a sequence of length-prefixed packets, so <code>cat a.pftrace b.pftrace</code> parses. But it has one
-context, one reader and one table of per-sequence state, keyed by sequence id. <code>traced</code> numbers sequences per session:
-1 for the service, then counting up for writers in the order they appear. So the two halves reuse the same ids for unrelated writers (Figure 12).</p>
+<h2 id="cat"><span class="n">10</span>Concatenating proto files with cat collides per-session writer sequence IDs</h2>
+<p>Part III examines the six failure modes that hit when merging multiple files from one device—most of them direct consequences of the four-scope split in Section 8.
+The first failure mode happens before archives even enter the picture: because a Perfetto protobuf trace is just a stream of length-delimited <code>TracePacket</code> messages, engineers often try <code>cat a.pftrace b.pftrace &gt; merged.pftrace</code>.
+That concatenated file loads without a wire-format error, yet Trace Processor treats it as one single file with one <code>ProtoTraceReader</code>—forcing unrelated writers from the two sessions onto the same per-sequence state table.</p>
+<p><code>traced</code> numbers <code>trusted_packet_sequence_id</code> per session—1 for the service, then counting up from 2 as producers connect—so the second half reuses the exact sequence IDs of the first half for completely different threads (Figure 12).</p>
 
 <figure>
 <figcaption><b>Figure 12. After cat, two unrelated writers share one sequence id. An archive keeps them apart.</b>
@@ -905,10 +888,10 @@ Each session numbers its writers from the start, so the ids collide.</figcaption
 Never merge Perfetto traces with <code>cat</code>. Pack them into a TAR instead, for example with <code>trace_processor util merge</code> (Section 5).
 </blockquote>
 
-<h2 id="tracks"><span class="n">11</span>The same thread recorded by two files gets two tracks</h2>
-<p>When two files on one machine record slices for the same thread, Trace Processor creates two tracks for it, and the slices never
-nest. A <b>track</b> is a timeline that events hang off: a row in the track table that slices or counter values point to, drawn
-as one lane in the UI. The two files’ slices should share one track so that they nest and line up.</p>
+<h2 id="tracks"><span class="n">11</span>Per-file TrackTrackers split one thread’s slices across duplicate UI tracks</h2>
+<p>Switching from <code>cat</code> to a proper TAR archive isolates sequence IDs, yet immediately exposes the scoping split from Section 8: <code>ProcessTracker</code> is shared per machine while <code>TrackTracker</code> and <code>SliceTracker</code> are forked per <code>(trace, machine)</code>.
+A <b>track</b> is a row in the <code>track</code> table—rendered as one horizontal lane in the UI—onto which slices or counter samples attach.
+When two files on one machine both emit slices for the same thread, you want one shared lane so nested intervals stack together; instead, Trace Processor allocates two separate tracks whose slices never nest.</p>
 <p>They do not, because each file creates its own tracks. The track tracker creates each track once and reuses it. It looks tracks
 up in its own map, keyed by a hash of the track’s <b>blueprint</b> and its dimensions. The blueprint is the track’s type, such as
 “thread execution”. A dimension is a key such as the utid:</p>
@@ -957,12 +940,10 @@ If both files on one machine trace the same thread or counter, expect two tracks
 with the Section 17 query before aggregating.
 </blockquote>
 
-<h2 id="sched"><span class="n">12</span>Scheduler data recorded by both files is stored twice</h2>
-<p>If both files recorded scheduler events for the same time, every scheduling row in that time is stored twice. Most CPU and
-latency analyses start from the sched and thread_state tables. Both tables assume one row per thread or CPU at any instant.</p>
-<p>Each file’s ftrace scheduler tracker handles its own copy of the same kernel events. Each tracker remembers, per CPU, which slice
-is open and which pid was switched in. But both look up CPUs and threads in the shared per-machine trackers. So both write into the
-one sched table, with the same ucpu:</p>
+<h2 id="sched"><span class="n">12</span>Overlapping ftrace streams duplicate every sched row and strand boundary slices open</h2>
+<p>Duplicate UI tracks are a visual nuisance. Overlapping kernel scheduler streams corrupt analytical queries outright.
+Almost every CPU-utilization and scheduling-latency query assumes the <code>sched</code> and <code>thread_state</code> tables hold non-overlapping intervals per CPU and per thread.
+Because <code>FtraceSchedEventTracker</code> and <code>ThreadStateTracker</code> live in the <code>PerTraceAndMachine</code> scope while <code>CpuTracker</code> and <code>ProcessTracker</code> live in <code>PerMachine</code>, two files that both record <code>sched_switch</code> during an overlapping window each run an independent state machine that writes duplicate intervals onto the exact same <code>ucpu</code> and <code>utid</code> rows:</p>
 <pre><code><span class="src">importers/ftrace/ftrace_sched_event_tracker.cc · PushSchedSwitch (shape)</span>auto* pending_sched = sched_event_state_.GetPendingSchedInfoForCpu(cpu);  <span class="c">// per file</span>
 if (prev_pid == pending_sched-&gt;last_pid)
   context_-&gt;sched_event_tracker-&gt;ClosePendingSlice(pending_slice_idx, ts, ...);
@@ -1004,10 +985,9 @@ Merge two files onto one machine only when their data sources do not overlap. Fo
 stack samples. If both have ftrace, give them separate machines, or crop one so the time ranges do not overlap.
 </blockquote>
 
-<h2 id="manifest"><span class="n">13</span>Two common manifest uses fail on files from one device</h2>
-<p>A manifest clock pin between two files on one machine either fails the load or misses the file it was meant for. Compressed
-members cannot be configured at all. The manifest is how you override the defaults of Part II: which machine a file belongs to,
-which clock is trace time, and fixed clock relations.</p>
+<h2 id="manifest"><span class="n">13</span>Manifest clock pins target machine-canonical clocks, breaking naive same-device overrides</h2>
+<p>When engineers hit clock or duplication issues on one phone, the natural instinct is to write a <code>perfetto_manifest.json</code> that pins the two files’ clocks or overrides compressed archive members.
+Because manifest <code>clocks</code> edges wire machine-canonical clock nodes (file tag <code>0</code>) rather than per-file secondary nodes, pinning two files that share one machine either aborts the import with a self-loop error or misses the secondary file completely—and compressed <code>.gz</code>/<code>.zst</code> containers reject overrides outright.</p>
 <p>A <code>clocks</code> entry relates one of this file’s clocks to a clock of another file. At a common instant, the other file’s
 clock reads this file’s value plus <code>offset_ns</code>. This page calls any such entry a <b>pin</b>. The reference doc reserves
 “pin” for the form without a clock, used for files with no clocks of their own.</p>
@@ -1086,12 +1066,10 @@ to the other. Each is then primary on its machine, so the edge lands on the cloc
 longer share a process tracker. The same thread gets two utids, and cross-file joins must go through tid and machine instead.
 </blockquote>
 
-<h2 id="reboot"><span class="n">14</span>A reboot between two files puts the second one at the wrong time</h2>
-<p>Two traces from one phone with a reboot between them still land on the same machine by default, and the second one lands at the
-wrong time. A <b>reboot</b> restarts BOOTTIME and MONOTONIC from zero and starts every process again with fresh pids.</p>
-<p>The second trace is a secondary file on the trace-time machine. So it is placed by the BOOTTIME identity edge, never by REALTIME.
-Its BOOTTIME values count from the new boot, so it lands in the wrong place (Figure 16). It lands before the first trace if it was
-recorded soon after boot. It lands on top of it if both were taken at similar <b>uptimes</b>, the time since boot.</p>
+<h2 id="reboot"><span class="n">14</span>A reboot resets BOOTTIME and PIDs, yet same-machine fallback still assumes one boot</h2>
+<p>What if two traces come from the same physical phone before and after a kernel reboot? A <b>reboot</b> resets <code>BOOTTIME</code> and <code>MONOTONIC</code> back to zero and restarts the PID allocator from scratch—making the post-reboot kernel a brand-new OS instance in everything except hardware serial number.
+Without a manifest, both files still default to machine 0, where the secondary file links via a zero-offset <code>BOOTTIME</code> identity edge instead of wall-clock <code>REALTIME</code>—placing post-reboot events at the wrong point in time (Figure 16).</p>
+<p>Because the secondary file’s <code>BOOTTIME</code> counts up from the new boot, a trace recorded ten minutes after reboot lands near trace-time zero—hours <em>before</em> a pre-reboot trace recorded at five hours of uptime—or lands right on top of the earlier trace if both were captured at similar uptimes.</p>
 
 <figure>
 <figcaption><b>Figure 16. After a reboot, BOOTTIME starts again from zero, so a trace taken soon after it is placed before the earlier one.</b>
@@ -1121,14 +1099,13 @@ Before merging two traces from one phone, compute REALTIME − BOOTTIME from eac
 the same, apart from NTP steps. If the two values differ by more than a few seconds, a reboot happened in between, so use separate machine names.
 </blockquote>
 
-<h2 id="ringbuf"><span class="n">15</span>Ring-buffer trace pairs are useful only inside the scheduler window and without suspend</h2>
-<p>When you pair a long ring-buffer trace with another trace from the same phone, the overlap that matters is where scheduler data
-survives, and suspend can shift MONOTONIC events. A useful same-device merge pairs two kinds of trace:</p>
+<h2 id="ringbuf"><span class="n">15</span>Pairing a background ring buffer with a profiling trace requires checking the surviving sched tail and suspend gaps</h2>
+<p>The flagship same-device merge workflow pairs two concurrent sessions on one phone that intentionally record disjoint data sources:</p>
 <ul>
-  <li>A <b>long ring-buffer system trace</b> comes from a long-running session that keeps recent system activity, including scheduler data, in
-  ring buffers and saves it when a trigger fires.</li>
-  <li>A <b>stack-sampling trace</b> comes from a separate session that records periodic and event-triggered call-stack samples.</li>
+  <li>A <b>long ring-buffer system trace</b> runs continuously in memory, holding recent kernel scheduling and system events in fixed-size ring buffers until a bug trigger snapshots it to disk.</li>
+  <li>A <b>stack-sampling trace</b> runs in a second session, capturing periodic or event-triggered callstack samples without duplicating ftrace scheduling.</li>
 </ul>
+<p>Even when both sessions come from one boot and keep data sources disjoint, two runtime effects—differential buffer wrap rates and device suspend—determine whether the merged pair is actually usable.</p>
 <h3>The scheduler window is much shorter than the trace</h3>
 <p>A ring-buffer trace keeps the most recent data per buffer. High-rate ftrace wraps quickly, so scheduler data covers only the tail
 of a trace whose other buffers span much longer. Overlap computed on the full start-to-end range mostly finds pairs that overlap
@@ -1168,9 +1145,9 @@ traces that recorded a suspend if any of your data uses MONOTONIC timestamps.
 <!-- ═════════════════════════ PART IV ═════════════════════════ -->
 <div class="part">Part IV · Practice</div>
 
-<h2 id="recipes"><span class="n">16</span>A short checklist and one recipe per kind of merge cover the rules above</h2>
-<p>Parts I to III reduce to a few checks for building a set of traces from one device, and one recipe for each kind of merge.
-Before putting several files from one phone onto one machine:</p>
+<h2 id="recipes"><span class="n">16</span>Decision checklist and canonical recipes for every multi-trace scenario</h2>
+<p>Part IV distills the clock-graph and context-scoping invariants from Parts I–III into concrete pre-merge checks and one canonical configuration per scenario.
+Before merging multiple files from one phone onto a single machine, verify all six preconditions:</p>
 <ul>
   <li>Compute overlap against the sched window, not the full trace range (Section 15).</li>
   <li>Skip traces that recorded a suspend if any of your data uses MONOTONIC timestamps (Section 15).</li>
@@ -1192,8 +1169,9 @@ Before putting several files from one phone onto one machine:</p>
   </tbody>
 </table>
 
-<h2 id="checking"><span class="n">17</span>Six queries catch the failures that load without an error</h2>
-<p>Most of Part III produces no error: the trace loads and the numbers are wrong. Run these queries after loading to check each failure mode.</p>
+<h2 id="checking"><span class="n">17</span>Six post-import SQL queries catch silent duplication and clock-bridge surprises</h2>
+<p>Because Trace Processor treats two overlapping per-file trackers or a post-reboot identity bridge as structurally valid input, most Part III bugs finish importing with zero errors and plausible-looking tables.
+Run these six diagnostic queries immediately after loading any merged archive before trusting cross-trace joins or CPU aggregations.</p>
 <pre><code><span class="c">-- Files in processing order, with their parent container.</span>
 <span class="k">SELECT</span> id, parent_id, name, trace_type, processing_order, size
 <span class="k">FROM</span> __intrinsic_trace_file <span class="k">ORDER BY</span> processing_order;
@@ -1265,7 +1243,7 @@ commit <code>9843f023eb</code>.</p>
 </table>
 
 <h2 id="sources">Sources</h2>
-<p>All paths are in the Perfetto source tree (<code>external/perfetto</code> in AOSP).</p>
+<p class="m">Paths are in the upstream Perfetto repository.</p>
 <ul>
   <li><code>src/trace_processor/util/clock_synchronizer.{h,cc}</code>: <code>ClockId</code>, <code>Qualify</code>, snapshot hashing, BFS conversion, cache, non-monotonic handling, the duplicate-clock error</li>
   <li><code>src/trace_processor/importers/common/clock_tracker.{h,cc}</code>: file tags, primary/secondary flip, <code>FlushDeferredClockSync</code>, <code>BridgeToTraceTime</code>, <code>SetGlobalClock</code></li>

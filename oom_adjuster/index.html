@@ -77,44 +77,54 @@
 
 <main id="top">
 <h1>How Android decides which processes to kill, slow down or freeze</h1>
-<p class="lead">Android keeps the apps you have left in memory so that switching back is fast. Memory and CPU are limited, so
-something has to rank every process. In <code>system_server</code> that is <code>OomAdjuster</code>. After every activity change,
-binding or broadcast it re-ranks the affected processes and updates the low-memory killer, the kernel and the app.
-This note explains how it computes those ranks, how the results are applied, and how to read every transition in a Perfetto trace.</p>
+<p class="lead">Android keeps the apps you leave resident in RAM so switching back skips cold startup. Because memory, big CPU cores
+and battery are finite, the system has to rank every running process continuously — deciding which cached apps to reclaim first under
+memory pressure, which processes deserve big cores, and which idle apps can be frozen outright. In <code>system_server</code>,
+<code>OomAdjuster</code> turns the live graph of activities, services, broadcasts and content providers into per-process ranks enforced
+by <code>lmkd</code>, kernel cgroups and the cached-app freezer. This note explains why that architecture evolved, how scores are computed
+and applied, and how to read every transition in a Perfetto trace.</p>
 <p class="m">Checked against AOSP as of Android 17 (<code>frameworks/base</code>, <code>system/memory/lmkd</code>, <code>system/core/libprocessgroup</code>, <code>external/perfetto</code>).</p>
 
 <h2 id="glance">At a glance</h2>
 <ul>
-  <li><b>What it decides.</b> Four outputs per process: how soon it may be killed (<code>oom_score_adj</code>), what lifecycle role it is in (<code>procState</code>), how much CPU it gets (<code>schedGroup</code>), and which capabilities it holds, including whether it may be frozen.</li>
-  <li><b>How it decides.</b> A process is at least as important as the most important client bound to it, so importance flows along service bindings and content-provider connections.</li>
+  <li><b>What it decides.</b> Four outputs per process: how soon it may be killed (<code>oom_score_adj</code>), what lifecycle role it plays (<code>procState</code>), how much CPU it gets (<code>schedGroup</code>), and which runtime capabilities it holds, including whether it may be frozen.</li>
+  <li><b>How it decides.</b> A process is at least as important as the most important client bound to it, so importance flows along service bindings and content-provider connections across a directed process graph.</li>
   <li><b>Why kill-order scores move when nothing visible changes.</b> Each output is kept in raw, effective, committed and reported copies. Local adjustments for recency ladders and short service callbacks can move <code>oom_score_adj</code> without changing <code>procState</code> or CPU group.</li>
-  <li><b>It is not the only writer.</b> Zygote at fork, <code>SchedulingPolicyService</code> for media threads, and <code>CachedAppOptimizer</code>'s direct thaw paths change CPU groups and freeze state outside <code>OomAdjuster</code>.</li>
-  <li><b>How to observe it.</b> A Perfetto trace records every <code>oom_score_adj</code> write, the <code>updateOomAdj_*</code> slice that caused it, and every freeze and thaw interval with its unfreeze reason.</li>
+  <li><b>Other subsystems write CPU groups and freeze state too.</b> Zygote at process fork, the media scheduling service (<code>SchedulingPolicyService</code>) for real-time audio threads, and the cached-app freezer's direct thaw paths all act outside <code>OomAdjuster</code>.</li>
+  <li><b>How to observe it.</b> A Perfetto trace records every <code>oom_score_adj</code> write, the <code>system_server</code> update slice (<code>updateOomAdj_&lt;reason&gt;</code>) that caused it, and every freeze and thaw interval with its unfreeze reason.</li>
 </ul>
 
 <p><b>Terms.</b></p>
 <ul>
   <li><b>Client and host</b>: a process that binds to a service or queries a content provider is the <b>client</b>; the process providing that service or content provider is the <b>host</b>.</li>
+  <li><b>Binder</b>: Android's inter-process communication (IPC) mechanism; synchronous calls block the calling thread until the host replies, whereas one-way (<code>oneway</code>) calls queue asynchronously in the host's kernel Binder buffer.</li>
   <li><b>Cached process</b>: a live background app process with no visible UI or active components, kept in RAM so a later launch skips cold startup.</li>
   <li><b>LRU list</b>: the least-recently-used list of running app processes kept by <code>ActivityManagerService</code> (AMS), ordered from least to most recently active.</li>
-  <li><b>Pass</b>: one execution of <code>OomAdjuster</code> (a full update across the LRU list or a partial update over a subgraph) that recomputes and commits process state.</li>
-  <li><b><code>adj</code> (<code>oom_score_adj</code>)</b>: the per-process kill-order score (<code>-1000</code> to <code>1000</code>), where higher scores are killed earlier by <code>lmkd</code> (the user-space low-memory killer daemon).</li>
-  <li><b>cgroup and cpuset</b>: Linux control groups that cap which CPU cores a task may run on (<code>cpuset</code>), its scheduler weight, and whether its threads are frozen.</li>
-  <li><b>Frozen process and thaw</b>: a process placed into the cgroup v2 freezer (<code>cgroup.freeze = 1</code>) so its threads receive no CPU time, and the unfreeze (<b>thaw</b>) that lets it run again.</li>
+  <li><b>Pass</b>: one execution of <code>OomAdjuster</code> (a full update across the LRU list or a partial update over a reachable subgraph) that recomputes and commits process state.</li>
+  <li><b><code>adj</code> (<code>oom_score_adj</code>) and PSI</b>: the per-process kill-order score (<code>-1000</code> to <code>1000</code>), sent to <code>lmkd</code> (the user-space low-memory killer daemon), which watches Linux Pressure Stall Information (PSI) memory-stall events and kills from the highest score down.</li>
+  <li><b>cgroup and cpuset</b>: Linux control groups, configured via <code>libprocessgroup</code> task profiles, that restrict which CPU cores a task may run on (<code>cpuset</code>), its scheduler share (<code>cpu</code>), and whether its threads are frozen.</li>
+  <li><b>Frozen process and thaw</b>: a process placed into the cgroup v2 freezer (<code>cgroup.freeze = 1</code>) so its threads receive zero CPU time while keeping its pages in RAM, and the unfreeze (<b>thaw</b>) that lets it run again.</li>
 </ul>
 
 <div class="part">Part I · What it decides</div>
 
 <h2 id="problem"><span class="n">1</span>OomAdjuster turns what each app is doing into four numbers</h2>
-<p>A phone runs far more processes than it has RAM to keep forever, so something must decide which processes to reclaim first.
-Android does not exit an app's process when you leave its screen: the process stays cached so returning to it skips cold startup.
-When free memory drops, killing the wrong process is immediately noticeable — background music stops, or the input method restarts.</p>
-<p>The process that sees every app's components is <code>system_server</code>, through <code>ActivityManagerService</code> (AMS) and its
-<code>com.android.server.am.psc</code> (<code>ProcessStateController</code>) package. AMS tracks which activity is on screen, which process runs a
-foreground service, which is receiving a broadcast, and which processes are connected through bindings or content providers.
-<code>OomAdjuster</code> turns that component graph into per-process numbers that daemons and the kernel enforce. Its name comes from
-the Linux out-of-memory (OOM) killer, whose <code>/proc/&lt;pid&gt;/oom_score_adj</code> knob it originally drove.</p>
-<p>Each managed process receives four outputs, whose scales are detailed in <a href="#scales">§2</a>:</p>
+<p>A phone runs far more app processes than its RAM can hold forever, so something must decide which processes to reclaim first.
+Android does not exit an app's process when you leave its screen: the process stays cached in memory so returning to it skips process
+creation and class loading. When memory runs tight, picking the wrong victim is immediately noticeable — background music cuts out,
+a navigation voice stops, or the keyboard restarts mid-sentence.</p>
+<p>Early Android delegated reclamation to an in-kernel <code>lowmemorykiller</code> driver: <code>ActivityManagerService</code> (AMS)
+wrote each process's score to <code>/proc/&lt;pid&gt;/oom_score_adj</code> alongside static free-page watermarks (<code>minfree</code>),
+and a kernel shrinker killed processes whenever free pages dropped below a threshold. Fixed page counts turned out to be a blunt signal —
+page-cache churn could trip kills when apps were not stalling, or devices could thrash before a watermark fired. Modern Android moved
+victim selection into user-space <code>lmkd</code>, which monitors Linux PSI stall time on <code>/proc/pressure/memory</code> and kills
+only when memory contention actually stalls work.</p>
+<p>Only <code>system_server</code> sees what every app is doing at once: AMS tracks which activity is on screen, which process runs a
+foreground service or broadcast receiver, and how processes connect through bindings and content providers. Historically all ranking state
+lived directly on AMS and <code>ProcessRecord</code>; in Android 17 it lives in the <code>com.android.server.am.psc</code>
+(<code>ProcessStateController</code>) package, which isolates process-state and graph calculation behind a dedicated controller.
+<code>OomAdjuster</code> retains its historical Linux OOM name and turns that component graph into four per-process outputs
+(scales in <a href="#scales">§2</a>):</p>
 <table>
   <thead><tr><th>Output</th><th>What it is</th><th>Who acts on it</th></tr></thead>
   <tbody>
@@ -232,9 +242,12 @@ visible <code>adj</code> band with <code>procState</code> <code>BOUND_FOREGROUND
 </blockquote>
 
 <h2 id="triggers"><span class="n">3</span>Updates run on specific events and touch only what can change</h2>
-<p>Recomputing every running process is expensive, so AMS triggers an update only at component transitions and scopes each pass to the
-processes whose scores can move. Every pass runs in <code>system_server</code> under the AMS lock, and an app switch fires many transitions
-in quick succession. Running too broadly wastes CPU under lock; running too rarely leaves stale scores in <code>lmkd</code>.</p>
+<p>Early Android apps typically ran inside a single process, so <code>OomAdjuster</code> could walk the entire AMS LRU list from end to end on
+every lifecycle event. Modern apps and system features split work across bound services, content providers, isolated <code>WebView</code>
+renderers and SDK-sandbox processes, and a single app switch or broadcast fan-out fires a burst of transitions while holding the AMS lock.</p>
+<p>Running a full-list scan on every transition wastes CPU under lock; running too rarely leaves stale scores in <code>lmkd</code> (a newly
+launched camera app could be killed under its own allocation pressure if still scored as cached). Since Android 11, AMS triggers updates at
+explicit component transitions and scopes localized changes to the reachable dependency subgraph.</p>
 <p>Callers enter through <code>ProcessStateController</code>, or through <code>ActivityManagerService.updateOomAdjLocked</code>, which delegates
 to the same <code>OomAdjuster</code> instance. Every call passes an <code>OOM_ADJ_REASON_*</code> code from <code>ActivityManagerInternal.java</code>
 identifying the trigger — such as an activity visibility change, broadcast delivery, service bind, content-provider acquisition, process death, or a
@@ -284,12 +297,17 @@ Each pass emits an atrace slice named <code>updateOomAdj_&lt;reason&gt;</code> o
 <div class="part">Part II · How scores are computed</div>
 
 <h2 id="pipeline"><span class="n">4</span>Each update runs in five ordered steps</h2>
-<p>A single linear scan over running processes cannot score them accurately, so each pass divides the work into five ordered steps.
-Two dependencies force that structure: a host's score depends on clients that may sit anywhere in the graph (including cycles), and recency
-ladders depend on each process's final band across the whole LRU list. Applying LRU offsets during graph propagation would compound the offset
-at every hop along a binding chain.</p>
-<p><code>OomAdjusterImpl</code> orchestrates the pass across every process in <code>fullUpdateLSP</code>, or across the target subgraph in
-<code>partialUpdateLSP</code>. The <code>LSP</code> suffix indicates that the caller holds both <code>mServiceLock</code> and <code>mProcLock</code>.</p>
+<p>Originally, <code>OomAdjuster</code> evaluated bindings recursively while walking the flat LRU list: scoring a host walked its incoming
+connections and recursively scored each client. Whenever processes formed a binding cycle — say <code>A</code> bound to <code>B</code> while
+<code>B</code> bound to <code>A</code> — recursion hit its own in-flight sequence marker (<code>mAdjSeq</code>) and fell back to iterative
+retry loops across the cycle, costing repeated graph scans under lock and occasionally yielding order-dependent results.</p>
+<p>Recency ladders create a second ordering constraint: spreading visible or cached apps by LRU recency requires knowing every process's final
+band first, because adding an LRU offset during binding propagation would compound that offset at every hop down a chain. Android therefore
+replaced recursive retries with a staged, cycle-safe graph pipeline (first shipped as <code>OomAdjusterModernImpl</code>, and extracted into
+<code>psc/OomAdjusterImpl</code> in Android 17).</p>
+<p><code>OomAdjusterImpl</code> orchestrates the five ordered steps across every process in <code>fullUpdateLSP</code>, or across the target
+subgraph in <code>partialUpdateLSP</code>. The <code>LSP</code> suffix indicates that the caller holds both <code>mServiceLock</code> and
+<code>mProcLock</code>.</p>
 
 <figure>
 <figcaption><b>Figure 4. Scores are derived from components and bindings first, laddered by recency, and then committed.</b> Blue steps
@@ -353,7 +371,7 @@ positions and cached slots. Green writes changes out to <code>lmkd</code>, cgrou
 <ol>
   <li><b>Intrinsic state.</b> Step 1 clears per-pass activity memos (<code>resetCachedInfo()</code>) and scores each process from its own components alone (<code>computeOomAdjLSP</code>). A process with nothing active receives <code>UNKNOWN_ADJ</code> and <code>PROCESS_STATE_CACHED_EMPTY</code> as placeholders, stores its raw and intermediate values (<a href="#state-matrix">§5</a>), and enters the propagation queues.</li>
   <li><b>Propagation.</b> <code>computeConnectionsLSP</code> drains two priority queues so client scores propagate along service and provider bindings.</li>
-  <li><b>Shadow graph controllers.</b> Behind <code>enable_procstate_controller_computation</code> and <code>enable_capability_controller_computation</code>, <code>ProcStateController</code> and <code>CapabilityController</code> evaluate explicit <code>ProcessNode</code> and <code>GraphEdge</code> objects (via <code>partialUpdateProcessGraphLSP</code> on partial passes). In Android 17 both run computation-only without overwriting the live outputs from steps 1 and 2.</li>
+  <li><b>Shadow graph controllers.</b> To decompose the monolithic connection pass into dedicated per-attribute evaluators, <code>psc</code> adds <code>ProcStateController</code> and <code>CapabilityController</code> over explicit <code>ProcessNode</code> and <code>GraphEdge</code> objects (invoked via <code>partialUpdateProcessGraphLSP</code> on partial passes). In Android 17 both sit behind rollout flags (<code>enable_procstate_controller_computation</code> and <code>enable_capability_controller_computation</code>) and run computation-only in shadow to validate parity without overwriting the live outputs from steps 1 and 2.</li>
   <li><b>LRU post-pass.</b> <code>applyLruAdjust</code> walks the LRU list from most to least recent (skipped on a partial update when no reached process requires laddering or a cached slot). Processes in the visible and previous bands receive consecutive scores, and processes still at <code>UNKNOWN_ADJ</code> receive cached or empty slots across <code>900–999</code>.</li>
   <li><b>Apply and trim.</b> <code>postUpdateOomAdjInnerLSP</code> calls <code>updateAndTrimProcessLSP</code>, which invokes <code>applyResultsLSP</code> per process (Part III) and trims cached and empty processes when their counts exceed configured limits.</li>
 </ol>
@@ -465,10 +483,14 @@ To inspect why a live process holds a given score, run <code>adb shell dumpsys a
 </blockquote>
 
 <h2 id="state-matrix"><span class="n">5</span>Each score is kept in several copies, one per stage</h2>
-<p>Different steps of the pipeline need different views of the same process, so <code>ProcessRecordInternal</code> stores multiple copies of
-each output. Propagation needs a client's score before local per-process penalties are applied; the LRU post-pass needs to ladder scores without
-feeding those offsets back into bindings; and commit needs the previously sent values so it writes out only changes. Field names combine two
-axes: <b>version</b> (raw vs effective) and <b>visibility</b> (in-flight vs committed vs reported).</p>
+<p>At first glance, keeping six field families on <code>ProcessRecordInternal</code> for what looks like a single score feels excessive.
+Suppose each process record stored just one integer per output instead — three things would break immediately:</p>
+<ul>
+  <li><b>Graph propagation and cycles would get poisoned by local clamps and ladders.</b> Several rules adjust one process's own kill order without changing the importance it grants to services it binds: <code>BIND_ABOVE_CLIENT</code> steps a client down behind its host, <code>mMaxAdj</code> clamps persistent or isolated system processes, zram writeback caps cached scores, and the LRU post-pass spreads visible and previous bands into consecutive integers (<code>100, 101, 102…</code>). With a single integer, a client's recency offset or self-demotion would feed back into outgoing bindings, compounding at every hop or oscillating around cycles. Separating an unadjusted <b>raw</b> copy (<code>curRaw*</code>) from the <b>effective</b> copy (<code>cur*</code>) lets bindings propagate clean graph scores while local rules mutate only <code>cur*</code>.</li>
+  <li><b>Every pass would spam <code>lmkd</code>, kernel cgroups and apps with redundant IPCs.</b> Updating <code>lmkd</code> costs a socket write and a <code>/proc/&lt;pid&gt;/oom_score_adj</code> syscall; updating cgroups posts handler work; updating <code>procState</code> sends a one-way Binder call into the app. Most passes leave most processes at the exact effective values they already had. Keeping <b>committed</b> copies (<code>set*</code>, plus <code>setRawAdj</code> to seed restarts and inspect prior raw state) and <b>reported</b> copies (<code>rep*</code>, since app notifications follow slightly different boundaries than <code>lmkd</code>) gives the commit step and between-pass connection skip checks a stable baseline of what external consumers already know while <code>cur*</code> holds in-flight scratch state.</li>
+  <li><b>Lifetime ceilings and window-visibility scans would repeat on every edge.</b> Storing a fixed ceiling (<code>max*</code>) and a per-pass activity-visibility memo (<code>cached*</code>) avoids re-checking process-creation invariants and re-walking <code>WindowManagerService</code> tasks every time propagation revisits a node.</li>
+</ul>
+<p>The core state fields therefore sit on two axes: <b>version</b> (raw vs effective) and <b>visibility</b> (in-flight vs committed vs reported).</p>
 
 <h3 id="name-decoder">Name decoder</h3>
 <p>Each prefix answers one question, and field names stack them. Note that <code>set</code> is a past participle here, not a verb:
@@ -991,9 +1013,15 @@ A kernel cgroup or freeze state that diverges from <code>mSet*</code> for longer
 </blockquote>
 
 <h2 id="sched-vs-proc"><span class="n">8</span>OomAdjuster ranks CPU groups on its own scale</h2>
-<p><code>OomAdjuster</code> defines its own <code>SCHED_GROUP_*</code> constants in <code>psc/Constants.java</code> rather than storing
-<code>android.os.Process.THREAD_GROUP_*</code> constants directly. Two requirements drive that separation: <b>comparing groups as integers during
-binding propagation</b>, and <b>distinguishing the top app from services bound to it</b>.</p>
+<p>Keeping background and cached apps resident in RAM makes warm launches fast, yet <code>lmkd</code> steps in only when memory runs short.
+Left unchecked between reclaims, background processes still wake on timers, broadcasts, network callbacks and garbage collection, competing
+with the visible app for high-capacity CPU cores on heterogeneous SoCs. Android therefore pairs kill-order ranking with kernel
+<code>cpuset</code> and <code>cpu</code> control groups (configured through <code>libprocessgroup</code> task profiles in
+<code>task_profiles.json</code>), confining background work to efficiency cores with a small scheduler share while giving the active app full
+core access and UI thread boosts.</p>
+<p>To drive those cgroups, <code>OomAdjuster</code> defines its own <code>SCHED_GROUP_*</code> constants in <code>psc/Constants.java</code>
+rather than storing <code>android.os.Process.THREAD_GROUP_*</code> constants directly. Two requirements motivate that separate scale:
+<b>comparing groups as integers during binding propagation</b>, and <b>distinguishing the top app from services bound to it</b>.</p>
 
 <h3 id="sched-ordering">Reason 1 · The kernel's group IDs are not in priority order</h3>
 <p>Step 2 combines CPU scheduling groups along bindings by keeping the larger integer, which works only when higher numbers mean stronger CPU access.
@@ -1049,8 +1077,9 @@ Rows are ordered from highest CPU priority at the top to lowest at the bottom. R
 <figure>
 <figcaption><b>Figure 13. Both top-app constants share the <code>top-app</code> cpuset, while only <code>SCHED_GROUP_TOP_APP</code> boosts UI threads.</b>
 In step 5, <code>applyResultsLSP</code> switches on <code>curSchedGroup</code> to pick the <code>Process.THREAD_GROUP_*</code> cgroup target and
-gates the UI-thread and <code>RenderThread</code> boost on <code>SCHED_GROUP_TOP_APP</code>. In <code>libprocessgroup</code>,
-<code>THREAD_GROUP_DEFAULT</code> maps to the foreground cpuset policy.</figcaption>
+gates the UI-thread and <code>RenderThread</code> boost on <code>SCHED_GROUP_TOP_APP</code>. In JNI (<code>android_util_Process.cpp</code>),
+<code>Process.setProcessGroup</code> remaps negative groups such as <code>THREAD_GROUP_DEFAULT</code> (<code>-1</code>) to
+<code>SP_FOREGROUND</code>, applying the foreground <code>cpuset</code> and <code>cpu</code> task profiles.</figcaption>
 <svg viewBox="0 0 1000 285" role="img" aria-label="Mapping from OomAdjuster SCHED_GROUP constants to kernel Process.THREAD_GROUP constants and side effects">
   <text x="10" y="18" class="th">oomadjuster sched_group (constants.java) → process.thread_group + thread priority boosts</text>
 
@@ -1138,12 +1167,20 @@ scheduler policies independently. Knowing those writers explains traces where a 
 <div class="part">Part IV · Process freezer</div>
 
 <h2 id="freezer-inside"><span class="n">10</span>A process is frozen once nothing gives it a reason to run</h2>
-<p><code>OomAdjuster</code> permits freezing a process as soon as the process holds neither CPU-time capability bit. Left unfrozen, a cached app
-is invisible to the user yet far from idle: periodic timers, handler messages and stray Binder work keep waking it up. To stop that background
-CPU drain, <code>CachedAppOptimizer</code> freezes cached processes in two steps: first <code>freezeBinder</code> blocks incoming Binder
-transactions on the process's kernel Binder interface (failing if transactions are currently in flight), and then <code>Process.setProcessFrozen</code>
-applies the <code>libprocessgroup</code> <code>Frozen</code> task profile by writing <code>1</code> to cgroup v2 <code>cgroup.freeze</code>.</p>
-<p>Whether a process is eligible to be frozen is decided in <code>psc/OomAdjuster.java</code> from its capability mask:</p>
+<p>Confining cached processes to <code>SCHED_GROUP_BACKGROUND</code> keeps them off big cores, yet a throttled process is still runnable:
+periodic <code>Handler</code> timers, SDK background threads and stray callbacks keep waking little cores, draining standby battery and
+dirtying memory pages. Starting with unified <code>cgroup.freeze</code> support in Android 11 and Android 12,
+<code>CachedAppOptimizer</code> added the cached-app freezer to stop cached threads completely — zero CPU time while keeping pages resident
+in RAM for fast warm resume.</p>
+<p>Freezing user-space threads while leaving their address space and IPC endpoints alive immediately creates a synchronization hazard. If a
+live process makes a synchronous Binder call into a frozen target, waiting for a frozen thread to reply would hang the caller — potentially
+stalling the foreground UI or deadlocking a <code>system_server</code> lock — while queued <code>oneway</code> calls could exhaust the
+target's kernel async Binder buffer. <code>CachedAppOptimizer</code> therefore freezes each process in two coordinated steps: first
+<code>freezeBinder</code> instructs the kernel Binder driver to reject incoming synchronous transactions and monitor async buffer headroom
+(failing if transactions are already in flight), and then <code>Process.setProcessFrozen</code> applies the <code>libprocessgroup</code>
+<code>Frozen</code> task profile by writing <code>1</code> to <code>cgroup.freeze</code>.</p>
+<p><code>OomAdjuster</code> permits freezing as soon as a process holds neither CPU-time capability bit, evaluated in
+<code>psc/OomAdjuster.java</code> from its capability mask:</p>
 
 <pre><code><span class="src">psc/OomAdjuster.java</span><span class="k">public static final int</span> ALL_CPU_TIME_CAPABILITIES =
         PROCESS_CAPABILITY_CPU_TIME | PROCESS_CAPABILITY_IMPLICIT_CPU_TIME;
@@ -1211,10 +1248,11 @@ To stay unfrozen in the background, a process needs an explicit CPU-time reason 
 </blockquote>
 
 <h2 id="freezer-outside"><span class="n">11</span>Many thaws and freezes bypass OomAdjuster</h2>
-<p>A frozen cached process occasionally needs to run briefly — to receive a broadcast, publish a content provider, or release a kernel file lock —
-without changing its overall importance. Running a full <code>OomAdjuster</code> pass for every such blip would waste lock time in
-<code>system_server</code>, so AMS and <code>CachedAppOptimizer</code> thaw and re-queue freezes directly without touching
-<code>oom_score_adj</code>:</p>
+<p>Freezing cached apps works cleanly only if expected system interactions do not trip the Binder freeze barrier or stall on kernel locks held
+by frozen threads. A frozen cached process occasionally needs to run briefly — to receive a broadcast, publish a content provider, answer an
+AMS ping, or release a kernel file lock — without changing its overall importance. Running a full <code>OomAdjuster</code> pass for every
+transient wakeup would waste lock time in <code>system_server</code>, so AMS and <code>CachedAppOptimizer</code> thaw and re-queue freezes
+directly without touching <code>oom_score_adj</code>:</p>
 
 <figure>
 <figcaption><b>Figure 15. Five paths thaw (and often re-freeze) a cached process without running <code>OomAdjuster</code>.</b>
@@ -1303,7 +1341,7 @@ the <code>UNFREEZE_REASON_*</code> codes they emit in traces.</figcaption>
   <li><b>The queued freeze.</b> <code>freezeAppAsyncLSP</code> posts <code>SET_FROZEN_PROCESS_MSG</code> to <code>FreezeHandler</code> delayed by <code>mFreezerDebounceTimeout</code> (never earlier than the process's earliest freezable timestamp). When the message fires, <code>freezeProcess</code> freezes Binder and writes <code>cgroup.freeze</code>, and can also enqueue memory compaction (<code>compactApp</code>) for the newly frozen cached process.</li>
   <li><b><code>unfreezeTemporarily</code>.</b> <code>ActivityManagerService.unfreezeTemporarily</code> collects the target process plus every host reachable from it along bindings, and calls <code>CachedAppOptimizer.unfreezeTemporarily</code> on each. That thaws the process immediately and queues a fresh freeze delayed by at least <code>mFreezerDebounceTimeout</code>. Broadcast delivery (<code>BroadcastQueueImpl</code>), content-provider installation (<code>ContentProviderHelper</code>), and AMS process pings all use this path.</li>
   <li><b>Pending Binder transactions at freeze time.</b> If <code>freezeBinder</code> fails because transactions are still in flight, <code>handleBinderFreezerFailure</code> thaws the process with <code>UNFREEZE_REASON_BINDER_TXNS</code> and schedules a retry with a shrinking, randomised timeout. Once the retry window drops below its minimum threshold, the process is killed rather than retried forever.</li>
-  <li><b>Binder transactions arriving while frozen.</b> Incoming calls to an already-frozen target do not thaw it. Instead, when the caller receives a Binder error, <code>binderError</code> schedules an inspection of frozen processes: a target that received a synchronous call while frozen is killed (<code>SUBREASON_FREEZER_BINDER_TRANSACTION</code>), as is one whose asynchronous Binder buffer is running out of space.</li>
+  <li><b>Binder transactions arriving while frozen.</b> Unanticipated calls to an already-frozen target do not thaw it and never block waiting on frozen threads. Instead, the kernel Binder driver rejects synchronous calls immediately so the caller does not hang, and queues <code>oneway</code> async calls only while buffer space remains. When the driver reports a frozen-target transaction error or low async buffer space, <code>binderError</code> schedules an inspection of frozen processes and kills the target (<code>SUBREASON_FREEZER_BINDER_TRANSACTION</code>) rather than risking a caller stall or dropped async events.</li>
   <li><b>Kernel file locks.</b> After freezing a process, <code>FreezeHandler</code> runs a deadlock check over <code>/proc/locks</code> via <code>ProcLocksReader</code>. If a frozen process holds a file lock that blocks an unfreezable process, <code>onBlockingFileLock</code> thaws the holder with <code>UNFREEZE_REASON_FILE_LOCKS</code>.</li>
   <li><b>Shell and heap-dump overrides.</b> <code>adb shell am freeze [--sticky] &lt;process&gt;</code> forces a freeze via <code>forceFreezeAppAsyncLSP</code>, and <code>am unfreeze</code> thaws with reason <code>NONE</code>. Calling <code>enableFreezer(false)</code> — used around <code>dumpHeap</code> and <code>enableAppFreezer</code> — thaws every frozen process with <code>UNFREEZE_REASON_FEATURE_FLAGS</code> until re-enabled.</li>
 </ol>

@@ -1,7 +1,7 @@
 # Notes on Android and Perfetto internals
 
 A small static site of long-form technical notes: explainers on the Android
-runtime (ART), native memory, process ranking and freezing, the path from a
+runtime (ART), native memory and Parcel, process ranking and freezing, the path from a
 touch to pixels, Kotlin coroutines and flows, and how Perfetto's trace
 processor and PerfettoSQL work.
 Each note opens with an "At a glance" summary and explains the rest with SVG

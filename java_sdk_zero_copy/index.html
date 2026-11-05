@@ -54,6 +54,7 @@
   <a href="#passes" style="padding-left:18px">LSE, GVN, LICM</a>
   <div class="ph">III · Keeping it alive</div>
   <a href="#liveness">8 · Keeping the array alive</a>
+  <a href="#fence-cost" style="padding-left:18px">What the fence costs</a>
   <a href="#summary">9 · Summary</a>
   <a href="#method">Numbers and method</a>
   <a href="#sources">Sources</a>
@@ -61,35 +62,39 @@
 
 <main id="top">
 <h1>Zero-copy Java to native on ART: a non-movable byte[] removes a copy and keeps Java writes fast</h1>
-<p class="lead">The Perfetto Java SDK rewrite encodes each trace event in Java and then hands the bytes to native code.
-That hand-off copies the bytes today. This page explains why, and how an array that never moves removes the copy.
-It also explains why a plain array is faster to write from Java than a direct buffer, even though on ART both are the same kind of memory.</p>
+<p class="lead">High-throughput Android code often builds structured binary payloads in Java or Kotlin and hands them to C without crossing JNI per field or copying the buffer twice.
+Perfetto’s tracing SDK hits this boundary head-on: Java code encodes typed protocol-buffer fields at sub-microsecond cost, and C code writes the packet into a shared-memory ring buffer.
+Standard arrays, JNI helpers, <code>DirectByteBuffer</code> and <code>Unsafe</code> each sacrifice either zero-copy hand-off or Java compiler optimizations; an ART non-movable <code>byte[]</code> keeps both.</p>
 <p class="m">Runtime and compiler excerpts are from <code>art/</code> and <code>libcore/</code> in AOSP as of Android 17. SDK excerpts are from the
 development branch of the Java SDK rewrite in the open-source Perfetto repository (“the branch” below). Instruction sequences marked <em>shape</em> are simplified. The proposal in Section 4 is a design sketch that has not been built.</p>
 
 <h2 id="overview">At a glance</h2>
 <ul>
-<li><b>What happens.</b> Each event’s bytes are copied twice on the way out: once into a native buffer, then into the tracing buffer.</li>
-<li><b>Why.</b> The garbage collector moves normal Java arrays, so native code cannot keep a pointer into one.</li>
-<li><b>The fix.</b> Allocate the encoding buffer as an array that never moves, and pass native code its address. Only the needed copy is left.</li>
-<li><b>Why not a direct buffer.</b> It uses the same memory, but every byte written through it makes the compiler reload the buffer’s state.</li>
-<li><b>The catch.</b> Something must keep the array alive while native code reads it. In the SDK, a field already does.</li>
+<li><b>Why trace in user space.</b> Android’s classic <code>Trace.beginSection(String)</code> writes a flat text string through JNI and a kernel <code>write()</code> into <code>ftrace</code>. Perfetto’s <code>TrackEvent</code> SDK instead writes typed protobuf fields into a user-space shared-memory ring buffer (SMB) at sub-microsecond overhead, with no syscall on the fast path.</li>
+<li><b>Why encode in Java, once.</b> Crossing JNI once per field would pay thread-state transitions on every field and block ART’s inliner (<a href="../art_costs/index.html#jni">Where the costs are in ART</a>). Encoding the whole event in Java and calling JNI once at <code>emit()</code> avoids that, leaving the encoded bytes in a Java buffer that C code must copy into the SMB.</li>
+<li><b>The runtime tension.</b> ART’s moving garbage collectors relocate normal <code>byte[]</code> arrays to keep allocation a fast pointer bump and prevent fragmentation, whereas C code wants a stable <code>uint8_t*</code> pointer. Standard JNI copies the bytes a second time (<code>GetByteArrayRegion</code>) or touches pages and stalls GC flips (<code>GetPrimitiveArrayCritical</code>).</li>
+<li><b>Why <code>DirectByteBuffer</code> and <code>Unsafe</code> lose in Java.</b> On ART a direct buffer sits on the same non-movable heap memory, yet every <code>put(byte)</code> writes through a raw-address intrinsic (<code>AllWrites</code>) that forces the compiler to reload buffer state from memory on every byte.</li>
+<li><b>How a non-movable <code>byte[]</code> gets both.</b> Allocating the scratch buffer with <code>VMRuntime.newNonMovableArray</code> and reading <code>VMRuntime.addressOf</code> once gives Java an ordinary <code>byte[]</code> (bounds-check elimination, register-held write cursor) and gives C a fixed address, provided a strong reference keeps the array alive across the call.</li>
 </ul>
-<p><b>Terms.</b> <b>ART</b> is the Android runtime that runs Java code, and the <b>GC</b> is its garbage collector. <b>JNI</b> is the bridge between Java and C code. The <b>SMB</b> (shared memory buffer) is the memory the tracing service reads events from.
-The <b>C SDK</b> is Perfetto’s C tracing API, which the JNI layer calls.
-A <b>non-movable array</b> is a Java array allocated where the GC never moves it.
-A <b>direct buffer</b> is a <code>java.nio</code> <code>DirectByteBuffer</code>, whose bytes native code can address directly.</p>
+<p><b>Terms.</b> <b>ART</b> is the Android Runtime for Java and Kotlin bytecode, <b>GC</b> is its garbage collector, and <b>JNI</b> (Java Native Interface) bridges managed code and C/C++.
+<b><code>atrace</code></b> is Android’s legacy user-space tracing API (<code>android.os.Trace</code>), which writes text markers into the kernel’s <b><code>ftrace</code></b> buffer.</p>
+<p>A <b><code>TrackEvent</code></b> is Perfetto’s structured trace packet, serialized as protocol-buffer bytes into a per-process <b>SMB</b> (shared memory buffer) mapped with the <code>traced</code> daemon by Perfetto’s <b>C SDK</b>.
+A <b>non-movable array</b> is a primitive Java array allocated in a heap space the GC never compacts, and a <b>direct buffer</b> is a <code>java.nio.DirectByteBuffer</code>.</p>
 
 <!-- ═════════════════════════ PART I ═════════════════════════ -->
 <div class="part">Part I · Getting the bytes out</div>
 
 <h2 id="today"><span class="n">1</span>Today each event is copied once more than it needs to be</h2>
-<p>The event body is copied twice on its way to the tracing buffer, and only the second copy is needed.
-On the branch, <code>ProtoWriter</code> encodes the TrackEvent body (the event’s protobuf payload) into its <code>mBuf</code>, an ordinary Java array.
-<code>PerfettoTrackEventBuilder.emit()</code> then makes one JNI call, <code>native_emit</code>, that passes the array and its length.</p>
-<p>The native side copies the bytes into a <code>RawBody</code> vector with <code>GetByteArrayRegion</code>.
-That vector backs the <code>raw_</code> field, a <code>PERFETTO_TE_HL_PROTO_TYPE_RAW</code> proto field that is just a pointer and a length.
-The C SDK, built as a shared library, then appends those bytes unchanged to the event in the SMB.</p>
+<p>To see why this path exists, start with <code>android.os.Trace.beginSection(String)</code>.
+It formats a plain text marker (<code>B|pid|name</code>, capped at 127 characters) and writes it through JNI and a kernel <code>write()</code> into <code>ftrace</code>.
+Every slice pays a syscall, and attaching structured debug arguments forces string concatenation on hot threads.
+Perfetto’s <code>TrackEvent</code> pipeline writes binary protobuf fields straight into a user-space shared memory buffer (SMB) with no syscall on the fast path.</p>
+<p>Exposing <code>TrackEvent</code> to Java and Kotlin raises a boundary choice: make one JNI call per protobuf field, or serialize the event in Java first?
+Per-field JNI calls lose because each regular call swaps thread state twice and blocks ART’s inliner (<a href="../art_costs/index.html#jni">Where the costs are in ART</a>).</p>
+<p>The Perfetto Java SDK rewrite therefore batches encoding in Java: on the branch, a per-thread <code>ProtoWriter</code> writes the entire <code>TrackEvent</code> protobuf body into a reusable <code>byte[]</code> (<code>mBuf</code>), and <code>PerfettoTrackEventBuilder.emit()</code> crosses JNI once via <code>native_emit</code>.</p>
+<p>That single crossing eliminates per-field JNI overhead, yet the encoded bytes still have to move from the Java <code>byte[]</code> into the SMB, and today they are copied twice when only the final copy into the SMB is required.
+In <code>_emit</code>, the JNI layer first copies <code>mBuf</code> into a native <code>RawBody</code> <code>std::vector</code> using <code>GetByteArrayRegion</code>.
+That vector backs <code>raw_</code>, a <code>PERFETTO_TE_HL_PROTO_TYPE_RAW</code> descriptor holding a pointer and a length, which Perfetto’s C SDK then copies unchanged into the SMB chunk.</p>
 
 <figure>
 <figcaption><b>Figure 1. A non-movable array removes the first copy.</b> Today the body crosses the JNI boundary by copying into a native vector. With a non-movable array, native code receives
@@ -152,13 +157,13 @@ cannot be handed a pointer into a normal Java array and keep using it.</p>
 
 <!-- ───────────── Why ───────────── -->
 <h2 id="why"><span class="n">2</span>JNI copies because the GC moves normal arrays</h2>
-<p>A raw pointer into a Java object is only safe while the object stays put, and on ART it usually does not.
-ART’s collectors are <b>moving</b> collectors. To keep the heap compact, they relocate live objects and update every Java reference to the new copy.
-CMC (concurrent mark-compact, the default collector in AOSP builds) slides live objects down within the moving space.
-CC (concurrent copying) copies them to fresh regions. A pointer held by native code is not a Java reference, so the GC cannot update it.</p>
-<p>The heap is split into <b>spaces</b> with different rules. A normal <code>new byte[n]</code> goes into the moving space, so its address
-can change at any GC. The <b>non-moving space</b> is a separate region managed with a free list: dead objects leave holes, and
-live ones stay put. The <b>large object space</b> (LOS) holds big primitive arrays and strings in whole pages, and never moves them either.
+<p>Why can’t C code simply take the address of <code>mBuf[0]</code> and read from it? ART’s garbage collectors are <b>moving</b> collectors.
+Freeing dead objects in place would scatter holes across the heap, wasting RAM to fragmentation and forcing allocations onto free lists.
+Compacting survivors together leaves contiguous free memory so normal Java allocation stays a lock-free pointer bump (<a href="../art_costs/index.html#alloc">Where the costs are in ART</a>).</p>
+<p>When Concurrent Mark-Compact (CMC, the default collector in AOSP builds) slides live objects down, or Concurrent Copying (CC) copies them into fresh regions, ART rewrites every Java reference on thread stacks and inside heap objects.
+A raw <code>uint8_t*</code> in C is an untyped integer outside ART’s view, so the collector cannot find or update it.</p>
+<p>Because objects differ in size and pinning needs, ART splits the heap into <b>spaces</b>. A normal <code>new byte[n]</code> lands in the moving space, where any GC cycle can relocate it.
+The <b>non-moving space</b> uses mark-sweep and a free list so live objects never move, and the <b>large object space</b> (LOS) maps primitive arrays and strings of 12 KB or more in whole OS pages without moving them either.
 Sizes and thresholds are in Numbers and method.</p>
 
 <figure>
@@ -233,8 +238,9 @@ The last row, <code>VMRuntime.addressOf</code> (Section 3), is not JNI and is th
 <p class="m">The critical call is how JNI pins. The <b>thread flip</b> is the short pause in which CC or CMC switches every thread over to the
 moved objects. While any thread holds a critical array, the flip waits. So the array cannot move, and a long critical section delays the
 next GC.</p>
-<p class="m">For movable and non-movable arrays alike, the critical call also runs <code>EnsureObjectUserfaulted</code> before returning. <b>Userfaultfd</b> is the kernel mechanism CMC uses to catch accesses to pages it
-has not compacted yet. Touching the array’s pages up front means a kernel call handed the pointer never hits one of those faults.</p>
+<p class="m">For movable and non-movable arrays alike, the critical call also runs <code>EnsureObjectUserfaulted</code> before returning.
+<b>Userfaultfd</b> is the Linux kernel mechanism CMC uses during concurrent compaction to catch user-space accesses to heap pages it has not compacted yet and compact them on the spot.
+If C code passed an uncompacted heap pointer straight into a kernel system call such as <code>write()</code>, the kernel access could not run ART’s user-space fault handler, so JNI touches every page of the array up front.</p>
 
 <blockquote class="key"><span class="lbl">What it means for you</span>
 If the array never moves, <code>Get&lt;T&gt;ArrayElements</code> and <code>GetPrimitiveArrayCritical</code> hand out a direct pointer instead of
@@ -244,8 +250,9 @@ a copy. <code>Get&lt;T&gt;ArrayRegion</code> still copies, by definition. <code>
 
 <!-- ───────────── Non-movable ───────────── -->
 <h2 id="nonmovable"><span class="n">3</span>Two runtime calls give you an array that never moves, and its address</h2>
-<p>To give native code a pointer it can keep using, the array has to live where the GC never moves it. Two calls in
-<code>dalvik.system.VMRuntime</code> do that. One allocates such an array, and the other returns its address.</p>
+<p>A per-thread encoding buffer has the opposite profile from ordinary short-lived Java objects: it is allocated once, grown rarely, and read across thousands of JNI calls.
+Paying a free-list allocation once so the buffer’s address never changes is an easy win.
+Two methods on <code>dalvik.system.VMRuntime</code> expose ART’s non-moving space directly: one allocates a primitive array there, and the other returns the native address of its first element.</p>
 <p>Platform and mainline module code can call both, because both are <code>@SystemApi(client = MODULE_LIBRARIES)</code>.
 They are not public SDK, and apps see them only as hidden API (both carry <code>@UnsupportedAppUsage</code>).
 Both are also <code>@FastNative</code>, a JNI binding that skips the usual thread-state change but still passes a <code>JNIEnv</code>.</p>
@@ -254,7 +261,7 @@ Both are also <code>@FastNative</code>, a JNI binding that skips the usual threa
 
 <div class="two">
 <div>
-<h3>newNonMovableArray</h3>
+<h4>newNonMovableArray</h4>
 <ul>
   <li>Throws <code>NegativeArraySizeException</code> for a negative length and <code>NullPointerException</code> for a null component type.</li>
   <li>Allocates through the normal <code>mirror::Array::Alloc</code>, but with the non-moving allocator
@@ -265,7 +272,7 @@ Both are also <code>@FastNative</code>, a JNI binding that skips the usual threa
 </ul>
 </div>
 <div>
-<h3>addressOf</h3>
+<h4>addressOf</h4>
 <ul>
   <li>Returns 0 for <code>null</code>. It throws for non-arrays, object arrays, and arrays the heap considers movable (<code>Heap::IsMovableObject</code>).
       That check only looks at the moving and non-moving spaces, so a plain <code>new byte[1 MB]</code> in the large object space is accepted too.
@@ -279,17 +286,17 @@ Both are also <code>@FastNative</code>, a JNI binding that skips the usual threa
 </div>
 
 <h3 id="dbb">DirectByteBuffer is the same memory</h3>
-<p>The usual Java answer to “give native code a stable pointer” is a direct buffer, so it is worth knowing what one is on ART.
-<code>ByteBuffer.allocateDirect</code> does not call <code>malloc</code>. Its <code>MemoryRef</code> allocates a non-movable
-array and takes its address the same way as above:</p>
+<p>In standard Java, the portable way to give native code a stable buffer address without internal APIs is <code>ByteBuffer.allocateDirect</code>.
+On OpenJDK/HotSpot, that allocates off-heap native memory and registers a <code>Cleaner</code> to free it.
+ART does something simpler: <code>ByteBuffer.allocateDirect</code> does not call <code>malloc</code> at all. Its <code>MemoryRef</code> allocates a non-movable <code>byte[]</code> on the managed heap and takes its address the exact same way:</p>
 <pre><code><span class="src">libcore/ojluni/src/main/java/java/nio/DirectByteBuffer.java · MemoryRef(int capacity)</span>VMRuntime runtime = VMRuntime.getRuntime();
 buffer = (<span class="k">byte</span>[]) runtime.newNonMovableArray(<span class="k">byte</span>.class, capacity + 7);
 allocatedAddress = runtime.addressOf(buffer);
 <span class="c">// Offset is set to handle the alignment</span>
 offset = (<span class="k">int</span>) (((allocatedAddress + 7) &amp; ~(<span class="k">long</span>) 7) - allocatedAddress);</code></pre>
 
-<p>Because the memory is a Java array, nothing has to free it explicitly. Buffers that own memory the GC does not manage use a
-<b>Cleaner</b> (<code>sun.misc.Cleaner</code>), a callback that runs once its referent becomes unreachable. For those buffers it unmaps the memory.
+<p>Because the backing store is an ordinary managed array, nothing has to free it explicitly. Buffers that wrap memory outside the GC’s control (such as file mappings) attach a
+<b>Cleaner</b> (<code>sun.misc.Cleaner</code>), a phantom-reference callback that unmaps the region once the buffer becomes unreachable.
 On ART only the file-mapped constructor creates one. The <code>allocateDirect</code> path sets <code>cleaner = null</code>, with the comment
 “no need for a cleaner since the GC will do all the work”.</p>
 
@@ -333,10 +340,10 @@ final <code>memoryRef</code>. ART’s optimizer does not treat final instance fi
 </svg>
 </figure>
 
-<p>The framework already uses the pattern this page proposes. <code>android.graphics.PathIterator</code> allocates its point buffer with
-<code>newNonMovableArray</code> and takes <code>addressOf</code> once in the constructor. It passes the address to a
-<code>@CriticalNative</code> method, the cheapest JNI binding: static, primitive arguments only, and no <code>JNIEnv</code>.
-It also keeps a fallback for runtimes that are not ART:</p>
+<p>The Android framework already uses this exact pattern in performance-sensitive graphics code. <code>android.graphics.PathIterator</code> allocates its scratch point buffer with
+<code>newNonMovableArray</code> and records <code>addressOf</code> once in the constructor. It passes that <code>long</code> address to a
+<code>@CriticalNative</code> method, the lowest-overhead JNI binding, restricted to static methods with primitive arguments and no <code>JNIEnv</code>.
+It also keeps a standard array fallback for host JVMs (<code>IS_DALVIK</code> checks <code>"Dalvik".equals(System.getProperty("java.vm.name"))</code>, a historical property value ART kept for compatibility):</p>
 <pre><code><span class="src">frameworks/base/graphics/java/android/graphics/PathIterator.java</span><span class="k">if</span> (IS_DALVIK) {
     <span class="k">final</span> VMRuntime runtime = VMRuntime.getRuntime();
     mPointsArray = (<span class="k">float</span>[]) runtime.newNonMovableArray(<span class="k">float</span>.class, POINT_ARRAY_SIZE);
@@ -405,7 +412,7 @@ raw_body-&gt;reset_after_emit();      <span class="c">// raw_.buf = nullptr agai
 
 <div class="two">
 <div>
-<h3>Rules</h3>
+<h4>Rules</h4>
 <ol>
   <li><b>Pass the address on every call</b>, and never keep it in native code after the call returns.</li>
   <li><b>Read the address after encoding finishes.</b> <code>ensureCapacity</code> may have replaced the array, and a new array has a new address.</li>
@@ -414,7 +421,7 @@ raw_body-&gt;reset_after_emit();      <span class="c">// raw_.buf = nullptr agai
 </ol>
 </div>
 <div>
-<h3>Tradeoffs</h3>
+<h4>Tradeoffs</h4>
 <ul>
   <li><b>Space.</b> The non-moving space has a fixed default size and is never compacted, so it fragments. Use small, reused buffers that grow geometrically.
       The branch starts at 512 bytes. The default size is in Numbers and method.</li>
@@ -442,8 +449,9 @@ If the name is also encoded in Java, into the same buffer or as an interned id (
 <div class="part">Part II · Writing the bytes in Java</div>
 
 <h2 id="put"><span class="n">5</span>One direct-buffer put() wraps a single store in a chain of loads and checks</h2>
-<p>If a direct buffer gives native code the same pointer, why not encode into a <code>DirectByteBuffer</code>? Because of what each
-<code>put(byte)</code> does on the Java side:</p>
+<p>Part I showed that on ART a <code>DirectByteBuffer</code> and a non-movable <code>byte[]</code> sit on the exact same heap memory, and both emit a single byte-store instruction for the payload itself.
+Why, then, is encoding protobuf varints and fixed-width integers byte-by-byte into a <code>DirectByteBuffer</code> so much slower than writing into a <code>byte[]</code>?
+Look at the state checks and mutable field updates that <code>DirectByteBuffer.put(byte)</code> runs around each byte:</p>
 <pre><code><span class="src">libcore/ojluni/src/main/java/java/nio/DirectByteBuffer.java</span><span class="k">public final</span> ByteBuffer put(<span class="k">byte</span> x) {
     <span class="k">if</span> (!memoryRef.isAccessible) {
         <span class="k">throw new</span> IllegalStateException(<span class="k">"buffer is inaccessible"</span>);
@@ -460,11 +468,9 @@ If the name is also encoded in Java, into the same buffer or as an interned id (
 }
 <span class="c">// Buffer.nextPutIndex(): int p = position; if (p &gt;= limit) throw ...; position = p + 1; return p;</span></code></pre>
 
-<p><code>Memory.pokeByte</code> is an <b>intrinsic</b>. The compiler recognizes the call and replaces it with inline machine code, here a
-single arm64 <code>strb</code> (store byte). So the call overhead disappears.
-What remains is that the compiler must record which memory the store may touch, and for a raw address the answer is “any”.
-The intrinsic is declared <code>kWriteSideEffects</code>, which the compiler records as <code>SideEffects::AllWrites()</code>. Section 7 explains the consequences.
-Nothing after the poke keeps the buffer alive explicitly. The method relies on ART keeping <code>this</code> live until it returns (Section 8).</p>
+<p><code>Memory.pokeByte</code> is an <b>intrinsic</b>: ART’s compiler recognizes the signature and emits a single arm64 <code>strb</code> (store byte) instead of a JNI call (<a href="../art_costs/index.html#ir">Where the costs are in ART</a>).
+Its destination, however, is an untyped 64-bit <code>long</code> that could point anywhere in memory, so the intrinsic is declared <code>kWriteSideEffects</code> (<code>SideEffects::AllWrites()</code>, Section 7).
+Nothing after the poke keeps the buffer alive explicitly; the method relies on ART keeping <code>this</code> live until it returns (Section 8).</p>
 
 <figure>
 <figcaption><b>Figure 4. The store is one instruction either way; the direct buffer wraps it in field loads and checks.</b> The store itself (blue) is the same single instruction in both cases. Everything around it differs. If the call site’s
@@ -507,12 +513,13 @@ It drops the buffer checks but not the side-effect problem, and a wrong address 
 
 <!-- ───────────── Bounds ───────────── -->
 <h2 id="bounds"><span class="n">6</span>The compiler can delete array bounds checks, but not a buffer’s</h2>
-<p>Java requires every array access and every buffer <code>put()</code> to be checked against its bound. A compare and branch per byte is
-a large overhead next to a one-instruction store. So what matters is which checks the compiler can delete.</p>
-<p>ART’s optimizing compiler represents a method as a graph of instructions whose class names start with H. <code>a[i] = v</code> becomes
-an <code>HArraySet</code> guarded by an <code>HBoundsCheck(i, a.length)</code>. <code>put()</code> instead runs an explicit
-<code>p &gt;= limit</code> test in <code>nextPutIndex</code>, which is ordinary Java code. <b>Bounds-check elimination</b> (BCE) is the
-pass that deletes bounds checks it can prove redundant. Whether it can depends on where the bound lives.</p>
+<p>Java enforces memory safety on every indexed write: writing past the end of an array or buffer must throw an exception rather than corrupting adjacent memory.
+Checking <code>0 &lt;= pos &lt; bound</code> on every byte of an 8-byte integer would emit eight compare-and-branch pairs around eight byte stores.
+To avoid that tax, an optimizing compiler tries to hoist or collapse repeated checks into a single guard ahead of the writes, which requires knowing that the bound cannot change mid-sequence.</p>
+<p>In ART’s optimizing compiler, a method’s intermediate representation (IR) is a graph of typed nodes whose class names start with <code>H</code>.
+An array store <code>a[i] = v</code> lowers to <code>HArraySet</code> guarded by <code>HBoundsCheck(i, a.length)</code>, where <code>HArrayLength</code> has <code>SideEffects::None()</code> because array length never changes.</p>
+<p><code>DirectByteBuffer.put()</code> instead runs a plain Java <code>if (p &gt;= limit)</code> branch inside <code>nextPutIndex</code>, comparing two mutable <code>int</code> fields.
+<b>Bounds-check elimination</b> (BCE) folds or hoists redundant <code>HBoundsCheck</code> nodes, so that structural difference decides whether checks disappear.</p>
 
 <figure>
 <figcaption><b>Figure 5. An array’s bound never changes; a buffer’s bound is two fields that can.</b> The compiler knows an array’s length never changes across writes, so it loads it once and reuses it. A buffer’s bound lives in mutable fields, which have no such guarantee.</figcaption>
@@ -577,12 +584,11 @@ the compiler an immutable bound to reason about and nothing to reload.
 
 <!-- ───────────── Side effects ───────────── -->
 <h2 id="sidefx"><span class="n">7</span>A raw-address write makes the compiler forget every field it loaded</h2>
-<p>Section 5 showed the buffer’s fields being reloaded around every poke. That comes from how the compiler decides whether a value it loaded
-earlier is still valid. Two memory accesses <b>alias</b> if they may touch the same location. A loaded value can only be reused if
-nothing in between may alias it.</p>
-<p>To answer that cheaply, the optimizing compiler records <b>side effects</b> for every instruction: which kinds of memory it may read
-and write. Fields are tracked by type, and arrays by element type. That set decides what the compiler may
-keep in a register across the instruction.</p>
+<p>Why couldn’t the compiler at least keep <code>buf.position</code>, <code>buf.limit</code> and <code>buf.address</code> in registers across consecutive <code>DirectByteBuffer.put()</code> calls?
+The obstacle is <b>pointer aliasing</b>: keeping a heap field in a CPU register across a store is only legal if the compiler can prove that the store did not overwrite that same memory location.
+In strongly typed Java, memory is partitioned cleanly by type: writing to a <code>byte[]</code> element can never overwrite an object’s <code>int</code> or <code>long</code> fields, because arrays and object fields occupy disjoint layouts.</p>
+<p>To check aliasing fast without expensive whole-program pointer analysis, ART’s compiler tags every IR instruction with a compact <b>side-effects</b> bitset listing which categories of heap memory (field types and array element types) it may read or write.
+As soon as code steps outside Java’s type system and passes a raw 64-bit integer address to <code>Memory.pokeByte(addr, v)</code>, that partitioning collapses: as far as the compiler knows, <code>addr</code> could point straight at <code>buf.position</code> itself.</p>
 
 <figure>
 <figcaption><b>Figure 6. An array store touches only array elements; a raw poke might touch anything.</b> A raw address is a number, and the compiler cannot tell what it points at. It might be the memory holding
@@ -621,7 +627,7 @@ register and reuses it. It has nothing to do with the L1 cache. A register read 
 instruction waits for.</p>
 
 <figure>
-<figcaption><b>Figure 7. Without a poke, the position is loaded once; with one, it goes back to memory around every byte.</b> Top: with nothing opaque between the writes, <code>pos</code> is loaded once, kept in register w1, and stored once. Bottom: each
+<figcaption><b>Figure 7. Without a poke, the position is loaded once; with one, it goes back to memory around every byte.</b> Top: with nothing opaque between the writes, <code>pos</code> is loaded once, kept in register <code>w1</code>, and stored once. Bottom: each
 poke forces <code>position</code> back to memory before it and a reload after it. Every other buffer field
 (<code>memoryRef</code>, <code>isAccessible</code>, <code>isReadOnly</code>, <code>limit</code>, <code>address</code>) is reloaded after it too.</figcaption>
 <svg viewBox="0 0 1000 300" role="img" aria-label="Register vs memory traffic">
@@ -683,14 +689,15 @@ str  w1, [x0, #position]</code></pre>
 </div>
 
 <h3 id="passes">LSE, GVN and LICM all lose to the poke</h3>
-<p>Three passes remove redundant memory traffic, and each needs a proof that nothing in between wrote the value. The poke in
-<code>put()</code> is an intrinsic call, which the compiler still represents as an <code>HInvoke</code> (its node for a method call), with <code>AllWrites</code>. Each pass handles it like this:</p>
+<p>In a normal Java method, ART relies on three complementary optimization passes to strip away redundant heap loads and stores: one tracks memory values along paths through a method, one deduplicates identical computations, and one hoists unchanging loads out of loops.
+All three consult the instruction’s side-effects bitset before reusing a heap value.
+Because <code>Memory.pokeByte</code> stays in the IR graph as an <code>HInvoke</code> (ART’s call node) tagged with <code>AllWrites</code>, it defeats every one of them:</p>
 <table>
   <thead><tr><th>Pass</th><th>What it removes</th><th><code>Memory.pokeByte</code> (an <code>HInvoke</code> with <code>AllWrites</code>)</th></tr></thead>
   <tbody>
     <tr><td><b>LSE</b> · load/store elimination</td><td>Reloads of a known value; stores that are overwritten before being read.</td><td class="bad"><code>HandleInvoke</code>: every heap value that might be shared (anything but a fresh, non-escaping allocation, i.e. an object created in this method that no other code can see) becomes unknown, and pending stores must be kept.</td></tr>
     <tr><td><b>GVN</b> · global value numbering</td><td>Recomputing an identical value, including loads.</td><td class="bad"><code>set-&gt;Kill(current-&gt;GetSideEffects())</code> drops every load of a written type</td></tr>
-    <tr><td><b>LICM</b> · loop-invariant code motion</td><td>Work that gives the same result on every iteration.</td><td class="bad">loop effects include AllWrites, so no field load is hoisted</td></tr>
+    <tr><td><b>LICM</b> · loop-invariant code motion</td><td>Work that gives the same result on every iteration.</td><td class="bad">loop effects include <code>AllWrites</code>, so no field load is hoisted</td></tr>
   </tbody>
 </table>
 <p>So inside <code>put()</code> the poke forces every reload. A <code>byte[]</code> loop with <code>pos</code> in a local
@@ -705,25 +712,21 @@ loaded and stored again for every byte.
 <div class="part">Part III · Keeping it alive</div>
 
 <h2 id="liveness"><span class="n">8</span>Something must keep the array alive while native code uses its address</h2>
-<p>The GC frees an object once it is no longer <b>reachable</b>, meaning no chain of references from a GC root leads to it.
-Roots are things like a thread’s stack, a static field or a JNI global reference.
-A <code>long</code> holding the object’s address is not a reference. So once code works only with the address, the object’s survival
-depends on how long the compiler keeps the original reference visible to the GC.</p>
-<p>The Java language rules let an object become unreachable after its last use, even while a method that used it is still running.
-ART has historically been more conservative. To see how, three terms are needed:</p>
+<p>Even when an array never moves, turning it into a raw <code>long</code> address introduces a lifetime hazard.
+A tracing collector finds live objects solely by following typed references from <b>GC roots</b> (thread stacks, static fields, and JNI local or global reference tables).
+An untyped <code>long</code> holding <code>addressOf(buf)</code> is invisible to the GC: once code stops reading the Java reference <code>buf</code>, a concurrent GC could reclaim the array and reuse its non-moving slot mid-call.</p>
+<p>Under the Java Language Specification, an object may become unreachable immediately after the last expression that reads its reference, even before the enclosing method returns.
+On Android, a long-standing implementation choice in ART masked many bugs of this kind. Three runtime concepts explain how:</p>
 <ul>
-  <li>A <b>safepoint</b> is a place in compiled code, such as a call or a loop back-edge (the jump back to the top of a loop), where
-      the thread may stop for GC.</li>
-  <li>A <b>stack map</b> tells the GC which stack slots and registers hold live references at that safepoint.</li>
-  <li>The method’s <b>environment</b> is the set of values recorded at each safepoint.</li>
+  <li>A <b>safepoint</b> is a point in compiled code, such as a method call or a loop back-edge (the jump back to the top of a loop), where a thread is allowed to pause for GC.</li>
+  <li>A <b>stack map</b> is metadata emitted at each safepoint telling the GC which CPU registers and stack slots currently hold live object references.</li>
+  <li>The method’s <b>environment</b> is the mapping from dex bytecode’s virtual registers to machine registers or stack slots recorded at each safepoint (used for deoptimization as well as root scanning).</li>
 </ul>
-<p>By default ART keeps every reference in the environment live.
-<code>SsaLivenessAnalysis::ShouldBeLiveForEnvironment</code> returns true for every reference unless the graph is <b>dead-reference safe</b>,
-meaning the compiler may drop a reference after its last use.</p>
-<p>That only happens for classes annotated <code>@DeadReferenceSafe</code>. It does not happen for methods that touch a
-<code>@ReachabilitySensitive</code> member, which is a field, usually a native pointer, whose owner must stay alive while it is used.
-The <code>@DeadReferenceSafe</code> documentation describes the risk: an object is finalized and its native memory freed while a method is
-still using a pointer copied out of it. It then says: “Historically, ART has avoided this by keeping ‘this’ reachable until m() completes.”</p>
+<p>By default, ART includes every reference still occupying a dex virtual register in the safepoint’s stack map, even after the code’s last lexical read of that variable.
+<code>SsaLivenessAnalysis::ShouldBeLiveForEnvironment</code> returns true for every reference unless the method’s graph is marked <b>dead-reference safe</b>,
+meaning the compiler is allowed to drop dead references right after their last use so large object graphs are not pinned unnecessarily across long methods.</p>
+<p>Today ART prunes dead references only in platform classes annotated <code>@DeadReferenceSafe</code>, and disables pruning for methods touching a <code>@ReachabilitySensitive</code> field or cleanup method.
+The <code>@DeadReferenceSafe</code> javadoc describes the classic failure, where a finalized wrapper frees its native struct while a method still dereferences the copied pointer, and notes: “Historically, ART has avoided this by keeping ‘this’ reachable until m() completes.”</p>
 
 <figure>
 <figcaption><b>Figure 8. Only the fence keeps the object alive under every policy.</b> The blue and green bars show when <code>this</code>, and so the memory behind <code>address</code>, is guaranteed alive.
@@ -759,11 +762,10 @@ A <code>byte[]</code> store does not have this problem, because <code>a[i] = v</
 </svg>
 </figure>
 
-<p><code>Reference.reachabilityFence(obj)</code> is that artificial use. The compiler treats it as an intrinsic. The call stays in the graph as an
-<code>HInvoke</code> whose argument keeps the reference live up to that point, so the reference is in the stack maps of the safepoints before it.
-It is declared with write side effects, so dead-code elimination cannot remove it, and the arm64 intrinsic code generator’s <code>VisitReachabilityFence</code> is empty.</p>
+<p>When a local variable is the sole reference to an object whose raw address is in use, <code>Reference.reachabilityFence(obj)</code> gives a portable guarantee instead of relying on ART’s default.
+The fence stays in the IR as an <code>HInvoke</code> intrinsic that extends <code>obj</code>’s live range past preceding safepoints; <code>kWriteSideEffects</code> prevents dead-code elimination while arm64’s <code>VisitReachabilityFence</code> emits zero instructions.</p>
 
-<h3>The fence costs no instructions, but it blocks some optimizations</h3>
+<h3 id="fence-cost">The fence costs no instructions, but it blocks some optimizations</h3>
 <table>
   <thead><tr><th>Kind</th><th>Cost</th></tr></thead>
   <tbody>
@@ -774,11 +776,8 @@ It is declared with write side effects, so dead-code elimination cannot remove i
     <tr><td><code>try/finally</code></td><td>Putting the fence in a <code>finally</code> block, so it runs on every path, adds a try region. ART inlines methods with try/catch (<code>kInlineTryCatches</code>), except at call sites that are themselves inside a try block, or that were devirtualized through CHA (class hierarchy analysis, which proves only one implementation is loaded) or an inline cache (the receiver classes recorded at that call site at run time).</td></tr>
   </tbody>
 </table>
-<p>Per byte, in a hot write loop, these costs would add up. <code>DirectByteBuffer.put</code> has no fence at all: it relies on the “ART default” column of Figure 8.
-Once per event, around a JNI call, they are negligible, because the call
-is already an opaque point for every pass. In the SDK design a fence is likely unnecessary anyway.
-<code>mBuf</code> stays reachable through the <code>ProtoWriter</code> that the thread-local builder holds.
-And because the array is non-movable, a GC during the native call cannot relocate it either.</p>
+<p>Per byte in a hot write loop, those costs would add up; <code>DirectByteBuffer.put</code> omits the fence and relies on ART’s default column in Figure 8.
+Once per event around a JNI call, the cost vanishes because the call is already opaque to the optimizer, and in the SDK design <code>mBuf</code> stays strongly reachable through the thread-local builder’s <code>ProtoWriter</code> anyway.</p>
 
 <blockquote class="key"><span class="lbl">What it means for you</span>
 Whenever you turn an object into a raw address, something else has to keep it alive. Prefer a strong field the GC can see.
@@ -793,7 +792,7 @@ Use <code>reachabilityFence</code> after the last raw access when the only refer
     <tr><td>Bound</td><td class="good">immutable <code>length</code></td><td class="bad">mutable <code>position</code>/<code>limit</code> fields</td><td class="good">immutable <code>length</code></td></tr>
     <tr><td>Bounds check</td><td class="good"><code>HBoundsCheck</code>, removable by BCE</td><td class="bad">explicit branch, reloaded each put</td><td class="good"><code>HBoundsCheck</code>, removable by BCE</td></tr>
     <tr><td>Write position</td><td class="good">local, in a register</td><td class="bad">field, loaded and stored per byte</td><td class="good">local, in a register</td></tr>
-    <tr><td>Store side effects</td><td class="good">byte[] elements only</td><td class="bad"><code>AllWrites</code> (poke)</td><td class="good">byte[] elements only</td></tr>
+    <tr><td>Store side effects</td><td class="good"><code>byte[]</code> elements only</td><td class="bad"><code>AllWrites</code> (poke)</td><td class="good"><code>byte[]</code> elements only</td></tr>
     <tr><td>Liveness</td><td class="good">implicit</td><td class="warn">no fence; relies on ART keeping <code>this</code> live</td><td class="good">a strong field; fence only if needed</td></tr>
     <tr><td>Native access</td><td class="bad">copy (<code>GetByteArrayRegion</code>)</td><td class="good">pointer (<code>GetDirectBufferAddress</code>)</td><td class="good">pointer via <code>addressOf</code></td></tr>
     <tr><td>Available on host</td><td class="good">yes</td><td class="good">yes</td><td class="bad">ART only; needs a fallback</td></tr>

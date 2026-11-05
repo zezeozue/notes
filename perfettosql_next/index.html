@@ -67,42 +67,33 @@
 
 <main id="top">
 <h1>PerfettoSQL: every statement goes through a generated parser, and pipe queries run on Perfetto's own executor</h1>
-<p class="lead">This page explains how Trace Processor turns PerfettoSQL text into results.
-It starts with tokens and grammars, then follows one query through the parser, the pipeline compiler and the executor.
-It ends with a recipe for adding a new pipe operator.</p>
+<p class="lead">Trace Processor embeds SQLite, yet stock SQLite alone hit two architectural ceilings as Perfetto grew: SQLite exposes no syntax tree for modules or macros, and its virtual-table boundary steps multi-stage queries one row at a time.
+This note explains why Perfetto put a generated LALR(1) parser in front of SQLite and built a columnar batch executor for <code>|&gt;</code> pipe queries, then traces one query from raw bytes to output rows.</p>
 <p class="m">Code is from the upstream Perfetto repository, main as of late October 2026, and code marked <em>shape</em> is simplified.
 Pipe syntax is experimental and changes quickly, so treat the names as a snapshot. Its status is in the design doc
 <code>docs/design-docs/perfetto-sql-pipelines.md</code> in the Perfetto repository.</p>
 
 <h2 id="glance">At a glance</h2>
 <ul>
-<li><b>One parser for everything.</b> Perfetto parses every statement itself, with a parser generated from SQLite's grammar plus Perfetto's additions.</li>
-<li><b>Three routes.</b> Plain SQL goes on to SQLite. Perfetto's own statements run in C++. Pipe queries go to a separate compiler.</li>
-<li><b>Macros stay traceable.</b> Macros expand while the text is being tokenized, and errors still point at the text you wrote.</li>
-<li><b>Pipes skip SQLite's interpreter.</b> A pipe query becomes a plan that Perfetto runs in fast column batches. SQLite only hands the rows back.</li>
-<li><b>Adding an operator is small.</b> A new pipe stage needs about five files of real work. The hard part is saying which columns it reads and what order it leaves.</li>
+<li><b>One generated parser in front of SQLite.</b> Stock SQLite compiles SQL straight to bytecode without exposing a syntax tree, so Perfetto parses every statement first with a Lemon parser built from SQLite's grammar plus PerfettoSQL rules.</li>
+<li><b>Three execution routes from one AST.</b> Plain SQL forwards to SQLite, catalog extensions (<code>CREATE PERFETTO …</code>, <code>INCLUDE</code>) run in C++, and <code>|&gt;</code> pipe queries compile onto Perfetto's batch executor.</li>
+<li><b>Token-level macros keep accurate tracebacks.</b> Macros expand inside the tokenizer as numbered token layers while recording byte-range rewrites, so SQLite errors still point back to the line you wrote.</li>
+<li><b>Pipelines bypass row-at-a-time interpretation.</b> Multi-stage <code>|&gt;</code> queries run in C++ over columnar batches of up to 2,048 rows, crossing into SQLite only once to stream final rows out.</li>
+<li><b>Modular operator registration.</b> Adding a new pipe stage touches roughly five files; the real design work is declaring which columns it reads and what row order it preserves.</li>
 </ul>
-<p><b>Terms.</b> A <b>token</b> is the smallest unit of text that means something, such as a keyword or a name.
-A <b>grammar</b> is the set of rules that says which token sequences are valid.
-An <b>AST</b> (abstract syntax tree) is the tree of what a statement means.
-<b>Lemon</b> is SQLite's tool that turns a grammar into a parser, and <b>syntaqlite</b> is the project that builds Perfetto's parser with it.</p>
-<p><b>Trace Processor</b> is Perfetto's query engine: it loads a trace and answers SQL over it.
-A <b>dataframe</b> is Perfetto's in-memory column store, where trace data lives.
-A <b>virtual table</b> (vtab) is a SQLite table whose rows come from C++ code.
-A <b>pipeline</b> is a query written with <code>|&gt;</code> stages.
-The <b>standard library</b> (stdlib) is the set of PerfettoSQL modules that ship with Trace Processor, loaded with <code>INCLUDE PERFETTO MODULE</code>.
-Names that start with <code>__intrinsic_</code> are <b>intrinsics</b>: tables and functions Trace Processor registers for its own use, not public API.</p>
+<p><b>Terms.</b> <b>Trace Processor</b> is Perfetto's C++ query engine: it ingests a trace into in-memory columnar tables called <b>dataframes</b> and exposes them to SQLite as <b>virtual tables</b> (vtabs) backed by C++ callbacks.
+SQLite executes queries by compiling SQL into bytecode for its scalar interpreter, the <b>VDBE</b> (Virtual Database Engine).
+The <b>standard library</b> (stdlib) is the collection of reusable PerfettoSQL modules shipped with Trace Processor and loaded via <code>INCLUDE PERFETTO MODULE</code>.
+Names starting with <code>__intrinsic_</code> are <b>intrinsics</b>: internal tables and functions Trace Processor registers for its own plumbing rather than public queries.</p>
+<p>On the compiler side, a <b>token</b> is the smallest meaningful slice of text (such as a keyword, identifier, or operator), and a <b>grammar</b> is the set of rules defining valid token sequences.
+An <b>AST</b> (abstract syntax tree) is the tree representing a statement's structure without redundant punctuation.
+<b>Lemon</b> is SQLite's LALR(1) parser generator, <b>syntaqlite</b> is the toolchain that builds Perfetto's AST-producing dialect parser on top of Lemon, and a <b>pipeline</b> is a dataflow query written with <code>|&gt;</code> stages.</p>
 
-<h2 id="overview">Overview: every statement is parsed once by Perfetto, then takes one of three routes</h2>
-<p>Every statement goes through Perfetto's own parser before SQLite sees it.
-SQLite runs a query in two steps. <b>Prepare</b> compiles the text into bytecode for SQLite's interpreter, the <b>VDBE</b> (Virtual Database Engine).
-<b>Step</b> then runs that bytecode one result row at a time.
-Trace data is not in SQLite's own storage. SQLite reads dataframes through virtual tables.</p>
-<p><b>PerfettoSQL</b> is SQLite's SQL plus statements SQLite lacks, such as <code>CREATE PERFETTO TABLE</code>, <code>INCLUDE PERFETTO MODULE</code> and macros.
-It also has a pipe syntax, switched on by a setting called a <b>pragma</b>.
-Pipe stages do not run as VDBE bytecode. They run on Perfetto's own executor.
-It processes rows in <b>batches</b> of up to 2048 rows held as columns, using C++ loops.</p>
-<p>The parser's output then picks one of the three routes in Figure 1.</p>
+<h2 id="overview">Overview: why Perfetto parses SQL itself, then routes each statement one of three ways</h2>
+<p>Why build a custom SQL parser and execution engine inside a system that already embeds SQLite? Two concrete bottlenecks forced the design.</p>
+<p><b>First, scaling a reusable SQL standard library broke text-level preprocessing.</b> Perfetto's standard library grew to hundreds of SQL modules that needed module imports (<code>INCLUDE PERFETTO MODULE</code>), typed materialized tables and functions (<code>CREATE PERFETTO TABLE</code>, <code>CREATE PERFETTO FUNCTION</code>), and parameterized macros (<code>CREATE PERFETTO MACRO</code>) because SQL functions cannot accept tables or expressions as arguments. Early versions split statements and expanded macros with ad-hoc text scanning before handing the result to SQLite. That brittle preprocessing tripped over comments, string literals, and nested subqueries, and macro substitution shifted character offsets so SQLite errors pointed into generated text instead of the author's file and line. Calling SQLite's internal parser was not an option either: SQLite emits VDBE bytecode directly inside grammar actions and never exposes a syntax tree. Generating a full AST parser from SQLite's grammar plus PerfettoSQL extensions solved syntax extensions and multi-layer error tracebacks cleanly.</p>
+<p><b>Second, multi-stage analytical queries hit SQLite's row-at-a-time virtual-table wall.</b> As <a href="../trace_processor_internals/index.html">Trace Processor internals</a> covers, trace data lives in dense columnar dataframes rather than SQLite B-trees. SQLite's virtual-table API pushes single-table filters down into a dataframe cleanly, so simple scans are fast. Multi-step analysis is different: joins, expressions across views, hierarchical slice rollups, and sorts pull intermediate rows across virtual-table callbacks one row and one column cell at a time through the VDBE interpreter. Standard SQL also forces multi-step queries to read inside-out as nested subqueries. Adding GoogleSQL-style <code>|&gt;</code> pipe syntax (gated for user queries behind <code>PERFETTO PRAGMA pipelines = 1</code>) lets analysts write top-to-bottom dataflow queries while Trace Processor compiles the whole multi-stage pipeline onto its own C++ columnar executor, processing up to 2,048 rows per batch.</p>
+<p>Because every statement passes through Perfetto's parser first, the root node of its AST cleanly selects one of three execution routes (Figure 1): plain SQL forwards to SQLite, PerfettoSQL catalog statements execute in C++, and <code>|&gt;</code> pipelines compile into a C++ batch plan wrapped in a single bridge virtual-table call.</p>
 
 <figure>
 <figcaption><b>Figure 1. Every statement is parsed by syntaqlite, then goes to one of three places.</b> Plain SQL is parsed a second
@@ -167,13 +158,14 @@ Each row of this table is one section.</p>
 <!-- ═════════════════════════ PART I ═════════════════════════ -->
 <div class="part">Part I · Parsing</div>
 
-<h2 id="tokens"><span class="n">1</span>The tokenizer cuts text into typed tokens and knows nothing about structure</h2>
-<p>Before parsing, a <b>tokenizer</b> (also called a lexer) cuts the text into tokens.
-Tokens are keywords, names, numbers, strings, punctuation, whitespace and comments.
-Each token is a small type number plus the byte range it came from.
-The tokenizer does not check structure. It would happily emit <code>FROM FROM FROM</code>.</p>
-<p>syntaqlite reuses SQLite's hand-written tokenizer. A generated header defines one constant per token type.
-The Perfetto <em>dialect</em> (SQLite's grammar plus Perfetto's additions, Section 3) has about 200 token types, some 20 more than stock SQLite 3.50.6 (sqlite-autoconf-3500600). The table in <a href="#lemon">What Lemon generates</a> has the exact counts.</p>
+<h2 id="tokens"><span class="n">1</span>The tokenizer reuses SQLite's lexical rules and cuts text into typed byte spans</h2>
+<p>Part I explains how Perfetto turns raw SQL text into a compact syntax tree without breaking compatibility with SQLite's dialect or allocating thousands of tiny heap objects per script.
+Parsing starts with lexical analysis because any mismatch in quoting, identifier rules, or numeric literals between Perfetto's front-end and SQLite's own parser would cause plain SQL queries to parse one way in Perfetto and fail inside SQLite.</p>
+<p>A <b>tokenizer</b> (or lexer) scans raw bytes into flat tokens: keywords, identifiers, numbers, string literals, operators, whitespace, and comments.
+Each token carries a small integer type ID plus the half-open byte range it came from.
+The tokenizer checks zero grammar structure—it will happily emit <code>FROM FROM FROM</code> and leave structural validation to the parser.</p>
+<p>To match SQLite byte for byte, syntaqlite reuses SQLite's hand-written tokenizer directly. A generated header defines one constant per token type.
+The Perfetto <em>dialect</em> (SQLite's base grammar plus PerfettoSQL's additions, Section 3) defines 207 token types, twenty more than stock SQLite (exact counts are in <a href="#lemon">What Lemon generates</a>).</p>
 
 <figure>
 <figcaption><b>Figure 2. The example query becomes seven tokens, and the pipe arrives as two.</b> Each token is a type number and a byte range; [0,4) means bytes 0 to 3.
@@ -207,22 +199,21 @@ The numbers come from <code>syntaqlite_perfetto.h</code>, for example FROM is 12
 <p>Keywords are found by looking up words that look like names. A word like TREE is a keyword in this dialect.
 It can still be used as a column name, thanks to the parser's fallback rule (Section 4).</p>
 
-<h2 id="grammar"><span class="n">2</span>A grammar defines valid statements, and an LALR(1) parser checks them one token at a time</h2>
-<p>A grammar tells the parser two things: whether a token list is a valid statement, and what its structure is.
-It is a set of <b>rules</b>, also called productions, that say how tokens combine.
-Each rule has a left side and a right side. The left side is a <b>nonterminal</b>, a named phrase such as <code>perfetto_pipe_stage</code>.
-The right side is a sequence of symbols. Each symbol is a nonterminal or a <b>terminal</b>.
-A terminal is a token type such as ORDER, a leaf that cannot be broken down further. In Lemon syntax:</p>
+<h2 id="grammar"><span class="n">2</span>A Lemon grammar defines valid syntax, and an LALR(1) state machine parses it bottom-up</h2>
+<p>Hand-writing a recursive-descent parser for SQL is a trap: SQLite's dialect has hundreds of productions with subtle precedence interactions across <code>NOT</code>, <code>BETWEEN</code>, <code>CASE</code>, joins, and bitwise operators, and SQLite already maintains its authoritative grammar in a Lemon file (<code>parse.y</code>).
+Layering PerfettoSQL onto that same Lemon grammar guarantees identical operator precedence and forces the parser generator to prove at build time—not when a user runs a query—that new rules introduce no ambiguities.</p>
+<p>A grammar specifies which token sequences form valid statements and how they group into phrases.
+Each <b>rule</b> (or production) has a left-hand <b>nonterminal</b>—a composite phrase such as <code>perfetto_pipe_stage</code>—and a right-hand sequence of nonterminals and <b>terminals</b> (leaf token types such as <code>ORDER</code>). In Lemon syntax:</p>
 <pre><code><span class="src">perfetto.y</span><span class="c">// a pipe stage can be ORDER BY followed by an order list</span>
 perfetto_pipe_stage(A) ::= ORDER BY perfetto_pipe_order_list(L). {
     A = synq_parse_perfetto_pipe_order_by(pCtx, L);
 }</code></pre>
-<p>The letters in parentheses name each symbol's <b>semantic value</b>, the C value the parser carries with it.
-The C block is the <b>action</b>. It runs when the rule matches and computes the left side's value, here the ID of a new tree node.</p>
-<p>The actions decide what goes into the tree, so the AST keeps only what carries meaning.
-Matching rules gives a <b>parse tree</b>, with one node per rule and every token as a leaf, keywords included.
-Nobody needs that much. The AST keeps only "an ORDER BY stage with these terms".
-The rule above builds one PerfettoPipeOrderBy node and drops the two keywords. The rule that matches <code>|&gt;</code> builds no node at all (Section 4).</p>
+<p>The letters in parentheses bind each symbol's <b>semantic value</b>, the C value carried on the parser stack.
+The C block is the rule's <b>action</b>: it runs as soon as the rule matches and computes the left-hand nonterminal's value—here the integer handle of a newly constructed AST node.</p>
+<p>Because each action chooses what to record, the AST keeps semantic meaning and discards syntactic scaffolding.
+A raw <b>parse tree</b> would allocate a node for every intermediate grammar rule and keep every keyword token as a leaf.
+Downstream compilers only care about "an ORDER BY stage with this list of sort terms".
+The action above allocates one <code>PerfettoPipeOrderBy</code> node and drops both keywords, while the rule matching <code>|&gt;</code> allocates no node at all (Section 4).</p>
 
 <figure>
 <figcaption><b>Figure 3. The AST keeps the meaning and drops the keywords.</b> Left, the parse tree for the stage <code>ORDER BY ts</code>.
@@ -247,17 +238,17 @@ Right, the node this rule's action builds. The term below it was built earlier, 
 </svg>
 </figure>
 
-<p>An <b>LR parser</b> reads tokens left to right and keeps a stack. At each step it does one of two things.
-It can <b>shift</b>, which pushes the next token. Or it can <b>reduce</b>: when the top of the stack matches a rule's right side, it pops those
-symbols, runs the action and pushes the left side. So it builds the tree bottom-up, finishing children before their parent.</p>
-<p>A state machine decides between shift and reduce. Each <b>state</b> stands for "where we might be in which rules".
-The choice depends on the state plus <b>one token of lookahead</b>, the next token, read but not yet consumed. That is the "(1)" in the name.
-<b>LALR</b> (look-ahead LR) is one way to build the state machine. It merges states that differ only in which lookahead tokens they expect.
-This gives much smaller tables than a full LR parser. The cost is that it sometimes reports conflicts a full LR parser would not. SQLite's grammar fits.</p>
-<p>A <b>conflict</b> means one token of lookahead cannot tell two readings apart.
-The grammar then allows two actions for one state and lookahead: shift or reduce, or reduce by either of two rules.
-A grammar can declare operator precedence (<code>%left</code>, <code>%right</code>) to settle shift/reduce conflicts.
-Lemon reports any conflict left over when it generates the parser, never when a query runs.</p>
+<p>How does the generated parser match rules in a single left-to-right pass without backtracking? Lemon builds a bottom-up <b>LR parser</b> that maintains an explicit stack of symbols it has partially matched. At each step it chooses between two moves:</p>
+<ul>
+  <li><b>Shift</b>: push the next input token onto the stack because the current phrase is not complete yet.</li>
+  <li><b>Reduce</b>: when the symbols at the top of the stack match a rule's right-hand side, pop them off, execute the rule's C action, and push the resulting left-hand nonterminal in their place. Because inner phrases reduce before outer phrases, children always exist before their parent node is built.</li>
+</ul>
+<p>A precomputed finite state machine picks between shifting and reducing in constant time. Each <b>state</b> encodes the set of grammar rules that remain viable given the stack prefix so far.
+To choose its move, the state machine inspects the current state and <b>one unconsumed lookahead token</b>—the "(1)" in <b>LALR(1)</b>.
+<b>LALR</b> (Look-Ahead LR) keeps the table compact by merging parser states that track the exact same grammar positions and differ only in which lookahead tokens can follow.
+Full canonical LR tables can explode to tens of thousands of states on SQL; LALR compresses Perfetto's entire dialect into under eight hundred states (Figure 5) while still accepting SQLite's grammar cleanly.</p>
+<p>If one token of lookahead cannot distinguish two valid parses for the same state—either shifting vs reducing, or reducing by two different rules—Lemon reports a <b>conflict</b> when generating the parser, never at query run time.
+Standard expression ambiguities (such as whether <code>a + b * c</code> reduces <code>+</code> first or shifts <code>*</code>) are resolved declaratively via precedence directives (<code>%left</code>, <code>%right</code>).</p>
 
 <figure>
 <figcaption><b>Figure 4. The parser shifts tokens and reduces rules, so the source node exists before the stage, and the stage before the pipeline.</b>
@@ -336,15 +327,12 @@ That is why nobody edits the generated C by hand, and why it is checked in whole
 If Lemon reports a conflict, the new rule is ambiguous with an existing one under one token of lookahead. Fix the grammar, not the action code.
 </blockquote>
 
-<h2 id="syntaqlite"><span class="n">3</span>syntaqlite gives Perfetto the syntax tree that SQLite never exposes</h2>
-<p>Perfetto needs a syntax tree, and SQLite does not offer one.
-SQLite's parser actions fill internal structures and pass them straight to its code generator.
-Perfetto needs a tree to find its own statements, compile pipelines, expand macros with exact error locations, work out a query's columns, and format SQL.
-<b>syntaqlite</b> is a separate project that fills this gap. It reuses SQLite's tokenizer and grammar, but every rule's action builds a typed AST node.
-It also lets you extend the grammar with a <b>dialect</b>: a named set of extra rules, node types and keywords layered on SQLite's.</p>
-<p>Perfetto's dialect is two hand-written files in <code>src/perfetto_sql/syntaqlite/</code>.
-The syntaqlite tool combines them with the base SQLite grammar it carries.
-It writes one self-contained C file and a header, and both are checked in.</p>
+<h2 id="syntaqlite"><span class="n">3</span>syntaqlite replaces SQLite's inline bytecode actions with a typed syntax tree</h2>
+<p>Why couldn't Trace Processor simply call SQLite's own parser? Inside stock SQLite, grammar actions in <code>parse.y</code> never materialize a standalone AST: they populate internal symbol tables attached to a <code>Parse</code> struct and emit VDBE opcodes on the fly.
+Trace Processor needs an explicit tree to dispatch PerfettoSQL statements, compile pipelines, track macro spans for error tracebacks, infer query schemas statically, and auto-format SQL files.
+<b>syntaqlite</b> fills that gap: it pairs SQLite's base tokenizer and grammar with generated C actions that construct typed AST nodes, and lets projects layer a custom <b>dialect</b>—extra rules, node types, and keywords—on top.</p>
+<p>Perfetto's dialect lives in two hand-written files under <code>src/perfetto_sql/syntaqlite/</code>.
+The syntaqlite generator merges them with its bundled SQLite base grammar and emits one self-contained C file plus a header, both checked into the repository so normal builds need no external tool.</p>
 
 <figure>
 <figcaption><b>Figure 6. Two hand-written files become one generated parser.</b> The same files also build the formatter for <code>.sql</code> files.</figcaption>
@@ -419,14 +407,14 @@ For example, <code>abstract PerfettoPipeStage</code> lists the eleven stage node
 <code>PerfettoIntervalFillGaps</code>, <code>PerfettoPipeOrderBy</code>, <code>PerfettoPipeAggregate</code> and six projections. <code>semantic { … }</code> blocks feed syntaqlite's own analysis.
 For example, <code>define_table</code> on <code>CreatePerfettoTableStmt</code> tells that analysis the statement defines a table.</p>
 
-<h3 id="arena">Tree nodes live in one buffer that is thrown away after each statement</h3>
-<p>All of a statement's nodes go into one buffer, the <b>arena</b>, which is reset as a whole before the next statement.
-A statement creates dozens of small nodes that all die together. Allocating and freeing each one would be wasted work.
-Nodes point to each other by <b>node ID</b>, a 32-bit number that names a node within the arena, not by memory address.
-<code>SYNTAQLITE_NULL_NODE</code> (0xFFFFFFFF) means "absent". Lists are nodes too: a tag, a count and an array of child IDs.
-Names are stored as byte ranges into the source (<code>SyntaqliteTextSpan</code>), so they are never copied.</p>
-<p>Because of the reset, memory grows with one statement, not the whole script.
-The catch is that a pointer from <code>syntaqlite_parser_node(p, id)</code> is valid only until the next <code>syntaqlite_parser_next()</code>.</p>
+<h3 id="arena">Tree nodes pack into a per-statement arena, avoiding per-node heap allocations</h3>
+<p>Loading the standard library parses hundreds of SQL statements in sequence, each producing dozens of short-lived AST nodes that become garbage the moment the statement finishes.
+Heap-allocating every node individually would thrash the allocator and waste memory on 64-bit pointers.
+Instead, syntaqlite appends all nodes for the current statement into one contiguous buffer—an <b>arena</b>—and resets the write cursor before parsing the next statement.
+Nodes reference children by 32-bit <b>node ID</b> within the arena rather than raw pointers, using <code>SYNTAQLITE_NULL_NODE</code> (<code>0xFFFFFFFF</code>) for absent optional fields.
+Lists are flat arena nodes too (a tag, a count, and a trailing array of child IDs), and identifiers stay as zero-copy byte spans (<code>SyntaqliteTextSpan</code>) pointing straight into the input buffer.</p>
+<p>Resetting the arena after every statement bounds parser memory by the largest single statement rather than the length of a multi-thousand-line script.
+The lifetime rule is strict: any pointer returned by <code>syntaqlite_parser_node(p, id)</code> is invalidated as soon as <code>syntaqlite_parser_next()</code> advances.</p>
 
 <figure>
 <figcaption><b>Figure 7. Nodes are built children first, so every link points back to an older node and the root comes last.</b>
@@ -470,8 +458,9 @@ C++ code reads the tree by casting. <code>Node&lt;SyntaqlitePerfettoPipeOrderBy&
 Anything that needs the tree, such as pipeline compilation, must finish before the parser moves on to the next statement.
 </blockquote>
 
-<h2 id="tricks"><span class="n">4</span>Four grammar tricks keep new syntax from breaking existing queries</h2>
-<p>Perfetto's extension grammar is short, but four techniques in it solve real ambiguity problems.</p>
+<h2 id="tricks"><span class="n">4</span>Four grammar techniques add keywords and pipes without breaking existing SQL</h2>
+<p>Extending a production SQL dialect carries a sharp backwards-compatibility hazard: reserving twenty new keywords or repurposing <code>|</code> and <code>&gt;</code> would immediately break existing queries that name columns <code>per</code>, <code>up</code>, or <code>tree</code>, or compute bitwise OR in expressions.
+Four targeted techniques in <code>perfetto.y</code> keep existing SQL working without forking SQLite's tokenizer.</p>
 
 <h3>New keywords still work as names</h3>
 <pre><code><span class="src">perfetto.y</span><span class="c">// Allow extension keywords to be used as regular identifiers.</span>
@@ -559,19 +548,16 @@ A top-level <code>a | b</code> in an ORDER BY term needs parentheses.
 <!-- ═════════════════════════ PART II ═════════════════════════ -->
 <div class="part">Part II · PerfettoSQL statements</div>
 
-<h2 id="macros"><span class="n">5</span>Macros expand inside the tokenizer, and errors still point at the text you wrote</h2>
-<p>PerfettoSQL adds <b>macros</b>, text templates expanded before the query runs, because SQL functions cannot take a table or an expression as an argument.
-The standard library keeps needing the same query shape with a different table plugged in, such as "build the callstacks for these callsites".
-A macro definition names typed parameters, with types such as <code>Expr</code> or <code>TableOrSubquery</code>. A call is written <code>name!(arg, …)</code>, the Rust macro style, because the generator runs with <code>--macro-style rust</code>.
-Each <code>$param</code> in the body is replaced by the argument's tokens:</p>
+<h2 id="macros"><span class="n">5</span>Token-layer macros parameterize SQL queries while keeping source-line tracebacks</h2>
+<p>Part II explains how PerfettoSQL scales reusable SQL libraries with macros, module imports, and typed catalog objects while preserving exact error locations.
+Standard SQL hits a composition wall in a large standard library: views take zero arguments, and scalar or table-valued functions accept runtime values—never a table name, a subquery, or an arbitrary SQL expression.
+Trace modules repeatedly need structural templates such as "compute cumulative callstack counts over whichever table of sample callsites the caller supplies".</p>
+<p>PerfettoSQL solves this with <b>macros</b> whose parameters carry syntactic kinds such as <code>Expr</code> or <code>TableOrSubquery</code>. Calls use Rust's <code>name!(arg, …)</code> syntax (selected via <code>--macro-style rust</code>) so macro invocations never collide with SQL function calls, and each <code>$param</code> in the body expands to the argument's token stream:</p>
 <pre><code><span class="src">stdlib/stacks/cpu_profiling.sql</span><span class="k">CREATE PERFETTO TABLE</span> _cpu_profiling_callstacks <span class="k">AS</span>
 <span class="k">FROM</span> _callstacks_for_callsites!((SELECT callsite_id FROM cpu_profiling_samples))
 |&gt; <span class="k">TREE ACCUMULATE UP</span> SUM(self_count) <span class="k">AS</span> cumulative_count;</code></pre>
-<p>Many languages expand macros in a separate <b>preprocessing</b> pass over the whole text, as the C preprocessor does. PerfettoSQL has no such pass.
-Instead, syntaqlite's tokenizer asks Perfetto through a callback whenever it meets a call.
-It then feeds the expansion's tokens to the parser as a new <b>layer</b>, a token stream with its own id.
-Layer 0 is the text the user wrote, and expansions are layers 1 and up.
-Perfetto's callback is <code>PerfettoSqlParser::Impl::LookupMacro</code>, shown in Figure 9.</p>
+<p>Why not run a C-style text preprocessor over the script before parsing? Whole-file text substitution loses token boundaries and scrambles byte offsets: a column typo inside a caller's argument ends up reported deep inside generated macro text.
+Instead, syntaqlite expands macros <em>inside the tokenizer</em> during the single parse pass. Whenever the tokenizer sees <code>name!(…)</code>, it invokes Perfetto's callback (<code>PerfettoSqlParser::Impl::LookupMacro</code>, Figure 9) and pushes the expanded tokens onto the input stream as a numbered <b>layer</b>: layer 0 is the author's original text, and macro expansions get layers 1 and up.</p>
 
 <figure>
 <figcaption><b>Figure 9. Each macro call is checked against the built-in intrinsics first, then against the user's macros.</b>
@@ -657,14 +643,13 @@ If a statement had no rewrites at all, it returns a plain substring.
 Otherwise it asks <code>syntaqlite_node_is_macro_free()</code> for each node, and builds the tree only for nodes that span an expansion.
 Calls that arrive through an argument are tagged <code>SYNTAQLITE_MACRO_BODY_CALL_ARG_INTERNAL</code> and handled by <code>BuildForArg</code>.</p>
 
-<h2 id="statements"><span class="n">6</span>Each parsed statement goes to SQLite, to a C++ handler, or to the pipeline compiler</h2>
-<p>The parser's root node decides who runs each statement, because SQLite has never heard of <code>CREATE PERFETTO TABLE</code> or <code>|&gt;</code>.
-<code>PerfettoSqlParser</code> wraps the syntaqlite parser.
-Each <code>Next()</code> calls <code>syntaqlite_parser_next()</code> until it gets a statement with a root node. A statement of only comments has none.
-It then builds the rewrite tree and sets <code>statement_sql()</code> to the expanded source of the root.</p>
-<p>Finally it calls <code>ParseStatement</code>, which switches on the root's <b>tag</b>, the node type stored in each node's first field.
-The result is a <code>PerfettoSqlParser::Statement</code>, a <code>std::variant</code> with one alternative per statement kind.
-Any tag it does not list becomes <code>SqliteSql{}</code>.</p>
+<h2 id="statements"><span class="n">6</span>Root-tag dispatch routes each statement to SQLite, C++ catalog handlers, or the pipe compiler</h2>
+<p>SQLite understands <code>SELECT</code>, <code>CREATE VIEW</code>, and virtual-table queries, whereas module imports (<code>INCLUDE PERFETTO MODULE</code>), materialized dataframe tables (<code>CREATE PERFETTO TABLE</code>), runtime column indexes, macros, and <code>|&gt;</code> pipelines exist only in Trace Processor.
+Rather than regex-matching statement prefixes—which breaks on leading comments, CTEs, or macros—Trace Processor dispatches off the AST's root node.</p>
+<p><code>PerfettoSqlParser</code> drives the syntaqlite parser one statement at a time.
+Each call to <code>Next()</code> advances <code>syntaqlite_parser_next()</code> past comment-only empty statements until a root node appears, reconstructs the macro rewrite tree, and materializes <code>statement_sql()</code> as the expanded SQL string.</p>
+<p><code>ParseStatement</code> then switches on the root node's <b>tag</b> (its leading enum field) and returns a <code>PerfettoSqlParser::Statement</code>—a <code>std::variant</code> with one alternative per route.
+Any standard SQLite root tag falls through to <code>SqliteSql{}</code>.</p>
 
 <table>
   <thead><tr><th>Syntax</th><th>Root tag → variant</th><th>What the connection does</th></tr></thead>
@@ -745,10 +730,11 @@ Statements take effect one at a time, in order, so a macro or module is visible 
 <!-- ═════════════════════════ PART III ═════════════════════════ -->
 <div class="part">Part III · Pipelines</div>
 
-<h2 id="pipes"><span class="n">7</span>Pipe syntax writes a query top to bottom, in the order data flows</h2>
-<p>A pipeline lists a source and then stages, and each <code>|&gt;</code> stage takes the rows of the one before it.
-Plain SQL is written inside-out. The FROM sits in the middle, and each extra step wraps the previous query as a subquery.
-Trace analysis also keeps needing operations SQL expresses badly, like summing a value up a tree of slices or intersecting intervals per CPU.</p>
+<h2 id="pipes"><span class="n">7</span>Pipe syntax aligns queries with dataflow and unlocks multi-stage batch execution</h2>
+<p>Part III follows <code>|&gt;</code> pipelines from syntax to execution. Pipelines exist to fix two mismatches at once: how multi-step analytical queries are written, and how Trace Processor executes them.</p>
+<p>First, plain SQL writes multi-step transformations inside-out: <code>FROM</code> sits in the middle, and each subsequent step wraps the previous query in another subquery or CTE. Trace analysis also leans heavily on hierarchical and interval operations—rolling durations up a parent-child slice tree or intersecting time intervals per CPU—that plain SQL expresses awkwardly or not at all.
+Second, even when a multi-stage query can be written in SQL, SQLite executes joins, views, and aggregations row by row through VDBE bytecode, crossing virtual-table callbacks once per cell.
+A pipeline writes a source followed by top-to-bottom <code>|&gt;</code> stages in dataflow order, giving Trace Processor a self-contained multi-stage plan it can execute end to end on columnar batches in C++.</p>
 
 <figure>
 <figcaption><b>Figure 12. The same query reads inside-out in SQL and top to bottom as a pipeline.</b> Shape, simplified: the SQL column
@@ -831,24 +817,19 @@ Every operand column is also output, but only as <code>alias.col</code>.</p>
 </div>
 </div>
 
-<h2 id="compiler"><span class="n">8</span>The compiler keeps column names apart from column values</h2>
-<p>The compiler turns the AST, which records what the user wrote, into a list of operations that each read and write specific columns.
-On the way, names keep changing. RENAME and AS change them, and a stage can add a new one such as subtree_dur.
-The same word can mean different columns at different stages. The compiler resolves all of that once.</p>
-<p><code>pipeline::Compile(parser, pipeline_node, source_fn, catalog)</code> runs inside <code>ParseStatement</code>, while the AST is still alive.
-So an unsupported query fails at parse time, with a traceback.
-The <b>catalog</b> is how it looks up the relations (tables and views) and dataframes a pipeline can read.</p>
-<p>It produces a <b>logical plan</b> (<code>LogicalPlan</code>), a tree that says <em>what</em> to compute, stage by stage, before any executor steps are chosen.
-Each node (<code>PlanNode</code>) holds one <code>PlanOperation</code> and the IDs of its children.
-The root is the last stage, and the leaves are sources.
-For the running example the plan has two nodes: a Scan of slice, and an OrderBy on ts whose child is the scan.</p>
-<p>The central design choice is in the <code>Compiler</code> class comment: "adding a plan node does not change the visible row,
-and changing the row does not add execution work". So the compiler keeps two things apart:</p>
+<h2 id="compiler"><span class="n">8</span>The compiler separates mutable column names from immutable dataflow values</h2>
+<p>As rows move down a pipeline, the visible schema keeps mutating: <code>SELECT</code> drops columns, <code>RENAME</code> and <code>AS</code> rebind names, <code>TREE ACCUMULATE</code> appends new columns, and interval intersections expose operand columns only under table aliases (<code>x.ts</code> vs bare region <code>ts</code>).
+If every rename or column projection emitted a physical copy step, readable pipelines would pay runtime overhead just for tidying up names.
+The pipeline compiler solves that at compile time by resolving every mutable name into a stable numeric value ID once, before any execution plan runs.</p>
+<p><code>pipeline::Compile(parser, pipeline_node, source_fn, catalog)</code> runs inside <code>ParseStatement</code> while the arena AST is still alive, so invalid column names or unsupported constructs fail immediately at parse time with an exact source traceback.
+The <b>catalog</b> lets it look up registered relations (tables and views) and finalized dataframes.</p>
+<p>Compilation emits a <b>logical plan</b> (<code>LogicalPlan</code>): a tree describing <em>what</em> relational work to perform, independent of physical executor operators.
+Each <code>PlanNode</code> wraps one <code>PlanOperation</code> plus the IDs of its child nodes, with the final stage at the root and sources at the leaves.
+For our running example, the logical plan has just two nodes: <code>Scan(slice)</code> feeding <code>OrderBy(ts)</code>.</p>
+<p>As the <code>Compiler</code> class comment states, "adding a plan node does not change the visible row, and changing the row does not add execution work". The compiler enforces that split with two distinct structures:</p>
 <ul>
-  <li><b>Values</b> live in the plan. <code>AddColumn(name, type)</code> allocates a <code>ColumnId</code>, a number that stays the same for the whole plan.
-  Operations refer to inputs and outputs only by this ID.</li>
-  <li><b>Names</b> live in the <code>Scope</code>: the ordered list of visible columns, each a name plus a value ID,
-  and snapshots of that list taken whenever an alias is given.</li>
+  <li><b>Immutable values</b> live in the plan: <code>AddColumn(name, type)</code> allocates a monotonic <code>ColumnId</code> that never changes, and every <code>PlanOperation</code> references inputs and outputs solely by <code>ColumnId</code>.</li>
+  <li><b>Mutable names</b> live in <code>Scope</code>: an ordered list of currently visible columns (name + <code>ColumnId</code>), plus frozen snapshots of that list saved whenever <code>AS alias</code> binds a relation alias.</li>
 </ul>
 <pre><code><span class="src">compiler.h (shape)</span><span class="c">// Scope::row, one entry per visible column</span>
 RowColumn{NamedColumn{name, id}, operation, node, qualified_only}
@@ -915,14 +896,13 @@ Its columns and types come from <code>analysis::RelationAnalyzer</code> in <code
 The running example is a SQL scan, because slice is a <code>CREATE PERFETTO VIEW</code> over <code>__intrinsic_slice</code>
 (<code>stdlib/prelude/after_eof/views.sql</code>).</p>
 
-<h2 id="pruning"><span class="n">9</span>Pruning removes the columns and the work that nothing reads</h2>
-<p><b>Column pruning</b> removes unread columns, and the work that makes them, before anything runs.
-It matters because a source like slice has about fifteen columns, and a query often reads two.
-Every column a scan emits is carried through every stage. For a SQL scan, each column is also first copied row by row into a temporary dataframe (Section 10).</p>
-<p>Right after compiling, <code>Compile</code> calls <code>PruneColumns(plan)</code>.
-It marks a <code>needed</code> bit for each column in <code>plan.output()</code>, then walks from the root to the leaves.
-Each operation's <code>Prune(needed)</code> drops outputs nobody needs and marks the inputs it still reads.
-It returns either <code>nullopt</code>, meaning "keep me", or a child slot (the index of one of its children), meaning "replace me with that child".</p>
+<h2 id="pruning"><span class="n">9</span>Backward liveness pruning drops unread columns and dead stages before execution</h2>
+<p>Trace views are wide while analytical answers are narrow: <code>slice</code> exposes fifteen columns, yet a query often keeps only two or three.
+Carrying every source column through a pipeline wastes memory bandwidth in every batch, sort, and hash table—and when a source is a SQL view, SQLite would first have to copy every unread column cell by cell into a temporary dataframe (Section 10).
+<b>Column pruning</b> eliminates dead columns—and any stage whose outputs nobody reads—via a backward liveness pass right after compilation.</p>
+<p>Immediately after building the plan, <code>Compile</code> runs <code>PruneColumns(plan)</code>.
+It seeds a <code>needed</code> bitvector from <code>plan.output()</code> and walks backwards from the root toward the leaves.
+Each operation's <code>Prune(needed)</code> drops any outputs that are unmarked, marks all input <code>ColumnId</code>s required to compute its surviving outputs, and returns either <code>nullopt</code> ("keep this stage") or a child index ("all my outputs are dead; splice me out and replace me with that child").</p>
 <p>The running example prunes nothing, because it has no SELECT and every slice column is output.
 Figure 15 uses the tree query from Section 8 instead, whose <code>SELECT id, t</code> keeps two columns.</p>
 <pre><code><span class="src">column_pruning.cc</span>PlanNodeId PruneNode(LogicalPlan&amp; plan, PlanNodeId id, std::vector&lt;bool&gt;&amp; needed) {
@@ -957,12 +937,11 @@ because "a batch with no columns has no rows".</figcaption>
 </svg>
 </figure>
 
-<h2 id="bridge"><span class="n">10</span>A pipeline reaches SQLite as one call to a table-valued function</h2>
-<p>To the rest of Trace Processor, a pipeline must still look like SQL.
-Results stream through the same prepared-statement API, and <code>CREATE PERFETTO TABLE … AS pipeline</code> reuses the SELECT path.
-So <code>PreparePipeline</code> turns the plan into one SELECT over <code>__intrinsic_pipeline</code>.
-That is an <em>eponymous</em> table-valued function: SQLite exposes it under its module name, with no CREATE VIRTUAL TABLE needed.
-<code>SelectPipelineSql(plan)</code> builds the statement in three steps:</p>
+<h2 id="bridge"><span class="n">10</span>A synthetic table-valued function bridges compiled pipelines back into SQLite</h2>
+<p>Why route a compiled C++ pipeline back through SQLite at all instead of returning batches directly? Every external caller—the Perfetto UI, Python bindings, <code>trace_processor_shell</code>, and <code>CREATE PERFETTO TABLE … AS pipeline</code>—consumes query results through SQLite's prepared-statement cursor API, and pipelines can read SQLite views or subqueries that only SQLite knows how to evaluate in the current scope.
+Wrapping the compiled plan in one synthetic <code>SELECT</code> over <code>__intrinsic_pipeline</code> preserves full SQLite composability while keeping multi-stage execution inside C++.</p>
+<p><code>__intrinsic_pipeline</code> is an <em>eponymous</em> virtual table: SQLite lets queries call it directly as a table-valued function in a <code>FROM</code> clause without a prior <code>CREATE VIRTUAL TABLE</code> statement.
+<code>SelectPipelineSql(plan)</code> constructs the bridge query in three steps:</p>
 <ol>
   <li><b>SQL scans become arguments.</b> Each one becomes a numbered argument: a small query that collects its rows into a dataframe.
   The dataframe reaches the pipeline as a tagged C pointer that only the pipeline can read.
@@ -1016,15 +995,12 @@ because at compile time they were only guesses.</figcaption>
 </svg>
 </figure>
 
-<h2 id="lowering"><span class="n">11</span>Lowering adds only the executor steps that are still missing</h2>
-<p><b>Lowering</b> turns the logical plan into concrete executor steps, and skips any step whose result is already true.
-A logical OrderBy says "rows sorted by ts". It does not say whether a sort is needed, or which executor class does it.
-Two stages may need the same preparation, such as numbering tree nodes. The input may also already be in the right order.</p>
-<p><code>pipeline::Lower(plan)</code> produces a <code>PhysicalPlan</code>: a source (<code>core::exec::Source</code>), a chain of steps,
-and which batch column each output name reads.
-A <code>Lowering</code> object assigns batch positions, the column slot in each batch that holds a value (<code>Define(id)</code>).
-It also tracks what is already true about the rows.
-It tracks three things:</p>
+<h2 id="lowering"><span class="n">11</span>Lowering translates logical operations into physical batch steps and elides redundant work</h2>
+<p>In compiler design, <b>lowering</b> translates a high-level logical plan ("what result is required") into a concrete physical execution plan ("which operators run on which buffer slots").
+Separating the two pays off at run time because physical properties of the input data—whether a dataframe column is already sorted, whether tree topology columns have already been computed, and what runtime types a SQL view actually produced—are only known once dataframes are bound.
+Tracking those properties lets lowering skip redundant sorts, share tree-preparation passes across adjacent stages, and fuse stateless steps in place.</p>
+<p><code>pipeline::Lower(plan)</code> produces a <code>PhysicalPlan</code>: a batch source (<code>core::exec::Source</code>), a sequence of execution steps, and the final batch-column slot for each output column.
+As <code>Lowering</code> walks the tree bottom-up, it assigns batch column slots (<code>Define(id)</code>) and maintains three physical invariants:</p>
 <ul>
   <li><b>Order</b>: which columns the rows are grouped by, and which ascend within a group.
   <code>Scan::Lower</code> marks every dataframe column whose sort state is not <code>Unsorted</code> as ascending.
@@ -1131,10 +1107,11 @@ Select only the columns you need, because pruning reaches all the way to the sca
 <!-- ═════════════════════════ PART IV ═════════════════════════ -->
 <div class="part">Part IV · Extending</div>
 
-<h2 id="new-op"><span class="n">12</span>Adding a pipe operator takes seven steps, but only about five files need real work</h2>
-<p>Every stage touches the same layers: syntax, compilation, serialization, lowering, execution and tests.
-ORDER BY is the smallest stage that has all of them, so the recipe below follows how it is wired.
-TREE ACCUMULATE is the model for a stage that adds columns.</p>
+<h2 id="new-op"><span class="n">12</span>Self-contained operator registrations keep new pipe stages to roughly five files</h2>
+<p>Part IV walks through extending the pipeline engine. If adding a domain-specific trace operator required editing central switch statements across the compiler, pruner, wire serializer, and physical planner, the experimental pipe engine would quickly ossify.
+Instead, every stage implements one <code>PlanOperation</code> interface and plugs into a flat registry via a static <code>OperationRegistration</code> struct—confining a new operator to roughly five files of focused work.</p>
+<p>Every stage touches the same seven checkpoints: AST declaration, grammar production, plan operation, registry entry, lowering, batch execution, and tests.
+<code>ORDER BY</code> is the smallest end-to-end stage that exercises all seven, while <code>TREE ACCUMULATE</code> is the reference template for a stage that appends new columns.</p>
 
 <figure>
 <figcaption><b>Figure 19. A new stage goes through seven steps, from the AST node to the tests.</b> Paths are relative to

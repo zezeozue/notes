@@ -74,11 +74,8 @@
 
 <main id="top">
 <h1>Native memory on Android: where each page in smaps comes from</h1>
-<p class="lead">This note explains native memory on Android from the page up. It covers how the kernel hands out memory and how a
-shared library is laid out. It follows <code>linker64</code>, Android’s dynamic linker, from <code>dlopen()</code> to your first
-call. It then shows how Scudo, the default allocator in bionic (Android’s C library), turns pages into malloc blocks. After
-reading it you should be able to look at a line in <code>/proc/pid/smaps</code> and say where it came from and why it costs what
-it does.</p>
+<p class="lead">Every native byte a process uses on Android comes from one of two user-space layers built on kernel pages: <code>linker64</code> mapping shared libraries, or Scudo carving anonymous pages behind <code>malloc()</code>. Reading <code>/proc/pid/smaps</code> comes down to knowing which pages stay shared and clean, and which writes force private copies.</p>
+<p class="lead">This note traces native memory from virtual pages and copy-on-write faults up through ELF segments, <code>dlopen()</code> relocations, RELRO sharing, and Scudo’s hardened heap layout, so you can trace any line in <code>smaps</code> back to the code that created it.</p>
 <p class="m">Code excerpts and constants are from AOSP as of Android 17 (<code>bionic/</code>, <code>external/scudo/</code> and <code>frameworks/base/</code>).
 ELF numbers are illustrative: they come from <code>readelf</code> on the arm64 <code>libhwui.so</code> of one platform build (“this build” below), and exact sizes and counts vary from build to build. Excerpts marked <em>shape</em>
 are simplified. Cost tiers are rough orders of magnitude, not measurements.</p>
@@ -89,7 +86,7 @@ are simplified. Cost tiers are rough orders of magnitude, not measurements.</p>
   <li>Shared pages stay shared until someone writes to them. Writing one byte costs a whole private page.</li>
   <li>Loading a library writes addresses into its pointer tables. Those pages become private memory in every process, unless the
   zygote or WebView shares them.</li>
-  <li>On Android, malloc is Scudo. It groups small blocks by size, checks every free, and fences large blocks with guard pages.</li>
+  <li>Scudo implements <code>malloc()</code> on Android. It groups small blocks by size, checks every <code>free()</code>, and fences large blocks with guard pages.</li>
   <li>Freeing memory lowers RSS only when a whole page is empty, and Scudo waits a moment before giving pages back.</li>
 </ul>
 <p>Terms used throughout, defined once:</p>
@@ -112,16 +109,16 @@ are simplified. Cost tiers are rough orders of magnitude, not measurements.</p>
   <li><b>Pages.</b> The kernel hands out RAM one page at a time, on first touch. Pages backed by the same file are shared
   between processes until someone writes to them.</li>
   <li><b>User-space sub-allocators.</b> The kernel only deals in whole pages. <code>linker64</code> maps page-aligned slices of
-  library files. malloc carves anonymous pages, which have no file behind them, into small blocks. It gives empty pages back
+  library files. The heap allocator behind <code>malloc()</code> carves anonymous pages—which have no file behind them—into small blocks, and gives empty pages back
   with <code>madvise</code>, a syscall that tells the kernel it may take them away.</li>
 </ol>
 <p>Staying in user space is cheap. Entering the kernel or touching a new page is far slower. Figure 1 puts the operations
 this note covers side by side.</p>
 <figure>
 <figcaption><b>Figure 1. Anything that enters the kernel or touches a new page costs far more than staying in user space.</b>
-A PLT call or a cached malloc is cheap. Entering the kernel or touching a page for the first time is two to three orders of
+A PLT call or a cached <code>malloc()</code> is cheap. Entering the kernel or touching a page for the first time is two to three orders of
 magnitude more, and waiting for storage is more again. <code>dlopen</code> does all of these at once. Page faults are in
-Section 1, PLT calls in Section 5, and malloc’s per-thread (TSD) caches in Section 10.</figcaption>
+Section 1, PLT calls in Section 5, and the allocator’s per-thread (TSD) caches in Section 10.</figcaption>
 <svg viewBox="0 0 1000 272" role="img" aria-label="Native cost ladder">
   <text x="10" y="18" class="th">operation</text>
   <text x="330" y="18" class="th">relative cost (rough, log scale)</text>
@@ -151,7 +148,7 @@ for far more memory than they will touch. And it shares one copy of common code 
 translation) maps it to a physical address through per-process <b>page tables</b>. The user address space runs to hundreds of
 gigabytes or more, depending on how the kernel is configured (Figure 3). The hardware also ignores the top byte of a pointer
 (TBI, top-byte ignore). That is what lets Android store tags there (Section 10).</p>
-<p>Translation works one page at a time. A page is 4 KiB, or 16 KiB on devices built for larger pages. The low bits of an address pass
+<p>Translation works one page at a time. A page is 4 KiB, or 16 KiB on newer arm64 builds that trade slightly more rounding slack for fewer page-table walks and wider translation-cache reach. The low bits of an address pass
 through unchanged. The rest select a <b>page-table entry (PTE)</b>, which either points at a physical page or is not present.</p>
 <p>Asking for memory only creates a VMA. <code>mmap(NULL, 1 GiB, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)</code>
 does not allocate a gigabyte. It records one VMA saying “this range is valid, read-write, anonymous” and returns. The PTEs
@@ -163,8 +160,7 @@ A <em>read</em> of untouched anonymous memory is cheaper still. The kernel can m
 allocates a real page only on the first write.</p>
 <p>Pages come in two kinds. File-backed pages hold file contents and live in the <b>page cache</b>, the kernel’s in-RAM cache
 of file data. Every process that maps the same file shares those pages, and a clean one can be dropped and read back later.</p>
-<p><b>Anonymous memory</b> has no file behind it: heap, stacks, and globals once written. Android has no swap partition. So
-the only way to reclaim it without killing the process is zram, a compressed swap device that lives in RAM.</p>
+<p><b>Anonymous memory</b> has no file behind it: heap, stacks, and globals once written. Android configures no swap partition on flash storage, because sustained swap traffic wears flash cells and stalls foreground threads on I/O. The only way to reclaim anonymous memory without killing the process is zram, a compressed swap block device that lives in RAM.</p>
 
 <figure>
 <figcaption><b>Figure 2. A process’s memory cost is the green and red rows, not the size of its VMAs.</b> Allocators live in
@@ -276,7 +272,7 @@ only reads should stay read-only, and anything you want shared across apps is be
 </blockquote>
 
 <h2 id="pss"><span class="n">3</span>PSS splits shared pages fairly, so it is the number to sum</h2>
-<p>Once pages are shared, “how much memory does this process use” has three answers.</p>
+<p>Because every Android app forks from the zygote and maps common framework libraries, a single physical page of <code>libc.so</code> or preloaded zygote state appears in dozens of address spaces at once. Once pages are shared that widely, “how much memory does this process use” has three different answers.</p>
 <ul>
   <li><b>RSS</b> (resident set size): every page mapped into the process, shared pages counted in full.</li>
   <li><b>PSS</b> (proportional set size): private pages in full, plus each shared page divided by the number of processes
@@ -341,10 +337,9 @@ fine-grained named pieces. The loader only wants to know what to map where, and 
 program headers.</p>
 <p>The split exists because the MMU enforces permissions per page. Page-aligning thirty sections would waste a page of padding
 for each. So the static linker, <code>lld</code>, groups sections with the same runtime permissions into one loadable
-(<code>PT_LOAD</code>) segment. The one exception is read-write data: the RELRO part gets a segment of its own.</p>
-<p>A <b>relocation</b> is needed wherever the library holds an address that is only known once the library’s load address is.
-<code>GNU_RELRO</code> (“relocation read-only”) marks the range that holds those written addresses. The linker writes it during
-loading and then makes it read-only (Section 6). Here is what <code>lld</code> produced for <code>libhwui.so</code> in this
+(<code>PT_LOAD</code>) segment. The one exception is read-write data: the RELRO part gets a segment of its own rather than sharing a segment with mutable globals.</p>
+<p>A <b>relocation</b> is needed wherever the library holds an address that is only known once the library’s load address is chosen.
+<code>GNU_RELRO</code> (“relocation read-only”) marks the range that holds those written addresses: isolating it from <code>.data</code> and <code>.bss</code> lets the linker write it during loading and then seal the entire segment read-only without splitting a VMA mid-range (Section 6). Here is what <code>lld</code> produced for <code>libhwui.so</code> in this
 build:</p>
 
 <pre><code><span class="c">$ readelf -lW libhwui.so   (arm64, excerpt)</span>
@@ -441,21 +436,10 @@ string blob costs nothing beyond its clean file pages.
 </blockquote>
 
 <h2 id="pic"><span class="n">5</span>Code reaches other libraries through a table, so code pages are never patched</h2>
-<p>A shared library loads at a different address in different processes. One reason is <b>ASLR</b> (address space layout
-randomisation): the kernel and linker pick random base addresses so an attacker cannot predict where code lives. Another is
-that each process loads a different set of libraries.</p>
-<p>If code contained absolute addresses, the linker would have to patch <code>.text</code>. Every patched page would become
-private dirty, and the code segment would have to be writable. Bionic refuses such <b>text relocations</b>: it rejects any
-library with <code>DT_TEXTREL</code> or <code>DF_TEXTREL</code>. Executables must be position-independent too. Support for
-non-PIE executables was dropped in API 21.</p>
-<p><b>Position-independent code (PIC)</b> relies on one invariant. All segments of a library move together by the same
-<b>load bias</b>: the difference between the address the library was linked at and the address it was actually loaded at. So
-the distance between any instruction and any byte of the same library is a link-time constant. Code reaches its own data with
-PC-relative instructions (<code>adrp</code> + <code>add</code>/<code>ldr</code>) and needs no relocation.</p>
-<p>Anything in another library is reached through a table of addresses inside this library. The <b>GOT</b> (global offset
-table) holds addresses of imported globals and functions, and the linker fills it in at load time. A call to an imported
-function goes to a small stub in the <b>PLT</b> (procedure linkage table, the <code>.plt</code> section). The stub loads the
-target from its GOT slot and branches. Figure 6 shows <code>libhwui.so</code> calling malloc.</p>
+<p>Early shared-library schemes tried assigning fixed virtual addresses to libraries, breaking whenever two libraries collided. Modern Android requires the opposite: <b>ASLR</b> (address space layout randomisation) picks random base addresses in every process so an attacker cannot predict gadget locations, and each process loads a different mix of libraries.</p>
+<p>If instructions encoded absolute target addresses, the linker would have to rewrite <code>.text</code> at load time. Every patched page would fault into a private dirty copy, destroying page-cache sharing across apps and requiring writable code mappings. Bionic refuses such <b>text relocations</b> outright, rejecting any library marked <code>DT_TEXTREL</code> or <code>DF_TEXTREL</code>, and Android dropped support for non-PIE (non-position-independent) executables in API 21.</p>
+<p><b>Position-independent code (PIC)</b> keeps <code>.text</code> untouched by relying on one invariant: all segments of a library shift together by the same <b>load bias</b>, the difference between link-time virtual addresses and the actual load base. Because the distance from any instruction to any byte inside the same library stays constant, code reaches its own globals and tables with PC-relative instructions (<code>adrp</code> + <code>add</code>/<code>ldr</code>) and zero relocations.</p>
+<p>Anything in another library is reached indirectly through an address table inside this library’s RELRO segment. The <b>GOT</b> (global offset table) holds resolved addresses of imported globals and functions, and a call to an imported function branches to a tiny stub in the <b>PLT</b> (procedure linkage table, <code>.plt</code>) that loads its target from a GOT slot. Figure 6 shows <code>libhwui.so</code> calling <code>malloc()</code>.</p>
 <figure>
 <figcaption><b>Figure 6. A call into another library goes through a stub, so the linker writes one table slot instead of
 patching code.</b> The distance from the stub to the GOT page is fixed at link time, so <code>.plt</code> stays clean and
@@ -493,12 +477,8 @@ into this slot”.</figcaption>
   <text x="10" y="220" class="ts">Addresses are link-time vaddrs from llvm-objdump and llvm-readelf on this build; at run time all of them shift by the load bias.</text>
 </svg>
 </figure>
-<p>Bionic resolves every slot up front, never lazily. Desktop glibc can instead resolve each PLT slot the first time it is
-called (<b>lazy binding</b>), which means the GOT stays writable for the life of the process. Bionic’s dynamic-section parser ignores <code>DT_PLTGOT</code> with the comment
-“Ignored (because RTLD_LAZY is not supported)”. Every slot is resolved during <code>dlopen</code>, and then the whole RELRO
-range is made read-only. Platform libraries are also linked with <code>-z now</code>, the static-linker flag that marks a
-library for eager binding: <code>libhwui.so</code> carries
-<code>FLAGS BIND_NOW</code> and <code>FLAGS_1 NOW</code>.</p>
+<p>Traditional desktop linkers such as glibc defaulted to <b>lazy binding</b> (<code>RTLD_LAZY</code>), resolving each PLT slot only on its first call to shave startup work—at the cost of leaving <code>.got.plt</code> writable for the entire life of the process and giving memory-corruption exploits an easy function-pointer target.</p>
+<p>Bionic never supported lazy binding: its dynamic-section parser ignores <code>DT_PLTGOT</code> with the comment “Ignored (because RTLD_LAZY is not supported)”. Platform libraries are linked with <code>-z now</code> (<code>FLAGS BIND_NOW</code> and <code>FLAGS_1 NOW</code> on <code>libhwui.so</code>), so every symbol is resolved during <code>dlopen</code> and the entire RELRO range is sealed read-only before library code runs.</p>
 
 <h2 id="load"><span class="n">6</span>linker64 loads a library in five steps</h2>
 <p>Everything so far is a static description in a file. Something has to turn it into a running library. It must pick an
@@ -578,10 +558,9 @@ if ((phdr-&gt;p_flags &amp; PF_X) &amp;&amp; phdr-&gt;p_align == kPmdSize &amp;&
   page. It maps any further <code>.bss</code> pages anonymously and names the range <code>[anon:.bss]</code>.</li>
   <li><b>Libraries can map straight out of an APK.</b> Segments are <code>MAP_PRIVATE</code> file mappings, so a library stored
   uncompressed and page-aligned in an APK needs no extraction.</li>
-  <li><b>Page size must match.</b> On 16 KiB-page devices, a library whose segments are aligned only for smaller pages fails
-  with “program alignment … cannot be smaller than system page size”. The exception is 16 KiB app-compat mode, which lets an
-app whose libraries are aligned only for 4 KiB pages still run. There the
-  linker reads the file into an anonymous read-write reservation instead of mapping it.</li>
+  <li><b>Page size must match.</b> On 16 KiB-page devices, a library whose segments are aligned only for 4 KiB pages fails
+  with “program alignment … cannot be smaller than system page size”. Only app-compat mode lets such a library run, by reading
+  the file into an anonymous read-write reservation instead of mapping it.</li>
 </ul>
 
 <h3 id="load-hash">A Bloom filter rejects libraries that do not define a symbol</h3>
@@ -642,9 +621,7 @@ lookup.</b> Counts come from this build’s relocation tables.</figcaption>
   <text x="10" y="210" class="ts">Green: relative, no lookup. Yellow: symbolic, needs a symbol lookup. The three .rela.dyn rows add up to 855.</text>
 </svg>
 </figure>
-<p>Relative relocations mostly hit consecutive 8-byte words, so a full record for each is wasteful. A standard
-<code>Elf64_Rela</code> record is 24 bytes. <b>RELR</b> encodes the same information as a bitmap, and the saving is large
-(Figure 9).</p>
+<p>When Android transitioned to 64-bit, C++ vtables and pointer arrays made relative relocations a major source of binary bloat: a standard <code>Elf64_Rela</code> record takes 24 bytes just to say “add the load bias at this offset”. Android first compressed relocation tables with packed delta encoding (<code>DT_ANDROID_RELA</code>, still used for non-PLT symbolic relocations in <code>.rela.dyn</code>), and then introduced <b>RELR</b>—a bitmap encoding for dense relative relocations that cuts the table to a tiny fraction of its <code>Elf64_Rela</code> size (Figure 9).</p>
 <figure>
 <figcaption><b>Figure 9. RELR stores libhwui.so’s relative relocations in about 4 KiB instead of about 517 KiB.</b> The same
 22,042 relocations, encoded two ways. The RELR bar is drawn to scale and is barely visible.</figcaption>
@@ -714,12 +691,8 @@ lists 0xc00038 and 0xc00050 as the second and third relocations, matching the de
   <text x="10" y="196" class="ts">One 8-byte word covers 63 pointer slots. libhwui.so: 22,042 relative relocations in 4,280 bytes; as Elf64_Rela they would take about 517 KiB.</text>
 </svg>
 </figure>
-<p>RELR is now a standard format. It was proposed on the generic-ABI (gABI) mailing list, where the ELF standard is
-discussed, and became <code>DT_RELR</code>. Bionic treats <code>DT_RELR</code> and the older
-<code>DT_ANDROID_RELR</code> tag the same way. The platform <code>libhwui.so</code> in this build uses
-<code>DT_ANDROID_RELR</code>. Its symbolic relocations live in other tables (Figure 8).</p>
-<p>Compact encoding shrinks the file and the time spent reading relocation records. It does not change how many pages get
-written: every page of <code>.data.rel.ro</code> that holds a pointer still becomes dirty.</p>
+<p>RELR started on Android as <code>DT_ANDROID_RELR</code>, was proposed on the generic-ABI (gABI) mailing list where the ELF standard is maintained, and was standardised as <code>DT_RELR</code>. Bionic handles <code>DT_RELR</code> and <code>DT_ANDROID_RELR</code> identically; this build’s <code>libhwui.so</code> carries <code>DT_ANDROID_RELR</code>, while its symbolic relocations live in <code>.rela.plt</code> and <code>.rela.dyn</code> (Figure 8).</p>
+<p>Keep the two costs separate: <code>DT_ANDROID_RELA</code> and RELR shrink the <em>on-disk ELF file</em> and the CPU time spent reading relocation metadata, not <em>runtime RAM</em>. Writing the resolved 8-byte pointers into <code>.data.rel.ro</code> still dirties every page that holds at least one pointer.</p>
 
 <h3 id="load-relro">RELRO is sealed read-only, but its pages stay dirty</h3>
 <p>The tables the linker writes must not stay writable. The GOT, vtables and constructor arrays must be writable while the
@@ -741,13 +714,8 @@ trace, look for <code>dlopen: …</code> and <code>calling constructors: …</co
 </blockquote>
 
 <h2 id="relro-share"><span class="n">7</span>Only the zygote and WebView share RELRO between processes</h2>
-<p>Libraries the zygote loads before forking are relocated once, in the zygote. Examples are
-<code>libandroid_runtime.so</code> and its dependency <code>libhwui.so</code>. Children inherit the relocated, sealed pages
-copy-on-write and never write to them, so the pages stay shared. Libraries loaded after the fork are relocated privately in
-each process.</p>
-<p>WebView’s native library is large and is loaded after the fork, in every app that uses WebView. So each app would pay for
-its own relocated RELRO copy. Android shares it with two flags to <code>android_dlopen_ext</code>, bionic’s
-<code>dlopen</code> variant that takes extra options (Figure 11).</p>
+<p>Sealing RELRO with <code>mprotect(PROT_READ)</code> fixes the security risk of writable function tables, but not their RAM cost: any library loaded after <code>fork()</code> relocates into its own private dirty pages. Core framework libraries such as <code>libandroid_runtime.so</code> and its dependency <code>libhwui.so</code> avoid that per-app tax by loading in the zygote before forking, so every child inherits already-relocated, read-only pages copy-on-write.</p>
+<p>WebView’s native library is far larger, yet the zygote cannot preload it: WebView updates independently of the OS image, and apps that never instantiate WebView should not map it. To avoid paying megabytes of duplicate RELRO in every app that does use WebView, Android coordinates a shared address range and a reference RELRO file through two flags to <code>android_dlopen_ext</code>, bionic’s extended <code>dlopen</code> API (Figure 11).</p>
 <figure>
 <figcaption><b>Figure 11. WebView apps share RELRO by comparing their pages with a file written once.</b> The file only
 matches where the app’s relocated bytes are identical. That requires the same load address, hence the zygote reservation,
@@ -816,14 +784,8 @@ every process. For this build’s <code>libhwui.so</code> that would be up to 26
 </blockquote>
 
 <h2 id="ns"><span class="n">8</span>Namespaces decide which libraries an app may load</h2>
-<p>A device carries hundreds of platform libraries whose ABI is not stable and may change in any update. If apps could link
-against them, every platform change could break apps, and vendor code could depend on system internals. Namespaces are how the
-linker enforces which libraries a caller may see.</p>
-<p>Bionic does not keep one global list of loaded libraries. Each library belongs to a namespace with its own search paths.
-In code, the linker’s record of one loaded library is a <code>soinfo</code>, and a namespace is an
-<code>android_namespace_t</code> (<code>bionic/linker/linker_namespaces.h</code>).
-Namespaces are connected by links. Each link carries an allow-list of library names (<code>shared_lib_sonames</code>) that may
-be resolved through it.</p>
+<p>On traditional desktop Linux, <code>dlopen</code> searches one process-wide library list. Early Android worked the same way, and apps routinely <code>dlopen</code>ed internal <code>/system/lib64</code> libraries whose C++ ABIs were never meant to be stable—breaking apps on OS upgrades and tangling vendor HALs with framework internals. Starting in Android 7.0 and expanding with Project Treble and modular APEX updates, bionic isolated symbol resolution into <b>linker namespaces</b>.</p>
+<p>Instead of one global list of loaded libraries, each loaded library (<code>soinfo</code>) belongs to an <code>android_namespace_t</code> (<code>bionic/linker/linker_namespaces.h</code>) with its own search paths. Namespaces connect only through explicit directed links, and each link carries an allow-list of library names (<code>shared_lib_sonames</code>) that may cross that boundary.</p>
 <p>The system namespaces are default, vendor, and one for each APEX module, the separately updatable parts of the platform.
 They are described in <code>/linkerconfig/ld.config.txt</code>, which the <code>linkerconfig</code> tool generates at boot. For
 apps, <code>libnativeloader</code> creates one namespace per app class loader, named with the <code>clns</code> prefix. An app
@@ -862,7 +824,7 @@ exists. Ship the library in your APK or use a public NDK API instead.
 <p><code>malloc(48)</code> is not a system call. The kernel hands out whole pages, and each <code>mmap</code> costs a syscall
 and a VMA. So an allocator gets large anonymous ranges from the kernel and carves them into small blocks in user space. A good
 allocator has a lock-free fast path for the common sizes, keeps per-block overhead low, and gives empty pages back.</p>
-<p>In bionic, malloc checks one atomic pointer, the current dispatch table. If it is null, malloc calls the native allocator
+<p>In bionic, <code>malloc()</code> checks one atomic pointer, the current dispatch table. If it is null, <code>malloc()</code> calls the native allocator
 directly. If not, it calls through the table:</p>
 <pre><code><span class="src">bionic/libc/bionic/malloc_common.cpp</span>extern "C" void* malloc(size_t bytes) {
   auto dispatch_table = GetDispatchTable();
@@ -880,7 +842,7 @@ malloc hooks (<code>libc_malloc_debug.so</code>, <code>libc_malloc_hooks.so</cod
 profiler), and GWP-ASan. GWP-ASan sends a small random sample of allocations to guarded pages to catch memory bugs on users’
 devices.</p>
 <figure>
-<figcaption><b>Figure 13. With no tool installed, malloc goes straight to Scudo after one check.</b> The fast path is one
+<figcaption><b>Figure 13. With no tool installed, <code>malloc()</code> goes straight to Scudo after one check.</b> The fast path is one
 acquire load and a predictable branch before Scudo. Tools like heapprofd work by installing a table, which is why they can be
 turned on in a running process.</figcaption>
 <svg viewBox="0 0 1000 214" role="img" aria-label="bionic malloc dispatch">
@@ -913,9 +875,8 @@ of new blocks turned off. They also get <code>mallopt(M_DECAY_TIME, 1)</code>, w
 page-release interval (Section 11).</p>
 
 <h2 id="scudo"><span class="n">10</span>Scudo balances speed, small overhead and safety</h2>
-<p>A phone allocator has three jobs that pull against each other. It must be fast, because malloc is on every hot path. It
-must keep per-process overhead small, because hundreds of processes each have their own heap. And it should make heap bugs
-hard to exploit, because overflows and use-after-free in native code are a common attack route.</p>
+<p>A phone allocator has three jobs that pull against each other. It must be fast, because <code>malloc()</code> and <code>free()</code> sit on every hot path. It
+must keep per-process overhead small, because hundreds of isolated processes each maintain their own heap. And it must harden the heap against exploitation, because buffer overflows, double frees, and use-after-free bugs in native media, IPC, and graphics code are a primary attack vector.</p>
 <p>Scudo is the default native allocator in bionic and is built for that balance. It comes from LLVM’s hardened allocator
 project (<code>external/scudo/standalone</code>), tuned with an Android configuration for normal phones. It has three parts:</p>
 <div class="cards">
@@ -978,7 +939,7 @@ region offset and block shuffle make heap addresses hard to predict.</figcaption
   <text x="80" y="228" class="tms">green = allocated, white = free</text>
 </svg>
 </figure>
-<p>A malloc that hits a TSD cache pops a block and writes its header. That costs one uncontended lock and no syscall. When the
+<p>A <code>malloc()</code> call that hits a TSD cache pops a block and writes its header. That costs one uncontended lock and no syscall. When the
 cache for a class is empty, it refills a batch from the region’s free list. When the region’s committed space runs out, Scudo
 commits another 256 KiB.</p>
 
@@ -1030,7 +991,7 @@ cookie.</figcaption>
 <ul>
   <li><b>Checksum.</b> <code>computeHeaderChecksum</code> runs CRC32 over the cookie, the address and the header. It uses
   hardware CRC32 instructions where available, and a BSD checksum otherwise. An overflow that clobbers the next block’s header
-  fails the check, and so does a pointer that malloc never returned. Both abort with “corrupted chunk header”.</li>
+  fails the check, and so does a pointer that <code>malloc()</code> never returned. Both abort with “corrupted chunk header”.</li>
   <li><b>State.</b> <code>Available</code>, <code>Allocated</code> or <code>Quarantined</code>. Freeing a block that is not
   <code>Allocated</code>, such as a double free, aborts with “invalid chunk state”.</li>
   <li><b>Origin.</b> <code>Malloc</code>, <code>New</code>, <code>NewArray</code> or <code>Memalign</code>. Scudo can abort on a
@@ -1105,21 +1066,17 @@ checked on every access.</b> Tag letters are placeholders for random 4-bit value
   <li><b>Without MTE</b>, bionic tags every heap pointer with a fixed top byte, <code>POINTER_TAG = 0xB4</code>
   (<code>malloc_tagged_pointers.h</code>), and checks it on <code>free</code>. Code that truncates or rewrites the top byte of a
   heap pointer aborts with “Pointer tag for %p was truncated”.</li>
-  <li><b>With MTE</b>, in a process where heap tagging is enabled, Scudo gives each block a random tag in the low half of the
-  top byte. It stores the same tag on every granule of the block, using the MTE instructions <code>irg</code> (pick a random
-  tag) and <code>stg</code> (store a tag to memory), in <code>memtag.h</code>. A load or store through a pointer with the wrong tag faults. On free, a primary block is
-  retagged with a different random tag (<code>retagBlock</code> excludes the previous one), so a stale pointer faults on use.</li>
+  <li><b>With MTE</b>, when heap tagging is enabled, Scudo picks a random tag in the low half of the top byte with <code>irg</code> and writes it onto every block granule with <code>stg</code> (<code>memtag.h</code>). Any load or store through a pointer with the wrong tag faults immediately, and <code>free()</code> retags primary blocks via <code>retagBlock</code> (excluding the previous tag) so dangling pointers fault on use.</li>
 </ul>
 <blockquote class="key"><span class="lbl">What it means for you</span>
 A Scudo abort on <code>free</code> is almost always a bug in the caller: overflow into a neighbour’s header, double free, or
-freeing a pointer that did not come from malloc. The abort happens at the <code>free</code>, not where memory was corrupted.
+freeing a pointer that did not come from <code>malloc()</code>. The abort happens at the <code>free</code>, not where memory was corrupted.
 MTE or HWASan move the report to the bad access. HWASan is hardware-assisted AddressSanitizer, a debug build that checks
 top-byte tags in software.
 </blockquote>
 
 <h2 id="release"><span class="n">11</span>free() lowers RSS only when a whole page is empty</h2>
-<p>A C/C++ allocator can never move a live block, because the program holds raw pointers to it. A page can go back to the
-kernel only when every block on it is free. One long-lived 64-byte object keeps its whole page resident.</p>
+<p>Unlike ART’s compacting Java garbage collector, which can relocate surviving objects and rewrite managed references, a C/C++ allocator hands out raw virtual addresses it can never move. A page can return to the kernel only when every block on it is free, so a single long-lived 64-byte object pins its entire page resident.</p>
 <figure>
 <figcaption><b>Figure 18. One live block pins its whole page, and only a fully free page goes back to the kernel.</b>
 Fragmentation, not leaks, is the usual reason native RSS stays high after a burst of allocations: survivors are spread over
@@ -1156,22 +1113,12 @@ interval. <code>M_PURGE_ALL</code> (API 34+) is slower and more thorough.
 </blockquote>
 
 <h2 id="others"><span class="n">12</span>Scudo replaced dlmalloc and jemalloc for its safety checks</h2>
-<p>Every general-purpose allocator answers the same questions differently. Where does per-block metadata live? How do threads
-avoid contending on one lock? When do empty pages go back to the kernel? Bionic has used three allocators.</p>
-<p>Early releases used <b>dlmalloc</b>: one heap of variable-size chunks under a global lock. Each chunk carries inline
-boundary tags, size fields stored right before and after the chunk. A freed chunk stores its free-list pointers in itself.
-Inline metadata made heap overflows easy to turn into arbitrary writes.</p>
-<p><b>jemalloc</b> replaced it, with per-thread caches, several independent heaps (arenas), and size-segregated runs whose
-metadata sits out of line. It is still in the tree for low-memory builds (<code>external/jemalloc_new</code>, <code>libjemalloc5</code>).
-Scudo replaced jemalloc as the default in Android 11, per the source.android.com Scudo page. It won for its checks and
-randomisation at a similar memory cost.</p>
-<p><b>TCMalloc</b> is Google’s server allocator and is not part of the Android tree. TCMalloc’s design document
-(<code>docs/design.md</code> in the TCMalloc repository) describes a front end of per-CPU caches or per-thread caches.</p>
-<p>Per-CPU caches rely on <code>rseq</code>, Linux restartable sequences: short code sequences that the kernel restarts if the
-thread is preempted or migrated mid-way. That lets a thread update the current CPU’s data without locks or atomics. Behind
-that sit a middle end of transfer caches and central free lists. Then comes a page heap, whose hugepage-aware version
-(Temeraire) packs allocations into huge pages. Size-class information lives in a page map rather than in per-object
-headers.</p>
+<p>Android’s native allocator changed twice as phone hardware and threat models shifted—from single-core simplicity, to multi-core throughput, to exploit hardening. Every general-purpose allocator trades off three choices: where per-block metadata lives, how threads avoid contending on one lock, and when empty pages return to the kernel.</p>
+<p>Early single-core Android releases used <b>dlmalloc</b>: one heap of variable-size chunks guarded by a single global lock. Each chunk carried inline boundary tags (size fields stored right before and after the payload), and freed chunks stored free-list pointers inside the freed payload itself. On multi-core SoCs the global lock stalled concurrent threads, and inline metadata let linear heap overflows corrupt free-list pointers into arbitrary writes.</p>
+<p>As multi-core phones became standard, <b>jemalloc</b> replaced <code>dlmalloc</code> with per-thread caches, multiple independent arenas, and size-segregated runs whose metadata sits out of line, away from adjacent buffer overflows. It remains in the tree for RAM-constrained builds (<code>external/jemalloc_new</code>, <code>libjemalloc5</code>) where every kilobyte of allocator overhead counts.</p>
+<p>In Android 11, <b>Scudo</b> replaced <code>jemalloc</code> as the default allocator (per the source.android.com Scudo page). Rather than chasing raw multi-arena throughput, Scudo kept per-process memory overhead close to <code>jemalloc</code> while adding deterministic corruption checks—checksummed chunk headers, randomised region order and block shuffling, secondary guard pages, and Arm MTE integration.</p>
+<p><b>TCMalloc</b> is Google’s server allocator and is not part of the Android tree. TCMalloc’s design document (<code>docs/design.md</code> in the TCMalloc repository) describes a front end of per-CPU caches (or per-thread caches) built on <code>rseq</code>, Linux restartable sequences—short instruction sequences the kernel restarts if a thread is preempted or migrated mid-way, allowing lock-free, atomic-free updates to the current CPU’s cache.</p>
+<p>Behind that front end sit transfer caches, central free lists, and a hugepage-aware page heap (Temeraire) that packs allocations into huge pages, using a central page map instead of per-object headers. Those trade-offs fit a server running one or two massive multi-gigabyte binaries across dozens of cores; Android instead runs hundreds of isolated processes that each need low baseline overhead and immediate heap-corruption detection.</p>
 <table>
   <thead><tr><th>Allocator</th><th>Metadata</th><th>Thread fast path</th><th>Hardening</th><th>On Android</th></tr></thead>
   <tbody>

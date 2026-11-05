@@ -40,15 +40,21 @@
 <nav id="toc" aria-label="Contents">
   <div class="h">Contents</div>
   <a href="#glance">At a glance</a>
+  <a href="#evolution">How ART got here</a>
   <a href="#ladder">The cost ladder</a>
   <div class="ph">I · Memory</div>
   <a href="#layout">1 · Every object pays a header</a>
+  <a href="#lock-word" style="padding-left:18px">the lock word</a>
   <a href="#spaces">2 · The heap has several spaces</a>
   <a href="#alloc">3 · Allocation is cheap, GC is not</a>
   <a href="#gc">4 · GC cost follows survivors</a>
   <a href="#cc">5 · CC: copy and check loads</a>
   <a href="#cmc">6 · CMC: slide, fault on touch</a>
+  <a href="#cmc-pauses" style="padding-left:18px">two short pauses</a>
+  <a href="#cmc-uffd" style="padding-left:18px">page-fault compaction</a>
   <a href="#barriers">7 · Barriers</a>
+  <a href="#write-barrier" style="padding-left:18px">write barrier</a>
+  <a href="#read-barrier" style="padding-left:18px">read barrier</a>
   <a href="#safepoints">8 · Safepoints and liveness</a>
   <div class="ph">II · Compiler</div>
   <a href="#tiers">9 · Hot code gets compiled</a>
@@ -62,8 +68,10 @@
   <a href="#str-intern" style="padding-left:18px">interning &amp; sharing</a>
   <a href="#str-ops" style="padding-left:18px">operation costs</a>
   <a href="#str-jni" style="padding-left:18px">strings across JNI</a>
+  <a href="#str-new" style="padding-left:18px">strings from native</a>
   <div class="ph">III · Native</div>
   <a href="#jni">16 · JNI calls</a>
+  <a href="#jni-steps" style="padding-left:18px">the seven stub steps</a>
   <a href="#arrays">17 · Arrays across JNI</a>
   <a href="#cheatsheet">18 · Cheat sheet</a>
   <a href="#method">Numbers and method</a>
@@ -72,39 +80,41 @@
 
 <main id="top">
 <h1>Where the costs are in ART: cheap until the GC, a lock or native code gets involved</h1>
-<p class="lead">This is a tour of the Android Runtime (ART) from the bottom up. It covers how objects are laid out and allocated,
-how the garbage collectors move them, what the compiler can and cannot remove, and what it costs to call native code.
-Most sections end with what it means for the code you write.</p>
+<p class="lead">On Android, ordinary Java and Kotlin code compiles to tight machine instructions: reading a field, writing an array element, or calling an inlined helper costs little more than C.
+Performance cliffs appear where managed code meets the runtime: relocating live objects concurrently, proving safety across opaque calls, contending on locks, or crossing JNI.
+This note walks the Android Runtime (ART) from object headers through GC, compilation, strings, and JNI to show why each boundary exists.</p>
 <p class="m">Code excerpts are from <code>art/</code> and <code>libcore/</code> in AOSP as of Android 17, arm64. Instruction sequences marked
 <em>shape</em> are simplified. The rest are quoted from the source files listed under Sources at the bottom. Cost tiers are rough orders of magnitude, not measurements.</p>
 
 <h2 id="glance">At a glance</h2>
 <ul>
-<li><b>Plain Java is cheap.</b> Field loads, array stores and inlined calls cost a few instructions each.</li>
-<li><b>Allocation costs later.</b> A new object is a quick pointer bump, but every byte brings the next garbage collection closer.</li>
-<li><b>The compiler needs to see through calls.</b> A call it cannot inline, a raw-memory write or a volatile field makes it assume all memory changed.</li>
-<li><b>Locks are cheap until two threads fight.</b> Contention turns a lock into a heavier one that stays heavy.</li>
-<li><b>Native calls pay at the border.</b> Each regular call into C swaps thread state twice, and strings and arrays usually get copied on the way.</li>
+<li><b>Straight-line Java compiles down to single loads and stores.</b> Once ART’s compiler inlines a hot path, local variables live in CPU registers, field accesses take one instruction, and most array bounds checks disappear.</li>
+<li><b>Allocation is cheap up front and paid back in GC work.</b> Creating a small object bumps a thread-local pointer in roughly ten instructions, but every allocated byte pulls the next collection closer, and surviving objects must be traced and relocated.</li>
+<li><b>Optimizations stop where the compiler loses visibility.</b> Uninlined virtual calls, <code>volatile</code> accesses, and raw-memory intrinsics force the compiler to assume heap fields changed and reload them from memory.</li>
+<li><b>Locks stay lightweight only while uncontended.</b> An uncontended <code>synchronized</code> block updates the object’s header word with one atomic instruction; contention or an identity hash code inflates the lock into a native monitor backed by kernel waits.</li>
+<li><b>Crossing into C/C++ pays at the border and on the data.</b> A regular JNI call performs two atomic thread-state transitions so the GC does not wait on native code, and passing Java strings or movable arrays usually copies their bytes.</li>
 </ul>
-<p><b>Terms:</b></p>
-<ul>
-<li><b>GC</b>: the garbage collector. <b>CC</b> (Concurrent Copying) and <b>CMC</b> (Concurrent Mark-Compact) are ART’s two collectors that run alongside the app.</li>
-<li><b>TLAB</b>: a chunk of memory one thread allocates from on its own.</li>
-<li><b>Card mark</b>: the one-byte note (the write barrier) the GC needs after a reference store.</li>
-<li><b>Read barrier</b>: a check after each reference load; only the CC collector needs it.</li>
-<li><b>Suspend check</b>: the poll compiled code runs so the GC can stop the thread.</li>
-<li><b>Deoptimize</b>: drop from compiled code back to the interpreter when an assumption the compiler made stops holding.</li>
-<li><b>JNI</b> (Java Native Interface): the bridge between Java and C. @FastNative and @CriticalNative are annotations that make its calls cheaper.</li>
-<li><b>Thread state</b>: whether a thread is Runnable (may touch the heap) or, for example, Native (has promised not to). A regular JNI call switches it twice.</li>
-<li><b>Userfault</b>: a page fault the runtime handles itself while the GC compacts the heap.</li>
-</ul>
+
+<h2 id="evolution">How ART got here: compilation and GC evolved under mobile limits</h2>
+<p>Desktop and server JVMs can spend gigabytes of RAM on generous heap headroom and background compilation threads. Phones cannot: flash storage, RAM, battery, and 16 ms frame budgets pull against one another, and ART’s Android 17 design is the product of two multi-release trade-offs.</p>
+<p><b>From full AOT to profile-guided tiers.</b> Android originally ran apps on Dalvik, an interpreter paired with a small trace JIT that saved RAM and storage at the cost of CPU speed.
+Android 5 replaced Dalvik with ART and ran <code>dex2oat</code> at install time to compile the entire APK ahead of time (AOT), boosting steady-state speed while stalling installs and bloating flash with cold methods.</p>
+<p>Android 7 restored balance with tiered execution (Section 9): apps start immediately on a fast assembly interpreter (<code>nterp</code>) while an in-process JIT compiles warm methods and records which concrete classes appear at each virtual call site.
+Background <code>dex2oat</code> then reads that profile to AOT-compile only proven hot paths, devirtualizing and inlining calls that static analysis alone could never resolve (Section 10 and Section 11).</p>
+<p><b>From mark-sweep to read barriers to page-fault compaction.</b> Early non-moving mark-sweep collectors freed dead objects in place, leaving scattered holes that fragmented RAM and forced allocations onto free lists.
+Android 8 introduced <b>Concurrent Copying (CC)</b> (Section 5), evacuating sparse 256 KB regions while the app runs; that unlocked bump-pointer allocation at the cost of a reserve of empty to-space regions and a <b>read barrier</b> on every reference load.</p>
+<p><b>Concurrent Mark-Compact (CMC)</b> (Section 6) drops that per-load tax: using Linux <code>userfaultfd</code>, it slides live objects in place with zero read barriers on loads.
+In exchange, touching an uncompacted heap page during compaction triggers a page fault that compacts that one page on the spot, and JNI helpers that expose raw heap pointers pre-touch pages before returning so kernel syscalls never trip a user-space fault.</p>
+<p><b>Terms on the ladder below.</b> A <b>TLAB</b> (thread-local allocation buffer) is a private slice of the moving heap that one thread bumps through without locks.
+A <b>card mark</b> is the one-byte write barrier emitted after storing a reference, a <b>read barrier</b> is CC’s per-load check during marking, and a <b>suspend check</b> is the poll at calls and loop back-edges where ART pauses threads for GC.</p>
+<p><b>JNI</b> (Java Native Interface) bridges Java and C/C++: regular JNI calls switch a thread’s state from <code>Runnable</code> to <code>Native</code> and back so GC never waits on C code, whereas <code>@FastNative</code> and <code>@CriticalNative</code> stay <code>Runnable</code> to make short, non-blocking C calls cheaper.</p>
 
 <!-- ═════════════════════════ LADDER ═════════════════════════ -->
 <h2 id="ladder">The cost ladder: each step up costs roughly ten times more</h2>
 <p>Most of this page explains why things sit where they do on this ladder. Each step up is very roughly an order of magnitude.</p>
 <figure>
 <figcaption><b>Figure 1. Instructions are cheap; kernel trips, waits and GC work are not.</b> Bar colour follows the tier: green is a few inline instructions, blue a call or a short slow path, amber an atomic, a JNI
-crossing or a malloc and copy, and red a trip into the kernel or a wait. The last row is the one people miss: an allocation is cheap on its own, but its real cost is the GC work it adds.</figcaption>
+crossing or a native-heap allocation and copy, and red a trip into the kernel or a wait. The last row is the one people miss: an allocation is cheap on its own, but its real cost is the GC work it adds.</figcaption>
 <svg viewBox="0 0 1000 490" role="img" aria-label="Cost ladder">
   <text x="10" y="18" class="th">operation</text>
   <text x="330" y="18" class="th">relative cost (rough, log scale)</text>
@@ -142,11 +152,10 @@ crossing or a malloc and copy, and red a trip into the kernel or a wait. The las
 <div class="part">Part I · Memory</div>
 
 <h2 id="layout"><span class="n">1</span>Every object pays a fixed header before its fields</h2>
-<p>Every Java object starts with a small <b>header</b>. The runtime needs two things from each object: what class it is, and a place for lock and GC state.
-So the header holds a pointer to the class and a <b>lock word</b>, 8 bytes in all.
-References are compressed to 32 bits to keep objects small.
-Objects are padded to a fixed alignment, and arrays add a length field before their elements.
-The exact sizes are in Numbers and method.</p>
+<p>In C, a struct’s type disappears once compiled; at run time it is just raw fields in memory. Java cannot do that: every heap object must support virtual dispatch, runtime type checks (<code>instanceof</code> and casts), <code>synchronized</code> locking, identity hashing, and GC graph traversal.
+ART therefore prefixes every object with an 8-byte <b>header</b>: a 4-byte class pointer (<code>klass_</code>) and a state word (<code>monitor_</code>).</p>
+<p>Even on 64-bit arm64, ART places the entire managed heap inside a four-gigabyte virtual address window so every Java reference, including <code>klass_</code>, fits in a 32-bit compressed <code>HeapReference</code>.
+That halves reference-field memory and cache footprint while native code keeps full pointers. Objects are padded to eight-byte alignment, and arrays add a length field before their elements; exact sizes are in Numbers and method.</p>
 
 <figure>
 <figcaption><b>Figure 2. Headers and padding take a large share of small objects.</b> The class linker, the part of ART that loads classes, lays out fields: references first, so the GC can scan them as one block, then
@@ -199,18 +208,18 @@ primitives from largest to smallest, filling alignment gaps. An empty
 </svg>
 </figure>
 
-<h3>The lock word packs four jobs into one field</h3>
-<p>Locking, identity hashing and the GC all need a little state per object. A separate field for each would grow every object.
-So ART packs them into one 32-bit field in the header. Its top two bits say which of four meanings the rest has, and two more bits belong to the GC.
-Figure 3 shows the exact bit widths, which come from <code>LockWord</code> in <code>lock_word.h</code>.</p>
+<h3 id="lock-word">The lock word packs four jobs into one field</h3>
+<p>Locking, <code>System.identityHashCode</code>, and moving GC each need per-object state, yet almost no object uses all of them at once.
+Giving each subsystem its own header word would add 12 bytes to every object in RAM, so ART multiplexes all four onto the single 32-bit <code>monitor_</code> word (<code>LockWord</code> in <code>lock_word.h</code>).
+Its top two bits select which state the word currently holds, and two bits belong to the GC:</p>
 <ul>
 <li>A <b>thin lock</b> stores the owning thread’s id and a recursion count right in the word. An id of zero means unlocked.</li>
-<li>A <b>fat lock</b> points to a separate native <code>Monitor</code> object. It is used when a thin lock is not enough, for example under contention or <code>wait()</code> (Section 14).</li>
-<li>The <b>hash</b> state holds the object’s identity hash code.</li>
-<li>The <b>forwarding</b> state holds the object’s new address while the CC collector moves it (Section 5).</li>
+<li>A <b>fat lock</b> holds a <code>MonitorId</code> indexing a separately allocated native <code>Monitor</code> struct when a thin lock is not enough: under thread contention, <code>Object.wait()</code>, or when an already-hashed object is locked (Section 14).</li>
+<li>The <b>hash</b> state holds the object’s 28-bit identity hash code once computed.</li>
+<li>The <b>forwarding</b> state holds the object’s new address while the CC collector evacuates it (Section 5).</li>
 </ul>
-<p>The mark bit and the read-barrier (“gray”) bit are scratch bits the collectors use while tracing, that is, while walking the object graph to find live objects (Section 4).
-Taking a thin lock is a single compare-and-swap (CAS) on this word.</p>
+<p>The mark bit and the read-barrier (“gray”) bit are scratch bits the collectors use while tracing the object graph (Section 4).
+Taking an uncontended thin lock is a single atomic compare-and-swap (CAS) on this word.</p>
 <figure>
 <figcaption><b>Figure 3. Only the thin state has room for both an owner and a count.</b> The top two bits select how the other 30 are read. The fat and hash states
 each spend 28 bits on one value, which is why an object cannot be thin-locked and hashed at the same time. Of the two production collectors, only CC uses the forwarding state.</figcaption>
@@ -250,21 +259,20 @@ each spend 28 bits on one value, which is why an object cannot be thin-locked an
 <blockquote class="key"><span class="lbl">What it means for you</span>
 Small objects are mostly header and padding: an <code>Integer</code> is 16 bytes for 4 bytes of payload.
 A lock and an identity hash cannot both fit in the lock word. If you take an object’s identity hash and later
-<code>synchronized</code> on it, ART must switch to a fat monitor (Section 14). The identity hash comes from <code>System.identityHashCode</code>,
+<code>synchronized</code> on it, ART must inflate it to a fat monitor (Section 14). The identity hash comes from <code>System.identityHashCode</code>,
 or from a <code>hashCode()</code> the class does not override.
 </blockquote>
 
 <!-- ───────────── Spaces ───────────── -->
 <h2 id="spaces"><span class="n">2</span>The heap is several spaces, each with its own rules</h2>
-<p>The “Java heap” is several address ranges, called <b>spaces</b>, with different rules for allocation, moving and sharing.
-Objects have different needs. Framework objects should be shared by every app. Most new objects should be cheap to allocate
-and free to move. A few must never move, because native code holds their address.</p>
-<p>Two spaces come from outside the app. The <b>boot image</b> is a precompiled snapshot of framework classes, objects and code that every process maps.
-It is stored in <code>.art</code> and <code>.oat</code> files. The <b>zygote</b> is the process every app is forked from.
-Whatever it allocated before forking is shared with each app, copy-on-write: a page is copied only when one side writes to it.</p>
-<p>The app’s own objects go to the other three spaces. Almost every new object goes to the moving space, whose layout depends on the collector (Sections 5 and 6).
-The non-moving space is collected in place by mark-sweep: the GC marks the live objects and frees the rest, and new objects come from a free list.
-Primitive arrays and strings of 12 KB or more go to the large object space.</p>
+<p>One uniform memory region cannot satisfy everything Android asks of a managed heap: framework classes should share physical RAM pages across every app, short-lived objects should allocate by pointer bump and compact freely, multi-page buffers should not be copied on every GC, and buffers shared with C must never move.</p>
+<p>ART therefore splits its virtual heap window into distinct <b>spaces</b>, each with its own allocator and compaction rules.
+Reserving a space’s virtual address range (such as 64 MB for the non-moving space) does not consume physical RAM up front; physical pages fault in on allocation and return to the kernel via <code>madvise</code> when freed.</p>
+<p>Two spaces are inherited rather than allocated by the app. The <b>boot image</b> maps pre-initialized framework classes and strings from <code>.art</code> files (paired with compiled code in <code>.oat</code> files) into every process.
+The <b>zygote space</b> holds heap objects allocated by the zygote process before it forks each app; child processes share those physical RAM pages copy-on-write until a write, such as locking or mutating a shared object, dirties a private copy of that 4 KB page.</p>
+<p>The app’s own allocations land in three spaces. Almost every new object goes to the <b>moving space</b>, compacted in place by CMC or across regions by CC (Section 5 and Section 6).
+The <b>non-moving space</b> uses mark-sweep and a free list for pinned addresses such as <code>Class</code> objects and <code>VMRuntime.newNonMovableArray</code> buffers.</p>
+<p>Primitive arrays and strings of 12 KB or more go straight to the page-granular <b>large object space</b>. Copying a 64 KB <code>byte[]</code> during compaction would burn memory bandwidth without helping small-object fragmentation, and reclaiming whole OS pages avoids free-list holes.</p>
 <figure>
 <figcaption><b>Figure 4. A new app starts with many objects it never allocated.</b> The boot image and zygote space are mapped and shared across all apps forked from the zygote.
 Writing to them, for example by locking a boot-image object, dirties a private copy of the page.</figcaption>
@@ -302,10 +310,10 @@ Writing to them, for example by locking a boot-image object, dirties a private c
 
 <!-- ───────────── Alloc ───────────── -->
 <h2 id="alloc"><span class="n">3</span>Allocation is a pointer bump; the cost comes later, in the GC</h2>
-<p>Each thread allocates from its own buffer, so a new object needs no lock and no atomic instruction.
-If every thread shared one “next free byte” pointer, each <code>new</code> would need one.
-Instead each thread owns a <b>thread-local allocation buffer (TLAB)</b>: a chunk of the moving space that only it allocates from.
-Allocation is then a pointer bump. TLAB sizes differ by collector and are listed in Numbers and method.</p>
+<p>Because the collector compacts the moving space into contiguous free ranges, allocating a small object never searches a free list.
+Still, if every thread bumped one shared heap cursor, every <code>new</code> on a multicore phone would contend on the same cache line with atomic compare-and-swaps.</p>
+<p>ART avoids that contention by giving each thread its own <b>thread-local allocation buffer (TLAB)</b>, a private slice of the moving space stored on its <code>Thread</code> struct.
+Within a TLAB, allocation is an unsynchronized pointer bump; only refilling an exhausted TLAB touches shared heap state. TLAB sizes differ by collector (see Numbers and method).</p>
 <figure>
 <figcaption><b>Figure 5. A thread allocates by moving its own pointer forward.</b> No other thread is involved, so no atomic is needed. The memory past <code>pos</code>
 is already zero, so the fast path only has to write the class pointer.</figcaption>
@@ -353,10 +361,9 @@ ldr  lr, [tr, #pAllocObjectResolved]  <span class="c">// entrypoint in Thread</s
 blr  lr                               <span class="c">// the fast path on the left</span>
 <span class="hw">dmb  ishst                            // constructor fence</span>
 <span class="c">// ... inlined constructor stores ...</span></code></pre>
-<p>Allocation is <b>not inlined</b> into compiled code. It is a call into a hand-written stub of about ten instructions.
-After the call comes a <b>StoreStore fence</b> (<code>dmb ishst</code>), an instruction that makes earlier stores visible before later ones.
-It stops other threads from seeing the object before its class pointer and fields are written.
-The compiler drops the fence when it can prove the object does not escape to another thread before the next fence.</p>
+<p>To keep compiled code compact, ART does <b>not inline</b> the bump sequence at every <code>new</code> site; instead it calls a shared ten-instruction assembly entrypoint on <code>Thread</code>.
+After the call comes a <b>StoreStore fence</b> (<code>dmb ishst</code>), ordering the header and constructor stores before any reference store that publishes the new object to another thread.
+The compiler omits that fence when escape analysis proves the object stays thread-local until a later barrier.</p>
 </div>
 </div>
 
@@ -368,17 +375,19 @@ Finalizable classes, which override <code>finalize()</code>, and classes still b
 
 <!-- ───────────── GC basics ───────────── -->
 <h2 id="gc"><span class="n">4</span>A GC’s cost follows what survives, not how much garbage there is</h2>
-<p>ART’s collectors find live objects by tracing, so their work grows with the objects that survive.
-Java code never frees memory, so the runtime has to work out which objects the program can still reach.
-A <b>tracing</b> collector starts from <b>roots</b>: references held outside the heap, such as thread stacks, static fields and
-JNI global references held by native code. It follows every reference, marks what it reaches, and treats everything else as garbage.</p>
+<p>Managed runtimes reclaim memory either by counting references on every pointer store or by periodically tracing live objects from roots.
+Reference counting pays an atomic increment and decrement on every pointer write and leaks reference cycles without backup cycle detection.
+ART instead uses <b>tracing</b> garbage collectors: pointer stores stay fast, cycles are reclaimed automatically, and collection work scales with the <b>live objects that survive</b> rather than the dead objects left behind. Dead memory is never visited.</p>
+<p>A tracing cycle starts from <b>GC roots</b>: references outside heap objects that are reachable by definition.
+Roots include thread stacks and registers, <code>static</code> reference fields, interned strings, <b>JNI local references</b> in active native frames, and <b>JNI global references</b> from <code>NewGlobalRef</code> (weak globals from <code>NewWeakGlobalRef</code> do not keep objects alive).
+From those roots, the collector marks reachable objects and reclaims the rest.</p>
 <figure>
 <figcaption><b>Figure 6. Anything not reachable from a root is garbage, even if it is part of a cycle.</b> The expensive part of a GC is marking and moving <b>live</b> objects, so its cost tracks what survives.</figcaption>
 <svg viewBox="0 0 1000 250" role="img" aria-label="Roots and reachability">
   <text x="10" y="18" class="th">roots</text>
   <rect x="10" y="30" width="170" height="40" rx="3" class="bw"/><text x="20" y="54" class="t">thread stacks &amp; registers</text>
   <rect x="10" y="80" width="170" height="40" rx="3" class="bw"/><text x="20" y="104" class="t">static fields (classes)</text>
-  <rect x="10" y="130" width="170" height="40" rx="3" class="bw"/><text x="20" y="154" class="t">JNI global refs</text>
+  <rect x="10" y="130" width="170" height="40" rx="3" class="bw"/><text x="20" y="154" class="t">JNI local &amp; global refs</text>
   <rect x="10" y="180" width="170" height="40" rx="3" class="bw"/><text x="20" y="204" class="t">interned strings, …</text>
   <text x="300" y="18" class="th">heap</text>
   <!-- live objects -->
@@ -406,23 +415,19 @@ JNI global references held by native code. It follows every reference, marks wha
 </figure>
 <p>To find roots on thread stacks, the GC must know which stack slots and registers hold references where each thread stopped.
 The compiler records this as <b>stack maps</b> at <b>safepoints</b>, the instructions where a thread is allowed to stop (Section 8).</p>
-<p>Every collector has some short <b>pauses</b>, where all threads stop, and long <b>concurrent</b> phases, where the app keeps running alongside the GC.
-A common pause is the <b>thread flip</b> (<code>ThreadList::FlipThreadRoots</code>).
-The GC suspends every thread for a moment and gives each a “flip function” that updates its stack roots to the objects’ new addresses.
-After the threads resume, each flip function runs exactly once. It runs either on the thread itself, before it can run Java code again, or on the GC thread on its behalf.</p>
+<p>Every collector combines short <b>pauses</b>, where all threads stop, with long <b>concurrent</b> phases alongside the app.
+A key pause is the <b>thread flip</b> (<code>ThreadList::FlipThreadRoots</code>): the GC briefly suspends threads and installs a flip function on each to update its stack roots to new object addresses.
+Once resumed, each thread’s flip runs once, either on the thread itself before Java resumes or on the GC thread’s behalf.</p>
 
 <!-- ───────────── CC ───────────── -->
 <h2 id="cc"><span class="n">5</span>CC moves objects by checking every reference load</h2>
-<p>Freeing garbage in place leaves holes, so ART’s collectors also <b>move</b> live objects together. Moving an object while the app runs is
-the hard part. Every reference to it must be updated, and meanwhile the app must never use a stale address.</p>
-<p>CC (Concurrent Copying) was the default from Android 8 until CMC. It splits the moving space into fixed-size <b>regions</b>.
-During a GC it picks the regions worth emptying, called <b>from-space</b>: every region allocated since the previous GC, plus older regions that are less than three-quarters live.
-It copies their live objects into fresh <b>to-space</b> regions and frees the old regions whole.</p>
-<p>To keep the app from using a stale from-space address, CC adds a <b>read barrier</b>.
-This is a short check after every reference load that swaps a from-space pointer for its to-space copy.
-An object whose fields are still being scanned is <b>gray</b>, marked by the gray bit in its lock word (Section 1).
-Only loads from gray objects need the slow path.
-The region size and the live-share threshold are in Numbers and method.</p>
+<p>Compacting live objects while the app is frozen is straightforward; compacting them while UI threads keep reading and writing fields is where concurrent GC gets hard.
+Once an object is copied, heap fields briefly mix old and new pointers, and writing to the stale copy loses updates.
+CC (Concurrent Copying), Android’s default collector from Android 8 until CMC, prevents that with a <b>to-space invariant</b>: app threads never observe an old address.</p>
+<p>CC divides the moving space into fixed 256 KB <b>regions</b>. During a collection it selects sparse regions to evacuate as <b>from-space</b> (every region allocated since the previous GC plus older regions that are less than three-quarters live), copies their surviving objects into fresh <b>to-space</b> regions, installs a forwarding address in each old lock word (Section 1), and reclaims the emptied regions whole.</p>
+<p>To uphold the to-space invariant while evacuation is running, the compiler emits a <b>read barrier</b> after every reference load.
+An object whose reference fields have not all been updated yet carries the <b>gray</b> bit in its lock word; only loads from gray objects take the barrier’s slow path to copy or look up the forwarding address and return the to-space reference.
+Region sizes and evacuation thresholds are in Numbers and method.</p>
 <figure>
 <figcaption><b>Figure 7. CC copies live objects out and redirects any load that would see the old copy.</b> Top: copying packs the live objects of several sparse regions into one, so whole regions come free. Bottom: the read barrier is what
 lets the app keep running meanwhile. A load that might return a from-space address is redirected to the copy before the app can use it.</figcaption>
@@ -455,16 +460,14 @@ to copy into. CC is still used where userfaultfd, the Linux feature CMC depends 
 
 <!-- ───────────── CMC ───────────── -->
 <h2 id="cmc"><span class="n">6</span>CMC slides objects in place and uses page faults instead of read barriers</h2>
-<p>CMC (Concurrent Mark-Compact) is the newer collector. It solves the same problem as CC, moving objects while the app runs, but with <b>no read barriers</b>.
-Instead of copying objects to a separate to-space, it <b>slides</b> live objects down in address order inside the same space.
-It relies on <b>userfaultfd</b>, a Linux feature that lets a process handle page faults on a memory range itself.
-That stops the app from seeing a page before it has been compacted.
-CMC also has a generational mode: a <b>young</b> collection only processes objects allocated since the previous GC.</p>
-<p>ART picks CMC at startup if the kernel has the userfaultfd features it needs and system settings allow it
-(the check is in <code>mark_compact.cc</code>, the CMC collector’s source).
-It is on by default up to Android 14. From Android 15, a system property or a device_config flag (a runtime-configurable system setting) turns it on.</p>
+<p>Every reference load in a Java app runs far more often than GC compaction does, so paying CC’s read barrier on every dereference and holding empty to-space regions in reserve is a steep tax.
+CMC (Concurrent Mark-Compact) compacts concurrently with <b>zero read barriers</b> and no separate to-space reserve.</p>
+<p>Instead of evacuating into empty regions, CMC computes each survivor’s destination address from its mark bitmaps, rewrites references to those post-compaction addresses, and <b>slides</b> live objects down in address order inside the same virtual range.
+Linux’s <b>userfaultfd</b> intercepts any thread that touches an uncompacted page, and generational mode compacts only young objects allocated since the previous cycle.</p>
+<p>ART selects CMC at process startup when the kernel supports the required <code>userfaultfd</code> features and system configuration enables it (<code>ShouldUseUserfaultfd</code> in <code>mark_compact.cc</code>).
+It is on by default through Android 14, and controlled from Android 15 onward by <code>ro.dalvik.vm.enable_uffd_gc</code> or a runtime <code>device_config</code> flag.</p>
 
-<h3>Only two short pauses; the rest runs alongside the app</h3>
+<h3 id="cmc-pauses">Only two short pauses; the rest runs alongside the app</h3>
 <figure>
 <figcaption><b>Figure 8. CMC stops the app twice, briefly, to flip thread roots.</b> Everything else runs alongside the app. Both red bars are thread flips.
 The app also pays during compaction, but only when it touches a page the GC has not reached yet.</figcaption>
@@ -493,11 +496,10 @@ The app also pays during compaction, but only when it touches a page the GC has 
 </svg>
 </figure>
 
-<h3>How userfaultfd keeps the app from seeing a half-built page</h3>
-<p>At the compaction pause, the GC moves the moving space’s contents to a separate <b>from-space</b> address with <code>mremap(MREMAP_DONTUNMAP)</code>.
-That call moves the pages but leaves the original range reserved and <b>empty</b>, and the GC registers that range with userfaultfd.
-Each compacted page is then installed whole with <code>UFFDIO_COPY</code>, an ioctl (a control call on the userfaultfd file descriptor) that maps a fully written page atomically.
-Where the kernel allows it, <code>UFFDIO_MOVE</code> moves the page in instead. From then on:</p>
+<h3 id="cmc-uffd">How userfaultfd keeps the app from seeing a half-built page</h3>
+<p>Once the compaction pause flips thread roots to post-compaction virtual addresses, the moving space’s virtual range cannot keep pointing at uncompacted physical pages, or threads would read stale bytes at new offsets.
+During that pause, <code>mremap(MREMAP_DONTUNMAP)</code> moves the old page-table mappings to a separate <b>from-space</b> virtual range while leaving the original virtual range reserved, <b>unmapped</b>, and registered with <code>userfaultfd</code>.</p>
+<p>As the GC assembles each compacted page from from-space survivors (rewriting their internal references to post-compaction addresses), it maps the finished physical page into the original virtual range atomically via <code>UFFDIO_COPY</code>, or moves it without copying via <code>UFFDIO_MOVE</code> when supported:</p>
 <figure>
 <figcaption><b>Figure 9. A page is either fully compacted or not mapped at all.</b> App pointers already hold the post-compaction addresses, so the original range must never show a half-built page. Compacted pages are green.
 Touching an unmapped page makes the faulting thread build that page, or wait for the thread already building it, before its load continues.</figcaption>
@@ -542,7 +544,7 @@ Touching an unmapped page makes the faulting thread build that page, or wait for
 
 <div class="two">
 <div>
-<h3>Why it replaced CC</h3>
+<h4>Why it replaced CC</h4>
 <ul>
   <li><b>No read barriers</b>: compiled code is smaller and every reference load is a plain <code>ldr</code>.</li>
   <li><b>Less memory</b>: sliding compaction doesn’t need a reserve of empty to-space regions, and preserves allocation order (good locality).</li>
@@ -550,7 +552,7 @@ Touching an unmapped page makes the faulting thread build that page, or wait for
 </ul>
 </div>
 <div>
-<h3>What it costs the app</h3>
+<h4>What it costs the app</h4>
 <ul>
   <li>A thread that touches a not-yet-compacted page during compaction takes a <b>page fault</b>. It then compacts that page itself, or waits if another thread is already on it. This happens once per page.</li>
   <li>Kernel calls must not hit those faults, and native code may pass a heap pointer straight to a system call. So <code>GetPrimitiveArrayCritical</code> and <code>GetStringCritical</code>, the JNI calls that hand out a direct pointer into the heap (Sections 15 and 17), call <code>EnsureObjectUserfaulted</code> to touch the object’s pages before handing out the pointer.</li>
@@ -561,13 +563,13 @@ Touching an unmapped page makes the faulting thread build that page, or wait for
 
 <!-- ───────────── Barriers ───────────── -->
 <h2 id="barriers"><span class="n">7</span>Barriers are the small tax that lets the GC run alongside the app</h2>
-<p>A <b>barrier</b> is extra code the compiler adds around reference loads or stores so the GC can run while the app does.</p>
+<p>If the app mutates the object graph while a collector is walking it, or stores a pointer from an old object to a newly allocated young object, the collector needs a lightweight record of what changed.
+A <b>barrier</b> is the short inline instruction sequence the compiler emits around reference stores or loads to maintain that invariant.</p>
 
-<h3>Write barrier: a one-byte note after each reference store</h3>
-<p>The write barrier stops the GC from missing references the app writes while marking.
-Without it, the app could store a reference to an unmarked object into an object the GC has already scanned, and the GC would free a live object.
-So the heap is divided into small <b>cards</b>, and a side array, the <b>card table</b>, holds one byte per card.
-After every reference store that may store a non-null value, compiled code marks the written object’s card as dirty.</p>
+<h3 id="write-barrier">Write barrier: a one-byte note after each reference store</h3>
+<p>The write barrier solves two problems at once: during concurrent marking, it catches references stored into already-scanned objects so live targets are not missed; during generational GC, it records which older objects point to young objects so young collections skip scanning the whole heap.</p>
+<p>Logging every pointer store into a per-thread queue would cost bounds checks and flushes.
+ART instead coarsens tracking to 1 KB heap slices called <b>cards</b>: a flat side byte array, the <b>card table</b>, holds one byte per 1 KB of virtual heap, and every non-null reference store unconditionally marks that slice’s byte dirty with no atomic instruction or branch.</p>
 <figure>
 <figcaption><b>Figure 10. A reference store dirties one byte; the GC rescans only dirty cards.</b> The card index is the object’s address shifted right by 10 (<code>kCardShift</code>), so marking a card is one shift and one byte store.
 The GC never logs individual stores. It only learns which 1 KB stretches of heap to look at again.</figcaption>
@@ -599,11 +601,13 @@ ldr  card, [tr, #card_table]   <span class="c">// biased base</span>
 lsr  temp, obj, #10            <span class="c">// kCardShift</span>
 strb card, [card, temp]        <span class="c">// low byte of base == kCardDirty</span></code></pre>
 </div>
-<div><p>It takes three instructions. The card table base is chosen so its low byte equals the dirty value, so one register is both the address and the value.
-If the stored value might be null, a branch skips the mark. If it is known to be null, there is no barrier. Primitive stores never need it.</p></div>
+<div><p>It takes three instructions. ART biases the card table’s base address so its low byte equals the dirty marker (<code>0x70</code>), letting one register supply both the base pointer and the byte value to store.
+If the stored reference may be null, <code>MaybeMarkGCCard</code> wraps these three instructions in a zero check; known-null and primitive stores emit no barrier.</p></div>
 </div>
 
-<h3>Read barrier: one untaken branch per load, CC only</h3>
+<h3 id="read-barrier">Read barrier: one untaken branch per load, CC only</h3>
+<p>Under CC, checking a thread-local memory flag on every reference load would double the memory traffic of pointer chasing.
+On arm64, ART avoids that extra load under CC by dedicating one general-purpose register (<code>x20</code>) as the <b>marking register</b> across managed code, so normal execution outside a GC cycle pays only a single predicted-not-taken branch:</p>
 <div class="two">
 <div>
 <pre><code><span class="src">GenerateFieldLoadWithBakerReadBarrier</span><span class="c">// every reference load under CC (shape)</span>
@@ -612,19 +616,20 @@ ldr  wRef, [obj, #off] <span class="c">// the real load</span>
 <span class="c">// field_thunk: is obj's lock word gray? if so, call
 // the mark entrypoint to get the to-space ref</span></code></pre>
 </div>
-<div><p>Outside a GC this is one extra branch that is not taken. It tests a dedicated <b>marking register</b>, which is reserved to hold “is the GC marking?”. During marking, loads from gray
-objects go through a shared thunk, a small out-of-line stub, that returns the to-space reference. Under CMC <b>none of this is emitted</b>, and reference loads are plain loads.</p></div>
+<div><p>While CC is not marking, <code>mr</code> holds zero and execution falls straight through to <code>ldr</code>. During marking, loads from gray
+objects branch to a shared out-of-line thunk that copies or forwards the target and returns its to-space address. Under CMC <b>none of this is emitted</b>, freeing <code>x20</code> and leaving reference loads as plain <code>ldr</code> instructions.</p></div>
 </div>
 
 <!-- ───────────── Safepoints ───────────── -->
 <h2 id="safepoints"><span class="n">8</span>Threads stop only at safepoints, and stack maps decide what stays alive</h2>
-<p>The GC can only stop a thread at points where the compiler wrote down which registers and stack slots hold references. Those points are <b>safepoints</b>.
-The GC often needs every thread stopped for a pause. Or it needs each thread to run a small job at a known point, called a <b>checkpoint</b>,
-such as a flip function or a stack dump for an ANR report.
-Every call is a safepoint. Compiled loops also get a <b>suspend check</b> on the jump back to the top of the loop, so a long loop cannot hold up a GC.</p>
-<p>Suspension is cooperative. To stop a thread, the runtime sets a suspend or checkpoint request flag on the thread and waits. The thread notices at its next suspend check. It then blocks until resumed, or runs the checkpoint and carries on.
-A thread that is blocked, or inside a regular JNI call, does not touch the heap, so the GC counts it as already suspended (Section 16).
-@FastNative and @CriticalNative calls stay Runnable, so the GC has to wait for them to return. Because suspension is cooperative, every pause includes the time for the slowest running thread to reach its next safepoint.</p>
+<p>Why can’t the GC pause threads instantly with a POSIX signal wherever they happen to be running?
+Mid-sequence, a CPU register may hold an unboxed interior pointer (such as array base plus offset), and recording exact register-type metadata for every machine instruction would bloat <code>.oat</code> files severalfold.
+Instead, threads stop only at designated <b>safepoints</b> (calls and loop back-edges), where compact <b>stack maps</b> list which registers and stack slots hold heap references.</p>
+<p>Stopping is cooperative, whether for a full stop-the-world pause or a per-thread <b>checkpoint</b> (a short self-service task such as flipping stack roots or dumping a stack for ANR).
+The runtime sets a request flag on <code>Thread</code>, and running Java code polls it at the next safepoint <b>suspend check</b>.</p>
+<p>Threads blocked in the kernel or inside a regular JNI call have already promised not to touch the heap, so the GC treats them as suspended immediately (Section 16).
+<code>@FastNative</code> and <code>@CriticalNative</code> calls remain <code>Runnable</code> without safepoints inside C code, so every pause waits until they return and every other <code>Runnable</code> thread reaches a safepoint.</p>
+<p>Because loop back-edges run constantly in hot code, even a three-instruction flag test adds measurable overhead. On arm64 methods without SIMD registers to spill, ART reduces the suspend check to a single self-referential load that faults only when suspension is requested:</p>
 <div class="two">
 <div>
 <pre><code><span class="src">GenerateSuspendCheck</span><span class="c">// explicit: test the thread's flags</span>
@@ -695,16 +700,15 @@ For raw access, also make sure the object cannot move, by putting it in the non-
 <div class="part">Part II · Compiler</div>
 
 <h2 id="tiers"><span class="n">9</span>Code gets faster as it gets hot</h2>
-<p>ART runs code in tiers and moves a method up as it gets hot. An app ships as <b>dex bytecode</b>, which the D8 and R8 tools build from Java and Kotlin.
-Compiling all of it up front would cost install time and storage, and most of it rarely runs.</p>
-<p>The interpreter, nterp, is written in assembly. It runs bytecode directly and counts how often each method runs.
-A hot method is compiled by the <b>JIT</b>, the just-in-time compiler inside the app process. The first version is baseline code: compiled quickly with
-few optimizations. It records an <b>inline cache</b> at each virtual call site: the list of receiver classes seen there, that is, the classes of the objects the method was called on.</p>
-<p>Hotter methods are recompiled by the optimized JIT, which uses those inline caches to inline calls (Section 11).
-A long-running loop in the interpreter can jump into compiled code mid-run. This is <b>on-stack replacement (OSR)</b>.</p>
-<p>The JIT also saves a profile of the hot methods and classes to disk. Later, during install or idle maintenance, <b>dex2oat</b>, the on-device ahead-of-time (AOT) compiler,
-compiles those methods with the <code>speed-profile</code> compiler filter, the setting that compiles only the methods in the profile. With this <b>profile-guided</b>
-compilation, the next launch starts with optimized code for the hot paths. Framework code is AOT-compiled into the boot image (Section 2).</p>
+<p>Java permits classes to be loaded dynamically and ships apps as portable <b>dex bytecode</b> built by D8 and R8.
+Compiling every method in an APK ahead of time wastes flash storage on cold error paths and still lacks runtime knowledge of which concrete subclasses actually show up at virtual call sites.
+ART therefore executes code in tiers, promoting methods only after they prove they are hot.</p>
+<p>Cold code starts in <b>nterp</b>, a hand-written assembly interpreter that runs dex bytecode directly while incrementing per-method hotness counters.
+Once a method crosses the warm threshold, the in-process <b>JIT</b> compiles a fast <b>baseline</b> version with minimal optimization whose job is both to run faster and to populate an <b>inline cache</b> at each virtual call site: a short list of the receiver classes actually observed there.</p>
+<p>Methods that stay hot are recompiled by the <b>optimizing JIT</b>, which reads those inline caches to guard and inline virtual calls (Section 11).
+If a method is stuck inside a long-running loop in the interpreter, <b>on-stack replacement (OSR)</b> transfers execution into freshly compiled loop code mid-iteration.</p>
+<p>To avoid repeating that warm-up on every app launch, the runtime flushes hot method and inline-cache records to a profile file on disk.
+During idle maintenance (or using cloud profiles at install), <b>dex2oat</b> runs ahead-of-time compilation with the <code>speed-profile</code> filter, compiling only profiled methods and pre-populating an <b>app image</b> of hot classes and literals. Framework code in the boot image is AOT-compiled up front (Section 2).</p>
 <figure>
 <figcaption><b>Figure 12. Methods climb from interpreter to optimized code, and the profile carries that work to the next launch.</b> Microbenchmarks that do not warm up measure the interpreter or baseline code. AOT code compiled from a profile has inline caches too, so
 it can inline virtual calls the profile saw.</figcaption>
@@ -725,12 +729,11 @@ it can inline virtual calls the profile saw.</figcaption>
 </figure>
 
 <h2 id="ir"><span class="n">10</span>The compiler reuses a value only if it can prove nothing changed it</h2>
-<p>To remove a repeated load or move it out of a loop, the compiler must prove that nothing in between changed that memory.
-The optimizing compiler turns bytecode into an intermediate representation (IR) called an <b>SSA graph</b>, where every value is defined once. SSA stands for static single assignment, and ART’s class for it is HGraph.
-Each instruction records its <b>side effects</b>: which kinds of memory it may read or write, by field type and array element type, and whether it can trigger a GC.
-Every memory optimization asks the same question of these sets: “can anything between A and B have written what A read?”</p>
-<p>Some library methods are <b>intrinsics</b>. The compiler recognizes them and emits a few instructions in place of a call, each with its own declared side effects.
-A <code>volatile</code> access is an ordering point the compiler cannot move other memory accesses across.</p>
+<p>Keeping a heap field in a CPU register instead of reloading it on every loop iteration requires proving <b>non-aliasing</b>: nothing between the first load and the second use could have written that memory.
+Whole-program pointer analysis is too slow for an on-device JIT, so ART leans on Java’s type safety: writing a <code>byte[]</code> element can never overwrite an <code>int</code> field.</p>
+<p>Inside the optimizing compiler, bytecode becomes a static single assignment (SSA) graph (<code>HGraph</code>) where every instruction carries a <b>side-effects</b> bitset listing which field and array types it may read or write, plus whether it can trigger GC.
+Every memory optimization asks those bitsets whether anything between A and B could have written the memory category A read.</p>
+<p>Known library methods marked as <b>intrinsics</b> are lowered directly into inline IR or machine instructions with custom side-effect declarations, whereas a <code>volatile</code> field access acts as a memory-ordering barrier that surrounding heap accesses cannot be reordered across.</p>
 <figure>
 <figcaption><b>Figure 13. A narrow store lets the compiler reuse a load; an opaque call forces a reload.</b> LSE (load/store elimination) and GVN (global value numbering), described in Section 12, are the passes that reuse the first load. On the left the store only touches <code>byte[]</code> elements, so
 <code>pos</code> cannot have changed. On the right the call might write anything, so <code>pos</code> is loaded again.</figcaption>
@@ -756,16 +759,14 @@ A <code>volatile</code> access is an ordering point the compiler cannot move oth
 </figure>
 
 <h2 id="dispatch"><span class="n">11</span>Inlining matters most, and it needs a known call target</h2>
-<p>Inlining is the most important optimization. It removes the call <b>and</b> exposes the callee’s body, so the other optimizations can see across what used to be an opaque call.
-To inline a virtual call, the compiler first has to know which method it will actually reach.</p>
-<p>Without that knowledge, the call is dispatched at runtime through a chain of loads. A virtual call loads the receiver’s class, then a method from the class’s
-<b>vtable</b>, then that method’s entry point. A vtable is an array of method pointers, one slot per overridable method.</p>
-<p>Interface methods cannot have one slot that is the same in every implementing class. So each class also has an <b>IMT</b> (interface method table): a small fixed table indexed by
-a hash of the interface method. When two methods share a slot, the slot holds a <b>conflict trampoline</b>, a shared stub that searches a
-per-slot list for the right method.</p>
-<p>The compiler avoids dispatch in three ways, shown at the bottom of Figure 14. <b>Class hierarchy analysis (CHA)</b> notices when only one
-loaded class implements a method. An inline cache (Section 9) says which classes a call site has actually seen. And sometimes the receiver’s type is known
-outright, for a final class or a freshly allocated object.</p>
+<p>Inlining is the highest-leverage pass in ART’s compiler: removing the call instruction itself saves a little work, and splicing the callee’s graph into the caller’s removes the black box that would otherwise force register spills and heap reloads.
+That requires knowing which concrete method a virtual or interface call will actually invoke.</p>
+<p>When the target is unknown at compile time, the CPU resolves it dynamically through dependent pointer loads.
+Because Java has single class inheritance, each overridable method occupies a fixed slot index in every subclass’s embedded <b>vtable</b>: a virtual call loads <code>obj.klass_</code>, loads <code>vtable[i]</code>, and branches to that <code>ArtMethod</code>’s compiled entry point.</p>
+<p>Interfaces break fixed indexing: a class implementing two unrelated interfaces <code>I</code> and <code>J</code> cannot place both interfaces’ first method at slot 0.
+Each class therefore carries a fixed 43-slot <b>IMT</b> (interface method table) indexed by a hash of the interface method.
+Uncollided slots jump straight to the implementing <code>ArtMethod</code>; slots shared by two or more methods point to a <b>conflict trampoline</b> that scans a short per-slot dispatch list.</p>
+<p>To avoid dynamic dispatch and unlock inlining, the compiler resolves targets in three ways (bottom of Figure 14): <b>exact type knowledge</b> (<code>final</code> classes/methods or a freshly constructed receiver), <b>class hierarchy analysis (CHA)</b> when only one currently loaded class implements the method, and <b>inline caches</b> (Section 9) when runtime profiling saw one to four receiver types at that site.</p>
 <figure>
 <figcaption><b>Figure 14. A real virtual or interface call is a chain of dependent loads; the compiler tries to turn it back into a direct call.</b> Each arrow is a load that depends on the one before, so a real call costs three dependent loads, each a possible
 cache miss, and an indirect branch. The green boxes are the ways the compiler turns it back into a direct call it can inline.</figcaption>
@@ -819,7 +820,8 @@ Keep hot methods small enough to inline.
 </blockquote>
 
 <h2 id="passes"><span class="n">12</span>Four passes remove repeated work once inlining exposes it</h2>
-<p>These four passes remove redundant work after inlining. All four rely on the side-effect sets from Section 10.</p>
+<p>Once inlining merges small helpers and getters into a single SSA graph, redundant loads, temporary wrapper objects, and repeated bounds checks sit side by side in one method.
+Four optimization passes clean them up, all gated on the side-effect bitsets from Section 10.</p>
 <div class="cards" style="grid-template-columns:repeat(2, 1fr)">
   <div class="card"><div class="lbl">LSE · Load/Store Elimination</div>
     <p>Reuses a loaded value instead of loading again, forwards a stored value to a later load, and deletes stores nobody reads. It can also remove an allocation entirely if the object never escapes, that is, if it is never stored to the heap, returned or passed to a call that isn’t inlined.</p>
@@ -844,12 +846,12 @@ and <code>Integer.bitCount</code> are recognized and replaced with a few instruc
 <code>kWriteSideEffects</code> or <code>kAllSideEffects</code>, as for <code>System.arraycopy</code>.</p>
 
 <h2 id="blockers"><span class="n">13</span>Opaque calls, raw memory and volatiles stop those passes</h2>
-<p>Each construct below either hides code from the compiler or forces it to assume memory changed. That stops the passes in Section 12.</p>
+<p>Any operation that hides control flow or steps outside Java’s typed heap forces the compiler to assume memory changed, cutting short the passes in Section 12:</p>
 <table>
   <thead><tr><th>Construct</th><th>Why it hurts</th></tr></thead>
   <tbody>
     <tr><td>A call that isn’t inlined</td><td>Treated as reading and writing everything, and as a safepoint. Cached fields are reloaded after it.</td></tr>
-    <tr><td>Raw-memory intrinsics (<code>Memory.pokeByte</code> and <code>poke*Native</code>, plain <code>Unsafe.put*</code>), <code>reachabilityFence</code></td><td>The compiler treats them like an unknown call, so GVN and LICM stop, even though they emit little code. LSE does the same for the intrinsics but ignores the fence. The volatile, ordered and release <code>Unsafe</code> stores count as touching everything. <code>Memory.pokeByteArray</code> is not an intrinsic at all.</td></tr>
+    <tr><td>Raw-memory intrinsics (<code>Memory.pokeByte</code> and <code>poke*Native</code>, object-and-offset <code>Unsafe.put*</code>), <code>reachabilityFence</code></td><td><code>Memory.poke*</code> and <code>reachabilityFence</code> stay in the IR as <code>HInvoke</code> nodes tagged <code>kWriteSideEffects</code>, so LSE, GVN, and LICM drop cached heap loads across them even though they emit one instruction or none. Every intrinsified <code>Unsafe.put*</code> store is <code>kAllSideEffects</code> (may read and write anything). Raw-address <code>Unsafe.putByte(long, byte)</code> is a <code>@FastNative</code> JNI call, and <code>Memory.pokeByteArray</code> is a regular JNI call.</td></tr>
     <tr><td><code>volatile</code> fields</td><td>Emitted as <code>ldar</code>/<code>stlr</code> (load-acquire/store-release instructions) on arm64, and act as ordering points the compiler can’t move other memory accesses across.</td></tr>
     <tr><td><code>synchronized</code></td><td>Lock and unlock are calls into runtime stubs (Section 14) with acquire/release ordering.</td></tr>
     <tr><td>Megamorphic call sites</td><td>Not inlined, so the callee stays opaque.</td></tr>
@@ -862,8 +864,9 @@ and <code>Integer.bitCount</code> are recognized and replaced with a few instruc
 
 <!-- ───────────── Locks ───────────── -->
 <h2 id="locks"><span class="n">14</span>Uncontended locks are cheap; contended ones turn fat and stay fat</h2>
-<p>Every object can be a lock. ART keeps uncontended locking cheap by storing the owner directly in the lock word, as a <b>thin lock</b>.
-It only allocates a real <code>Monitor</code>, a <b>fat lock</b>, when it has to.</p>
+<p>Java lets code <code>synchronized</code> on any object, yet most locks are taken by one thread at a time and never call <code>Object.wait()</code>.
+Pre-allocating an OS mutex and wait queue on every object would waste dozens of bytes per instance.
+ART instead keeps uncontended locks inline inside the 32-bit header word as a <b>thin lock</b>, inflating to a native <code>Monitor</code> (<b>fat lock</b>) only on contention, <code>wait()</code>, count overflow, or a stored identity hash.</p>
 <figure>
 <figcaption><b>Figure 16. Every red arrow leads to the fat state, and none leads back.</b> A monitor is only deflated, turned back into a thin lock, during a heap trim (below).
 A thin lock inflates when it needs more than an owner and a count. A hashed object inflates as soon as it is locked.</figcaption>
@@ -922,10 +925,10 @@ Examples are a <code>HashMap</code> key whose class does not override <code>hash
 They have their own layout, compression, interning, compiler intrinsics, a fused concatenation path, and their own family of JNI functions.</p>
 
 <h3 id="str-layout">One object, with characters stored inline</h3>
-<p>An ART <code>String</code> is a <b>single object</b> with its characters stored <b>inline</b>. There is no separate character array.
-After the object header come a length field and a cached hash code, so the characters always start at the same offset.
-If every character is ASCII, the string is <b>compressed</b> to one byte per character. Otherwise it uses two bytes per character (UTF-16).
-The exact fields and offsets are in Figure 17 and Numbers and method.</p>
+<p>On a standard desktop JVM, a <code>String</code> is two heap objects: a wrapper holding metadata plus a reference to a separate <code>byte[]</code> or <code>char[]</code>.
+On mobile heaps packed with UI labels, JSON keys, and class names, that second object wastes an extra array header, a reference field, padding, and a dependent pointer load on every read.</p>
+<p>ART instead gives <code>java.lang.String</code> a custom variable-size VM layout: a <b>single object</b> whose characters follow <b>inline</b> right after its header, <code>count_</code>, and cached <code>hash_code_</code>.
+Strings containing only ASCII characters (code points below 128) use one byte per character; all others use two-byte UTF-16 units. Exact offsets are in Figure 17 and Numbers and method.</p>
 
 <figure>
 <figcaption><b>Figure 17. Every string pays a fixed 16 bytes before its first character.</b> Strings are padded to the 8-byte object alignment, and the padding is guaranteed to be <b>zero</b>. The <code>equals</code> intrinsic compares 8 bytes at a time and relies on it.
@@ -1034,10 +1037,9 @@ So every string costs 16 bytes of fixed overhead plus up to 7 bytes of padding.<
 The emoji row: a character outside the Basic Multilingual Plane is a surrogate pair, two units of UTF-16.</p>
 
 <h3 id="str-intern">Equal literals share one object; everything else is a fresh copy</h3>
-<p>Two strings with the same contents are the <b>same object</b> when they are <b>interned</b>: looked up in a global table and deduplicated.
-The same literal appears in many classes, and building a new object each time it runs would waste memory and time.
-ART’s <code>InternTable</code> keeps a strong set and a weak set, and entries in the weak set can be collected. The table is guarded by a lock and keyed by the string’s hash.
-A literal is loaded by the dex instruction <code>const-string</code>.</p>
+<p>Two strings with identical contents become the <b>same object</b> when <b>interned</b> in a global deduplication table.
+Because string literals repeat across many classes, allocating a fresh object each time bytecode runs would waste RAM and CPU.
+ART’s locked, hash-keyed <code>InternTable</code> maintains a strong set and a collectable weak set, populated lazily when bytecode executes <code>const-string</code>.</p>
 <figure>
 <figcaption><b>Figure 19. A literal costs a runtime lookup once, then one load every time after.</b> Compiled code keeps one slot per literal. The first run fills it, and later runs just load it.</figcaption>
 <svg viewBox="0 0 1000 250" role="img" aria-label="const-string resolution">
@@ -1139,7 +1141,7 @@ So most JNI string functions have to <b>copy</b>, and several also <b>allocate</
     <tr><td><code>GetStringUTFRegion</code></td><td>byte copy into your <code>char*</code></td><td>encode to modified UTF-8</td><td class="good">no</td><td><code>start</code>/<code>len</code> are in UTF-16 units. Size the buffer for up to 3 bytes per char + NUL, or call <code>GetStringUTFLength</code> first (which scans the string).</td></tr>
     <tr><td><code>GetStringChars</code></td><td class="bad"><code>new jchar[]</code> + widen</td><td class="bad"><code>new jchar[]</code> + memcpy if the string may move</td><td class="bad">yes, usually</td><td>Direct pointer only for an uncompressed string the GC won’t move (non-moving or large-object space).</td></tr>
     <tr><td><code>GetStringCritical</code></td><td class="bad"><code>new jchar[]</code> + widen</td><td class="warn">direct pointer; blocks the GC’s thread flip until release</td><td>compressed: yes</td><td>ASCII strings, the common case, are compressed, so this usually copies anyway.</td></tr>
-    <tr><td><code>GetStringUTFChars</code></td><td class="bad"><code>new char[]</code> + copy</td><td class="bad"><code>new char[]</code> + encode</td><td class="bad">always</td><td>Convenient, but a malloc and free per call.</td></tr>
+    <tr><td><code>GetStringUTFChars</code></td><td class="bad"><code>new char[]</code> + copy</td><td class="bad"><code>new char[]</code> + encode</td><td class="bad">always</td><td>Convenient, but allocates and frees a native buffer per call.</td></tr>
     <tr><td><code>GetStringLength</code> / <code>GetStringUTFLength</code></td><td>O(1) / O(1)</td><td>O(1) / O(n) scan</td><td class="good">no</td><td></td></tr>
   </tbody>
 </table>
@@ -1177,7 +1179,7 @@ For the standard form, encode in Java with <code>getBytes(StandardCharsets.UTF_8
 The exact byte forms are in Numbers and method.
 </blockquote>
 
-<h3>Creating strings from native code always scans and allocates</h3>
+<h3 id="str-new">Creating strings from native code always scans and allocates</h3>
 <ul>
   <li><b><code>NewStringUTF(const char*)</code></b> scans and decodes modified UTF-8, counts UTF-16 units, decides compression, and allocates a managed string. It only lightly validates the input; CheckJNI, JNI’s debug checking mode, validates fully. Every call costs a full scan plus a Java allocation.</li>
   <li><b><code>NewString(const jchar*, len)</code></b> skips decoding but still scans for compressibility and copies.</li>
@@ -1194,24 +1196,15 @@ Keep text ASCII where you can, because one non-ASCII character doubles the size.
 <div class="part">Part III · Native</div>
 
 <h2 id="jni"><span class="n">16</span>A regular JNI call swaps thread state twice and can absorb a GC pause</h2>
-<p>Every native call goes through a small generated stub that bridges two gaps between Java and C.
-The first gap is the <b>calling convention</b>, the rule for which registers carry which arguments. ART’s compiled code passes the method pointer and arguments in different registers from the standard Arm C convention (AAPCS64), and its references are 32-bit heap addresses.
-The second gap is the <b>GC contract</b>. A thread running Java code may hold raw object addresses, so the GC has to wait for it to reach a safepoint (Section 8).
-A C function can run as long as it likes without reaching one.
-The exact register assignments are in Numbers and method.</p>
-<p>The <b>JNI stub</b> is generated per native method by
-<code>ArtJniCompileMethodInternal</code> in <code>jni_compiler.cc</code>, in dex2oat or the JIT.
-When a method has no compiled stub, a shared hand-written trampoline, <code>art_quick_generic_jni_trampoline</code>, does the same steps at runtime, more slowly.</p>
-<p>Native code also needs a way to name Java objects that survives the GC moving them. JNI gives every native method a <b>JNIEnv*</b>, a
-per-thread pointer to the table of JNI functions. It refers to objects through handles (<code>jobject</code>) instead of addresses.
-Arguments and the objects JNI functions return are <b>local references</b>. They stay valid, and keep the object alive, until the native
-method returns. Steps 3 and 4 below show how the stub creates them.</p>
-<p>The stub’s main job is the <b>thread state transition</b>. Each thread has a state-and-flags word that says whether it is running Java code, plus request flags that other threads set, such as “please suspend”.
-The <b>mutator lock</b> is a reader-writer lock (“mutator” is GC jargon for a thread running app code, which mutates the heap).
-Running Java threads hold it shared, and the GC takes it exclusively when it needs every thread stopped.
-So a <b>Runnable</b> thread holds the mutator lock in shared mode and may touch heap objects directly.
-Any other state, such as Native, is a promise not to touch the heap, so the GC treats that thread as already suspended.
-The word’s layout is in Numbers and method.</p>
+<p>Calling a C function from Java cannot be a plain branch because Java and C disagree on calling conventions and GC safety.
+ART’s managed ABI passes <code>ArtMethod*</code> in <code>x0</code>, shifts arguments up from <code>x1</code>, and uses 32-bit heap references, whereas C expects Arm AAPCS64 arguments starting in <code>x0</code>.
+Java threads also poll cooperative safepoints (Section 8), whereas C code can block in syscalls indefinitely.</p>
+<p>ART bridges both mismatches with a per-method <b>JNI stub</b> compiled by <code>ArtJniCompileMethodInternal</code> in <code>jni_compiler.cc</code> (or handled by <code>art_quick_generic_jni_trampoline</code> until compiled).
+Because the GC may move objects while C runs, native code never sees raw heap pointers; it receives a <code>JNIEnv*</code> table and indirect <code>jobject</code> handles pointing to root slots ART updates.</p>
+<p>Reference arguments and JNI return values are <b>local references</b>: GC roots scoped to the active JNI frame and freed in bulk on return.
+To retain an object across calls or threads, native code creates a <code>NewGlobalRef</code> (strong root until <code>DeleteGlobalRef</code>) or <code>NewWeakGlobalRef</code> (updated on move, collected when unreachable).</p>
+<p>To let GC proceed while C runs, a regular JNI stub performs a <b>thread state transition</b> on entry and exit.
+<code>Runnable</code> threads hold ART’s reader-writer <b>mutator lock</b> in shared mode; switching from <code>kRunnable</code> to <code>kNative</code> releases it and promises not to touch the heap, letting GC pauses, flips, and checkpoints proceed without waiting. Exact layouts are in Numbers and method.</p>
 <figure>
 <figcaption><b>Figure 22. The annotations skip steps: @FastNative skips the state change, and @CriticalNative skips almost everything.</b> Dashed boxes are skipped steps. Synchronized native methods also lock in step 2 and unlock in step 7.</figcaption>
 <svg viewBox="0 0 1000 392" role="img" aria-label="JNI flavours">
@@ -1271,22 +1264,18 @@ compare-and-swap on <code>state_and_flags</code>.</figcaption>
 </svg>
 </figure>
 
-<h3>What each step does</h3>
-<p>The step numbers match the comments in <code>ArtJniCompileMethodInternal</code>. The arm64 instructions come from
-<code>jni_macro_assembler_arm64.cc</code>.
-Each step below is in plain words. Table 2, after the list, gives the registers, fields and functions behind each one.</p>
+<h3 id="jni-steps">The seven steps inside a compiled JNI stub</h3>
+<p>The step numbers match <code>ArtJniCompileMethodInternal</code>, with arm64 code emitted by <code>jni_macro_assembler_arm64.cc</code>.
+Notice how packing the thread’s state and its suspend/checkpoint request bits into a single 32-bit <code>state_and_flags</code> word at offset 0 of <code>Thread</code> lets one atomic compare-and-swap both switch state and verify that no GC request is pending.
+Table 2, after the list, gives the registers, fields, and runtime entrypoints behind each step.</p>
 
 <ol>
-  <li><b>Build and publish the frame</b> (regular and @FastNative).
-    The stub pushes a frame and stores the method pointer at its bottom. The frame saves the callee-save registers, the ones a function must hand back unchanged.
-    It then copies every reference argument that arrived in a register, including <code>this</code>, to that argument’s stack slot.
-    Finally it records the stack pointer in the thread.
-    From then on the GC can walk this thread’s stack while C code runs, find those references, and update them if it moves the objects.
-    @CriticalNative stubs skip all of this, because the GC cannot run during the call.</li>
+  <li><p><b>Build and publish the frame</b> (regular and <code>@FastNative</code>).
+    The stub pushes a frame, stores the <code>ArtMethod*</code> at its bottom, saves callee-save registers, and spills every register-passed reference argument (including <code>this</code>) into its stack slot.</p>
+    <p>Finally it records the stack pointer in <code>Thread</code> so the GC can walk the stack while C runs, find those references, and update them if objects move.
+    <code>@CriticalNative</code> stubs skip all of this because the GC cannot run during the call.</p></li>
 
-  <li><b>Leave Runnable</b> (regular only). Synchronized methods take the monitor first.
-    Then the stub changes the thread state from “Runnable, no flags” to “Native, no flags” in one atomic compare-and-swap,
-    and clears the thread’s record that it holds the mutator lock:
+  <li><b>Leave Runnable</b> (regular only). Synchronized methods lock first; then one atomic CAS flips <code>state_and_flags</code> from “<code>Runnable</code>, no flags” to “<code>Native</code>, no flags” and clears the mutator-lock record:
 <pre><code><span class="c">// TryToTransitionFromRunnableToNative, LSE (ARMv8.1 atomics) path
 // (VIXL assembler calls shown as assembly, register names simplified)</span>
 mov  w16, #0                      <span class="c">// expected: kRunnable (0), no flags</span>
@@ -1294,61 +1283,35 @@ mov  w17, #kNativeStateValue      <span class="c">// new: kNative, no flags</spa
 casl w16, w17, [x19]              <span class="c">// state_and_flags is at offset 0 of Thread</span>
 cbnz w16, slow_path               <span class="c">// any flag set → pJniMethodStart</span>
 str  xzr, [x19, #held_mutexes[kMutatorLock]]</code></pre>
-    The comparison includes the flag bits. If the GC has already asked this thread to suspend or run a checkpoint, the swap fails,
-    and a slow path handles the request first. Once the swap succeeds, the GC no longer waits for this thread.
-    @FastNative and @CriticalNative skip this step and stay Runnable for the whole native call. That saves both swaps.
-    But any GC pause, thread flip or checkpoint that needs this thread now waits until the native function returns.
-    Their javadoc says it plainly: do not do I/O, take long-held native locks, or do unbounded work in them.</li>
+    Pending GC flags make the CAS fail into a slow path; once it succeeds, GC no longer waits for this thread. <code>@FastNative</code> and <code>@CriticalNative</code> stay <code>Runnable</code>, saving both swaps while making GC pauses wait for C to return, so never block or loop unboundedly in them.</li>
 
-  <li><b>Push a local reference frame</b> (regular and @FastNative). A local reference is an entry in a per-thread table
-    that keeps an object alive and gives native code a stable handle to it. Every JNI call that returns an object, such as <code>NewStringUTF</code>, adds one.
-    JNI frees them all when the native method returns, and this step makes that cheap.
-    The stub saves the table’s current top position and keeps it in callee-save registers, so it can roll the table back after the call.</li>
+  <li><b>Push a local reference frame</b> (regular and <code>@FastNative</code>). A local reference is a slot in a per-thread table that keeps an object alive and gives native code a stable handle; calls like <code>NewStringUTF</code> add entries to it.
+    The stub snapshots the table’s current top index in callee-save registers so all local references created during the call can be rolled back in one write on return.</li>
 
-  <li><b>Build the native arguments and call</b> (all flavours, differently). For regular and @FastNative methods:
-    <ul>
-      <li>The first argument is the <code>JNIEnv*</code>.</li>
-      <li>The second is the class, for a static method, or <code>this</code>, for an instance method. Both are passed as handles.</li>
-      <li>Each reference argument becomes a handle that is the <b>address of its stack slot</b> from step 1, or null.
-        Native code never sees a heap address. If the GC moves the object, it updates the slot, and the handle still leads to the object.</li>
-      <li>Primitives are passed unchanged, following the C convention.</li>
-    </ul>
-    The call goes through the method’s JNI entry point. <code>RegisterNatives</code> fills it in, or else the runtime looks up the native symbol by name on the first call.
-    Afterwards the stub extends small integer results, because C only guarantees their low bits.
-    <br>@CriticalNative methods must be static and take and return only primitives, so there is nothing to wrap.
-    The C function gets no <code>JNIEnv*</code> and no class. For example:
+  <li><b>Build the native arguments and call</b> (all flavours). Regular and <code>@FastNative</code> calls pass <code>JNIEnv*</code>, a class or <code>this</code> handle, stack-slot addresses from step 1 for reference arguments (so GC moves stay transparent), and primitives per AAPCS64, then call the JNI entry point (from <code>RegisterNatives</code> or lazy symbol lookup) and extend narrow integer results. <code>@CriticalNative</code> methods must be <code>static</code> with primitive-only signatures and receive no <code>JNIEnv*</code> or <code>jclass</code>:
 <pre><code><span class="c">// Java declaration</span>
 @CriticalNative static native long write(long ptr, int len);
 <span class="c">// binds to</span>
 jlong Java_..._write(jlong ptr, jint len)</code></pre>
-    Optimized code goes one step further and calls the native function directly, skipping the stub. Debuggable apps do not get this.</li>
+    Optimized callers jump straight to the C function pointer without a stub (except in debuggable apps).</li>
 
-  <li><b>Return to Runnable</b> (regular only). After the C function returns, the thread is still Native and may not touch the heap,
-    not even to turn a returned handle into a reference. The stub does the reverse swap, “Native, no flags” to “Runnable, no flags”, and records the mutator lock as held again.
-    If any flag was set while the thread was in native code, the swap fails. That flag can be a suspend request for a GC pause, a checkpoint, or a pending thread flip.
-    A slow path then waits until the request is done. <b>That wait is charged to the end of the JNI call.</b>
-    <br>@FastNative never left Runnable, so instead it does a suspend check: it tests the suspend and checkpoint flags and calls into the runtime if any is set.
-    Without it, a thread making many short @FastNative calls could hold off a GC indefinitely.
-    For methods that return an object, the stub checks for a pending exception first, then turns the returned handle back into a reference.</li>
+  <li><b>Return to Runnable</b> (regular only). When C returns, the thread is still <code>Native</code> and cannot touch the heap, even to decode a returned <code>jobject</code>. A reverse CAS flips back to “<code>Runnable</code>, no flags” and re-records the mutator lock; if a suspend, checkpoint, or flip flag arrived in C, the CAS fails and waits in a slow path <b>charged to the end of the JNI call</b>. <code>@FastNative</code> instead polls the flags explicitly before decoding any reference result after an exception check.</li>
 
-  <li><b>Pop the local reference frame</b> (regular and @FastNative). The stub writes back the table position it saved in step 3.
-    Every local reference the native code created is dropped at once, without visiting them.</li>
+  <li><b>Pop the local reference frame</b> (regular and <code>@FastNative</code>). The stub writes back the table position saved in step 3, dropping every local reference created during the call in O(1) time without scanning them.</li>
 
-  <li><b>Unlock, check for an exception, return</b> (regular and @FastNative). Synchronized methods release the monitor.
-    Then the stub checks whether the thread has a pending exception.
-    C code has no way to throw into Java: <code>env-&gt;ThrowNew(…)</code> only records the pending exception in the thread and returns normally.
-    This check is where it is actually thrown, and the Java stack unwinds. Otherwise the stub restores the saved registers, pops its frame and returns.</li>
+  <li><b>Unlock, check for an exception, return</b> (regular and <code>@FastNative</code>). Synchronized methods release the monitor, and the stub checks <code>Thread::exception</code>.
+    Because C cannot throw across frames into Java, <code>env-&gt;ThrowNew(…)</code> simply records a pending exception and returns normally; this check unwinds the Java stack if one is set, or else restores registers and returns.</li>
 </ol>
 
 <p class="m"><b>Table 2.</b> Registers, fields and functions behind each step (arm64).</p>
 <table>
   <thead><tr><th>Step</th><th>Code names and details</th></tr></thead>
   <tbody>
-    <tr><td>1 · frame</td><td>Saves callee-save registers <code>x19</code>–<code>x29</code>, <code>lr</code>, <code>d8</code>–<code>d15</code>; stores the <code>ArtMethod*</code> at <code>sp</code>. Reference arguments are spilled to their stack slots (ART’s managed calling convention reserves one for every argument). <code>sp</code> goes into the thread’s top-of-managed-stack field via <code>StoreStackPointerToThread(Thread::TopOfManagedStackOffset)</code>. JIT-compiled stubs tag the stored <code>sp</code> with <code>0x2</code> so the stack walker knows the frame belongs to JIT code. @CriticalNative stubs only reserve space for stack-passed arguments, and with none they tail-call the native function.</td></tr>
+    <tr><td>1 · frame</td><td>Saves callee-save registers <code>x19</code>–<code>x29</code>, <code>lr</code>, <code>d8</code>–<code>d15</code>; stores the <code>ArtMethod*</code> at <code>sp</code>. Reference arguments are spilled to their stack slots (ART’s managed calling convention reserves one for every argument). <code>sp</code> goes into the thread’s top-of-managed-stack field via <code>StoreStackPointerToThread(Thread::TopOfManagedStackOffset)</code>. JIT-compiled stubs tag the stored <code>sp</code> with <code>0x2</code> so the stack walker knows the frame belongs to JIT code. <code>@CriticalNative</code> stubs only reserve space for stack-passed arguments, and with none they tail-call the native function.</td></tr>
     <tr><td>2 · leave Runnable</td><td>Monitor via <code>pJniLockObject</code>. The CAS on <code>state_and_flags</code> uses release ordering. Slow path: <code>artJniMethodStart</code>.</td></tr>
     <tr><td>3 · push local refs</td><td>Local references live in the thread’s <code>LocalReferenceTable</code> inside <code>JNIEnvExt</code>; <code>GetObjectArrayElement</code> is another call that adds one. The stub loads <code>JNIEnv*</code> from the thread, reads the table’s current and previous segment states (each an <code>LRTSegmentState</code>, a 32-bit top index), and stores the current one as the new previous one. It keeps the env pointer and the old states in callee-save registers <code>x22</code>–<code>x29</code>.</td></tr>
-    <tr><td>4 · arguments and call</td><td><code>x0</code> = <code>JNIEnv*</code>. <code>x1</code> = <code>jclass</code> for a static method, which is the <code>ArtMethod*</code> itself: its <code>declaring_class_</code> field sits at offset 0, so a pointer to the method is a pointer to a GC root that holds the class. For an instance method <code>x1</code> is <code>this</code> as a <code>jobject</code>. Reference handles are made by <code>CreateJObject</code>. Primitives go into the next AAPCS64 registers or stack slots. Entry point: <code>ArtMethod::EntryPointFromJniOffset</code> (the <code>data_</code> field). Results of type <code>byte</code>, <code>short</code>, <code>boolean</code> and <code>char</code> are sign- or zero-extended. @CriticalNative passes the <code>ArtMethod*</code> in the hidden register <code>x15</code>; optimized code marks the call <code>kCallCriticalNative</code> and calls the native pointer stored in the <code>ArtMethod</code> directly.</td></tr>
-    <tr><td>5 · back to Runnable</td><td>Reverse CAS with acquire ordering (<code>casa</code>, or <code>ldaxr</code>/<code>stxr</code> without LSE). Slow path <code>artJniMethodEnd</code> calls <code>Thread::TransitionFromSuspendedToRunnable</code>. @FastNative suspend check: load the flags, test the suspend and checkpoint bits, call <code>pTestSuspend</code>; methods that return an object do it at step 5.3, the others at step 7.4. Returned <code>jobject</code> is decoded inline for local and transition references, otherwise through <code>JniDecodeReferenceResult</code>.</td></tr>
+    <tr><td>4 · arguments and call</td><td><code>x0</code> = <code>JNIEnv*</code>. <code>x1</code> = <code>jclass</code> for a static method, which is the <code>ArtMethod*</code> itself: its <code>declaring_class_</code> field sits at offset 0, so a pointer to the method is a pointer to a GC root that holds the class. For an instance method <code>x1</code> is <code>this</code> as a <code>jobject</code>. Reference handles are made by <code>CreateJObject</code>. Primitives go into the next AAPCS64 registers or stack slots. Entry point: <code>ArtMethod::EntryPointFromJniOffset</code> (the <code>data_</code> field). Results of type <code>byte</code>, <code>short</code>, <code>boolean</code> and <code>char</code> are sign- or zero-extended. <code>@CriticalNative</code> passes the <code>ArtMethod*</code> in the hidden register <code>x15</code>; optimized code marks the call <code>kCallCriticalNative</code> and calls the native pointer stored in the <code>ArtMethod</code> directly.</td></tr>
+    <tr><td>5 · back to Runnable</td><td>Reverse CAS with acquire ordering (<code>casa</code>, or <code>ldaxr</code>/<code>stxr</code> without LSE). Slow path <code>artJniMethodEnd</code> calls <code>Thread::TransitionFromSuspendedToRunnable</code>. <code>@FastNative</code> suspend check: load the flags, test the suspend and checkpoint bits, call <code>pTestSuspend</code>; methods that return an object do it at step 5.3, the others at step 7.4. Returned <code>jobject</code> is decoded inline for local and transition references, otherwise through <code>JniDecodeReferenceResult</code>.</td></tr>
     <tr><td>6 · pop local refs</td><td>Writes back the two saved segment states (<code>StoreLocalReferenceTableStates</code>).</td></tr>
     <tr><td>7 · unlock, exception, return</td><td>Monitor via <code>pJniUnlockObject</code>. Loads <code>Thread::exception</code> and branches if non-null (<code>ldr</code> + <code>cbnz</code>). The exception is thrown by <code>DeliverPendingException</code>, which unwinds the Java stack.</td></tr>
   </tbody>
@@ -1377,16 +1340,17 @@ jlong Java_..._write(jlong ptr, jint len)</code></pre>
 <blockquote class="key"><span class="lbl">What it means for you</span>
 A regular JNI call costs one atomic swap each way plus the frame and local-reference bookkeeping, and it can absorb a GC pause on its way back.
 The annotated kinds are several times cheaper (Figure 24). Batch work so each crossing does more.
-Use @FastNative and @CriticalNative only for short, bounded functions, since they hold up the GC while they run.
+Use <code>@FastNative</code> and <code>@CriticalNative</code> only for short, bounded functions, since they hold up the GC while they run.
 </blockquote>
 
 <h2 id="arrays"><span class="n">17</span>Arrays reach native code by copying, by blocking the GC, or by never moving</h2>
-<p>Native code wants a stable pointer, but a normal array can move at any GC. Each API resolves that differently:</p>
+<p>Passing bulk binary data between Java and C hits the core tension of a moving runtime: C functions want a contiguous <code>uint8_t*</code> that stays valid for the duration of the call, whereas ART’s moving space can relocate an ordinary primitive array at any GC flip.
+Every array-crossing API picks one of three ways out: copy the bytes across the border, block GC flips until C finishes, or allocate the array in a non-moving space up front.</p>
 <table>
   <thead><tr><th>API</th><th>What happens for a normal (movable) array</th><th>Cost</th></tr></thead>
   <tbody>
     <tr><td><code>Get/Set&lt;T&gt;ArrayRegion</code></td><td>memcpy into or out of a native buffer you supply.</td><td><span class="tier t2">copy</span> proportional to the range; no allocation</td></tr>
-    <tr><td><code>Get&lt;T&gt;ArrayElements</code></td><td>If the array may move: <code>new[]</code> a native buffer and copy the whole array; <code>Release</code> copies back and frees. Arrays that can’t move (large-object or non-moving space) get a direct pointer.</td><td><span class="tier t3">malloc + copy</span> of the whole array, twice</td></tr>
+    <tr><td><code>Get&lt;T&gt;ArrayElements</code></td><td>If the array may move: <code>new[]</code> a native buffer and copy the whole array; <code>Release</code> copies back and frees. Arrays that can’t move (large-object or non-moving space) get a direct pointer.</td><td><span class="tier t3">alloc + copy</span> twice for movable arrays; zero-copy if non-movable</td></tr>
     <tr><td><code>GetPrimitiveArrayCritical</code></td><td>No copy. Disables the GC’s <b>thread flip</b> until release (so the array can’t move), and touches its pages so a kernel call on the pointer never hits a userfault.</td><td><span class="tier t3">blocks GC</span> thread flips while held; don’t block or call JNI in between</td></tr>
     <tr><td><code>VMRuntime.newNonMovableArray</code> + <code>addressOf</code></td><td>Array lives in the non-moving space (or the large-object space from 12 KB); pass its address as a <code>long</code>. Keep it reachable.</td><td><span class="tier t1">zero-copy</span>; non-moving space is 64 MB</td></tr>
     <tr><td><code>ByteBuffer.allocateDirect</code> + <code>GetDirectBufferAddress</code></td><td>On ART this is <b>also</b> a non-movable <code>byte[]</code> underneath.</td><td><span class="tier t1">zero-copy</span> native side; slow per-byte <code>put</code> on the Java side</td></tr>
@@ -1414,9 +1378,9 @@ Why <code>DirectByteBuffer.put</code> is slow while a <code>byte[]</code> store 
     <tr><td><code>volatile</code> read/write</td><td><span class="tier t2">2</span></td><td><code>ldar</code>/<code>stlr</code>; blocks reordering.</td><td></td></tr>
     <tr><td>Uncontended <code>synchronized</code></td><td><span class="tier t3">3</span></td><td>Stub call + exclusive load/store.</td><td>Don’t lock on identity-hashed objects.</td></tr>
     <tr><td><code>@FastNative</code> / regular JNI</td><td><span class="tier t3">3</span></td><td>Frame, local refs, (regular) state transitions.</td><td>Batch work per crossing.</td></tr>
-    <tr><td><code>Get&lt;T&gt;ArrayElements</code></td><td><span class="tier t3">3</span></td><td>malloc + full copy for movable arrays.</td><td>Prefer <code>Region</code> or non-movable arrays.</td></tr>
+    <tr><td><code>Get&lt;T&gt;ArrayElements</code></td><td><span class="tier t3">3</span></td><td>Native buffer allocation + full copy for movable arrays.</td><td>Prefer <code>Region</code> or non-movable arrays.</td></tr>
     <tr><td>Userfault during compaction</td><td><span class="tier t4">4</span></td><td>Page fault, compact one page, map it.</td><td>Only during a GC’s compaction phase.</td></tr>
-    <tr><td><code>GetStringUTFChars</code> / <code>GetStringChars</code></td><td><span class="tier t3">3</span></td><td>malloc + copy/encode (compressed or movable strings).</td><td>Use <code>Get…Region</code> into a reused buffer.</td></tr>
+    <tr><td><code>GetStringUTFChars</code> / <code>GetStringChars</code></td><td><span class="tier t3">3</span></td><td>Native buffer allocation + copy/encode (compressed or movable strings).</td><td>Use <code>Get…Region</code> into a reused buffer.</td></tr>
     <tr><td>String concat in a hot path</td><td><span class="tier t2">2</span></td><td>One fused allocation at best; StringBuilder growth at worst.</td><td>Hoist constant parts; avoid <code>String.format</code>.</td></tr>
     <tr><td>Contended lock</td><td><span class="tier t4">4</span></td><td>Spin, inflate, futex wait, context switch.</td><td>Shard state; shorten critical sections.</td></tr>
     <tr><td>GC pause / allocation stall</td><td><span class="tier t4">4</span></td><td>All threads stop for the flip; or wait for a GC to free memory.</td><td>Allocate less; watch Perfetto GC slices.</td></tr>
@@ -1436,7 +1400,7 @@ The cost tiers in Figure 1 and the cheat sheet are rough orders of magnitude. Th
     <tr><td>CC regions</td><td>256 KB each. Evacuated: every region allocated since the previous GC, plus older regions under 75% live (<code>ShouldBeEvacuated</code>).</td><td>region_space.h, region_space.cc</td></tr>
     <tr><td>Heap spaces</td><td>Non-moving space 64 MB. Primitive arrays and strings of 12 KB or more go to the large object space.</td><td>heap.h</td></tr>
     <tr><td>Card table</td><td>1 byte per 1 KB card (<code>kCardShift = 10</code>); biased base whose low byte is <code>kCardDirty = 0x70</code>; nullable stores use <code>MaybeMarkGCCard</code> (adds <code>cbz</code>).</td><td>card_table.h, code_generator_arm64.cc</td></tr>
-    <tr><td>Side-effect flags</td><td>Raw-memory intrinsics and <code>reachabilityFence</code> are <code>kWriteSideEffects</code>; volatile, ordered and release <code>Unsafe</code> stores are <code>kAllSideEffects</code>.</td><td>intrinsics_list.h</td></tr>
+    <tr><td>Side-effect flags</td><td><code>Memory.poke*</code> intrinsics and <code>reachabilityFence</code> are <code>kWriteSideEffects</code> (<code>SideEffects::AllWrites()</code>); all intrinsified <code>Unsafe.put*</code> stores (<code>sun.misc.Unsafe</code> and <code>jdk.internal.misc.Unsafe</code>) are <code>kAllSideEffects</code> (<code>SideEffects::AllExceptGCDependency()</code>).</td><td>intrinsics_list.h, load_store_elimination.cc</td></tr>
     <tr><td>Interface method table</td><td>43 entries per class.</td><td>imtable.h</td></tr>
     <tr><td>Inlining</td><td>Inline caches hold up to 4 receiver classes before going megamorphic; default callee budget 32 dex code units.</td><td>profiling_info.h, compiler_options.h</td></tr>
     <tr><td>Contended lock</td><td>Spins 100 times, then up to 50 more times with <code>sched_yield</code>, then inflates.</td><td>monitor.cc</td></tr>
@@ -1446,7 +1410,7 @@ The cost tiers in Figure 1 and the cheat sheet are rough orders of magnitude. Th
     <tr><td>Modified UTF-8</td><td>NUL is encoded as the two bytes <code>C0 80</code>. Characters outside the BMP become two 3-byte surrogate encodings instead of one 4-byte sequence. <code>GetStringUTFRegion</code> needs up to 3 bytes per char plus NUL.</td><td>JNI spec, jni_internal.cc</td></tr>
     <tr><td>Calling conventions</td><td>ART managed code passes the <code>ArtMethod*</code> in <code>x0</code> and arguments from <code>x1</code>, with references as 32-bit heap addresses. A C function expects AAPCS64 arguments (the standard Arm 64-bit C calling convention) in <code>x0</code>–<code>x7</code>.</td><td>calling_convention_arm64.cc</td></tr>
     <tr><td>Thread state word</td><td>32-bit <code>state_and_flags</code> at offset 0 of the <code>Thread</code> object (<code>x19</code> on arm64 points at it). The top 8 bits hold the <code>ThreadState</code>, and <code>kRunnable</code> is 0. The low bits are request flags: <code>kSuspendRequest</code>, <code>kCheckpointRequest</code>, the thread-flip flags and a few more. Native code runs in <code>kNative</code>.</td><td>thread.h, thread_state.h</td></tr>
-    <tr><td>JNI call cost</td><td>Regular 115 ns, @FastNative 35 ns, @CriticalNative 25 ns, measured on a 2016 device.</td><td>FastNative.java, CriticalNative.java</td></tr>
+    <tr><td>JNI call cost</td><td>Regular 115 ns, <code>@FastNative</code> 35 ns, <code>@CriticalNative</code> 25 ns, measured on a 2016 device.</td><td>FastNative.java, CriticalNative.java</td></tr>
     <tr><td>Annotations</td><td><code>dalvik.annotation.optimization.FastNative</code> and <code>CriticalNative</code>: system-only from Android 8, CTS-tested public API from Android 14.</td><td>FastNative.java, CriticalNative.java</td></tr>
     <tr><td>CMC availability</td><td>Chosen by <code>ShouldUseUserfaultfd</code> when the kernel supports <code>userfaultfd</code> with SIGBUS (faults arrive as a signal in the faulting thread) and <code>MREMAP_DONTUNMAP</code>. Both pauses run <code>FlipThreadRoots</code> in <code>MarkCompact::RunPhases</code>. On by default up to Android 14; from Android 15 enabled by <code>ro.dalvik.vm.enable_uffd_gc</code> or a device_config flag.</td><td>mark_compact.cc</td></tr>
   </tbody>
@@ -1474,7 +1438,7 @@ The cost tiers in Figure 1 and the cheat sheet are rough orders of magnitude. Th
   <li><code>art/runtime/jni/local_reference_table.h</code>: <code>LRTSegmentState</code></li>
   <li><code>art/compiler/optimizing/sharpening.cc</code>: <code>kCallCriticalNative</code> direct calls</li>
   <li><code>libcore/dalvik/src/main/java/dalvik/annotation/optimization/CriticalNative.java</code>, <code>…/FastNative.java</code>: public API since Android 14, GC-blocking warning, measured costs</li>
-  <li><code>art/runtime/intrinsics_list.h</code>: side effects of <code>String</code>, <code>Memory.poke*</code>, <code>Unsafe.put*</code>, <code>System.arraycopy</code> and <code>reachabilityFence</code> intrinsics; <code>art/compiler/optimizing/intrinsics_arm64.cc</code>: <code>VisitStringEquals</code> check order, zero padding</li>
+  <li><code>art/runtime/intrinsics_list.h</code> and <code>art/compiler/optimizing/load_store_elimination.cc</code> (<code>HandleInvoke</code>): side effects of <code>String</code>, <code>Memory.poke*</code>, <code>Unsafe.put*</code>, <code>System.arraycopy</code> and <code>reachabilityFence</code> intrinsics; <code>art/compiler/optimizing/intrinsics_arm64.cc</code>: <code>VisitStringEquals</code> check order, zero padding</li>
   <li><code>libcore/ojluni/src/main/java/java/lang/String.java</code>, <code>libcore/libart/src/main/java/java/lang/CaseMapper.java</code>: <code>hashCode</code> caching, case changes</li>
   <li><code>libcore/ojluni/src/main/java/java/nio/DirectByteBuffer.java</code>: backed by <code>newNonMovableArray</code></li>
   <li><code>art/runtime/jni/jni_internal.cc</code>: <code>GetPrimitiveArrayCritical</code>, <code>Get&lt;T&gt;ArrayElements</code></li>

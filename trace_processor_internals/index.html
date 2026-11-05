@@ -40,7 +40,7 @@
 <nav id="toc" aria-label="Contents">
   <div class="h">Contents</div>
   <a href="#glance">At a glance</a>
-  <a href="#overview">The sorter splits the pipeline</a>
+  <a href="#overview">Overview: two design splits</a>
   <a href="#when" style="padding-left:18px">what each stage leaves</a>
   <div class="ph">I · Ingestion</div>
   <a href="#reader">1 · Readers find timestamps</a>
@@ -70,34 +70,54 @@
 
 <main id="top">
 <h1>How trace processor turns an out-of-order trace file into fast SQL tables</h1>
-<p class="lead">A Perfetto trace file holds events out of time order. Trace processor sorts them, turns them into rows, and stores
-each table column by column. SQLite then answers queries by reading those columns through a thin adapter.
-Each stage explains why some tables and queries are cheap and others are not.</p>
+<p class="lead">Recording millions of kernel and app events per second without slowing a phone down produces a trace file whose timestamps jump backwards and forwards.
+Trace processor sorts those events into monotonic time, reconstructs intervals and tracks into dense column-oriented tables, and exposes those columns to SQLite through a thin virtual-table adapter.
+Understanding those two boundaries — sorting at ingestion and column storage behind SQLite — explains why some tables and queries are cheap and others are not.</p>
 <p class="m">Code is from the upstream Perfetto repository, main as of late October 2026, and paths are relative to its root. Excerpts marked
 <em>shape</em> are simplified. The rest are quoted or closely paraphrased from the files under Sources.</p>
 
 <h2 id="glance">At a glance</h2>
 <ul>
-<li><b>What happens.</b> Readers cut the file into timestamped events, a sorter puts them in time order, and trackers turn them into table rows.</li>
-<li><b>The one rule.</b> Code before the sorter sees events in file order. Only code after it may depend on earlier events.</li>
-<li><b>Storage.</b> Every table keeps one array per column. Flags declared in Python decide how each column stores empty values and whether it is sorted.</li>
-<li><b>Queries.</b> SQLite parses and plans the SQL. Trace processor runs the filters on its own columns and hands rows back one at a time.</li>
-<li><b>What to do.</b> Record long traces in streaming mode (<code>write_into_file</code>, §2), filter with GLOB rather than LIKE, and join on ids or sorted columns.</li>
+<li><b>Why the file is disordered.</b> Kernel per-CPU ring buffers and per-thread app writers flush asynchronously without a global lock, so packets land on disk out of timestamp order.</li>
+<li><b>The ingestion split.</b> Code before the sorter runs in file order and only frames packets and normalizes clocks. Only code after the sorter sees monotonic timestamps and may reconstruct slices, scheduling intervals or thread lifetimes.</li>
+<li><b>Columnar storage.</b> Instead of inserting rows into SQLite B-trees, every table keeps one typed array per column, with string pooling and null-compression layouts chosen from Python schema flags.</li>
+<li><b>Pushed-down queries.</b> SQLite parses and plans the SQL, while single-table filters and sorts run as register bytecode directly over columns before surviving rows step back into SQLite.</li>
+<li><b>What to do in practice.</b> Record long traces in streaming mode (<code>write_into_file</code>, §2), filter strings with <code>GLOB</code> rather than <code>LIKE</code>, and join on <code>id</code>, <code>utid</code>/<code>upid</code> or sorted columns.</li>
 </ul>
-<p><b>Terms.</b> <b>Trace processor</b> is Perfetto’s analysis engine: it loads a trace file and answers SQL queries about it.
-The <b>embedder</b> is the program that runs it, such as the Perfetto UI or the <code>trace_processor</code> shell.
-A <b>packet</b> is one timestamped protobuf message in the trace. A <b>sequence</b> is all the packets from one writer.
-A <b>slice</b> is an interval with a begin and an end, such as a function call or a frame.
-A <b>track</b> is the timeline a slice or counter value lives on, such as one thread, one CPU’s frequency or one async lane of an app.
-A <b>dataframe</b> is trace processor’s in-memory table, stored column by column.
-A <b>vtab</b>, or virtual table, is the adapter SQLite uses to read data it does not store itself.</p>
+<p><b>Terms.</b> <b>Trace processor</b> is Perfetto’s C++ analysis engine: it ingests a trace file and answers SQL queries over it.
+The <b>embedder</b> is the host program driving it, such as the Perfetto UI, the Python API or the <code>trace_processor</code> shell.
+<code>traced</code> is Perfetto’s system tracing daemon, and <b>ftrace</b> is the Linux kernel’s built-in per-CPU event tracer.
+A <b>packet</b> is one length-prefixed protobuf message (<code>TracePacket</code>) in the trace, and a <b>sequence</b> is the ordered stream of packets from one writer, tagged by <code>trusted_packet_sequence_id</code>.
+A <b>slice</b> is a named time interval with a begin and an end, such as a function call or a frame.
+A <b>track</b> is the timeline a slice or counter series lives on, such as one thread, one CPU’s frequency or one async lane of an app.
+A <b>dataframe</b> is trace processor’s in-memory columnar table, and a <b>vtab</b> (virtual table) is SQLite’s C callback interface for querying external storage as if it were a SQL table.</p>
 
 <!-- ═════════════════════════ OVERVIEW ═════════════════════════ -->
-<h2 id="overview">The sorter splits the pipeline in two</h2>
-<p>Trace processor is built around one split. Code before the sorter sees events in file order. Code after it sees them in timestamp order.</p>
+<h2 id="overview">Two design splits shape the engine: sorting at ingestion and columns behind SQLite</h2>
+<p>Trace processor’s architecture is a direct response to two physical constraints: how a low-overhead tracer writes bytes on a live device, and how an analytical engine scans tens of millions of events in memory.</p>
+<p><b>Why trace files arrive out of timestamp order.</b> Capturing every kernel context switch, Binder transaction and app slice on a multi-core phone leaves only a few hundred nanoseconds of budget per event.
+Writers cannot contend on a shared lock or serialize into one clock-ordered buffer.
+Instead, ftrace writes into separate per-CPU kernel ring buffers, while each user-space thread writes into its own shared-memory chunks under a distinct <code>trusted_packet_sequence_id</code>.
+Whenever a buffer fills, a periodic flush fires or tracing stops, <code>traced</code> copies chunks into the output file in whatever order it drains them.
+Order and compression state hold within a single sequence, but across sequences a packet near the end of the file can carry an earlier timestamp than one near the start.</p>
+<p><b>Why downstream analysis needs monotonic order.</b> Engineers rarely query raw point events in isolation.
+Pairing a slice’s begin marker with its matching end marker on a call stack, or turning point <code>sched_switch</code> events into continuous thread-state durations, requires seeing events in non-decreasing timestamp order.
+Trace processor therefore splits ingestion down the middle.
+Code before the sorter sees packets in arbitrary file order: it may frame bytes, maintain per-sequence wire compression tables and translate device clocks into one shared <b>trace time</b>, but it cannot depend on prior events from other sequences.
+Only after the sorter merges streams into monotonic trace time do stateful trackers pair intervals, resolve recycled thread IDs and append table rows.</p>
+<p><b>Why tables live in custom columnar dataframes instead of SQLite B-trees.</b> Once events become rows, SQL is an ideal query language for both interactive debugging and Perfetto’s modular standard library, and SQLite supplies a battle-tested SQL parser and query planner in a small embeddable footprint.
+Storing trace rows inside native SQLite tables, however, fails at trace scale.
+A 500 MB trace routinely expands into tens of millions of slice, scheduler and counter rows.
+SQLite’s native storage is row-oriented <b>B-trees</b> (balanced tree pages of variable-length records): inserting tens of millions of rows inflates memory several-fold with page and record headers, and filtering on a single column such as <code>dur &gt; 16000000</code> drags every column of every row through CPU caches.</p>
+<p>Trace processor keeps SQLite’s front end while replacing its storage.
+Trackers write into custom columnar <b>dataframes</b> — one dense typed array per column, backed by a trace-wide string pool, compact null bitmaps and declared sort invariants — frozen read-only at end of file.
+Each dataframe registers with SQLite through a <b>virtual table</b> adapter (<code>DataframeModule</code>).
+Single-table filters and sorts push down into a register bytecode interpreter that scans contiguous column arrays, returning only surviving row indices for SQLite to step one row at a time. An experimental <code>|&gt;</code> pipe engine goes further and keeps whole multi-stage interval queries in columnar batches until the final output.</p>
+<p>Figure 1 maps these two boundaries onto the C++ classes that implement them. On the file-order side sit <code>ForwardingTraceParser</code>, <code>ChunkedTraceReader</code> and format tokenizers. <code>TraceSorter</code> forms the ordering boundary. On the timestamp-order side, stateless format parsers and stateful trackers populate <code>Dataframe</code>s, which <code>DataframeModule</code> and the experimental pipe executor read at query time.
+(“Intern ids” in the figure means replacing repeated strings and track descriptions with compact integer IDs, covered in Sections 1, 3 and 6. The repository’s own overview is in <code>docs/design-docs/trace-processor-architecture.md</code>.)</p>
 <figure>
-<figcaption><b>Figure 1. The sorter is the dividing line.</b> Code left of the dashed line must cope with any order.
-Code right of it can assume timestamps never go backwards.</figcaption>
+<figcaption><b>Figure 1. Two boundaries divide trace processor: the sorter orders events, and the vtab bridges columnar storage to SQLite.</b>
+Code left of the dashed line must tolerate arbitrary file order; code right of it sees non-decreasing timestamps.</figcaption>
 <svg viewBox="0 0 1000 250" role="img" aria-label="Pipeline overview">
   <text x="10" y="18" class="th">file order</text>
   <text x="430" y="18" class="th">timestamp order</text>
@@ -142,17 +162,6 @@ Code right of it can assume timestamps never go backwards.</figcaption>
   <text x="10" y="204" class="t">finalized column storage.</text>
 </svg>
 </figure>
-<p>The file is out of order because many writers fill it. The kernel tracer, ftrace, fills one ring buffer per CPU.
-Each app or daemon writes into memory chunks it shares with the tracing service. The service copies each buffer into the file whenever it
-reads it out. So a packet near the end of the file can be older than one near the start.</p>
-<p>In the file, each packet is a length-prefixed <code>TracePacket</code> holding one event or a batch of events.
-Each sequence is tagged with a <code>trusted_packet_sequence_id</code>, and order and shared state are guaranteed only within a sequence.</p>
-<p>Most of what trace processor computes depends on order. A slice’s end has to meet its begin.
-A thread’s scheduling state depends on the previous context switch, the sched_switch event.
-So only code after the sorter may build state that depends on time.</p>
-<p>“Intern ids” in Figure 1 means replacing repeated strings and track descriptions with small integer ids (Sections 1 and 3).
-The repository’s own summary of this pipeline is in
-<code>docs/design-docs/trace-processor-architecture.md</code>.</p>
 
 <h3 id="when">Each stage leaves a known state behind</h3>
 <p>Stages overlap in time, but each event passes through them in the same order. Knowing the stage tells you what state exists.</p>
@@ -175,7 +184,10 @@ one released is dropped as out of order.</p>
 <div class="part">Part I · Ingestion</div>
 
 <h2 id="reader"><span class="n">1</span>Readers cut bytes into timestamped events and stop there</h2>
-<p>Before sorting, a reader only finds each event and its timestamp. It builds no slices, threads or other state.</p>
+<p>Part I follows an event from raw input bytes to table rows (Sections 1 to 4).
+The ingestion pipeline has to accept multi-gigabyte traces in arbitrary byte chunks, normalize several wire formats onto one clock, sort disordered streams without holding the whole file in memory when streaming, and reconstruct intervals and entity identities.</p>
+<p>The first stage — the reader and its tokenizer — handles everything that must happen in file order and stops before building any cross-event state.
+Three constraints keep this stage narrow: a streamed packet may split across two input chunks, wire-level compression tables belong to a single writer sequence, and timestamps from different clocks cannot be compared until they are translated into global trace time.</p>
 <figure>
 <figcaption><b>Figure 2. A reader frames events and converts their clocks, then hands them to the sorter.</b>
 If a clock cannot be converted yet, the reader tries to switch the whole import to sorting everything at the end.</figcaption>
@@ -236,9 +248,12 @@ belongs in the parser, after the sorter.
 
 <!-- ───────────── Sorter ───────────── -->
 <h2 id="sorter"><span class="n">2</span>The sorter merges nearly sorted queues instead of sorting everything</h2>
-<p>The sorter builds one time-ordered stream from many inputs while holding as little as possible in memory.
-It relies on two facts noted at the top of <code>src/trace_processor/sorter/trace_sorter.h</code>.
-Most events come from ftrace, and ftrace events from one CPU are almost always in order already.</p>
+<p>Once timestamps are in trace time, events from dozens of sequences and CPUs have to merge into one monotonic stream.
+Two obvious designs perform poorly at trace scale.
+Buffering the whole trace in an array and calling <code>std::sort</code> at end of file holds gigabytes of packets in RAM and copies variable-sized payloads on every swap.
+Pushing every incoming event into a binary min-heap avoids waiting for end of file, but pays heap-maintenance branches on tens of millions of events even when almost every stream is already ordered.</p>
+<p><code>TraceSorter</code> avoids both costs by exploiting two properties of real traces noted at the top of <code>src/trace_processor/sorter/trace_sorter.h</code>: most high-rate events come from kernel ftrace, and ftrace events from a single CPU arrive almost completely in timestamp order already.
+The sorter keeps variable-sized payloads out of the sort array, sorts only the out-of-order tail of each stream, and drains old events incrementally behind periodic flush barriers.</p>
 
 <h3 id="sorter-layout">Each stream gets its own queue of small 16-byte entries</h3>
 <p>Each importer asks the sorter for typed <b>streams</b>. A stream is one input lane of the sorter, and its events share one payload type.
@@ -393,12 +408,12 @@ If <code>sorter_push_event_out_of_order</code> is non-zero, events were lost to 
 
 <!-- ───────────── Trackers ───────────── -->
 <h2 id="trackers"><span class="n">3</span>Parsers decode events, and trackers keep the state and write rows</h2>
-<p>After sorting, parsers decode each event and trackers turn it into rows. Each event reaches its stream’s sink, which calls the format’s
-<b>parser</b>. A parser knows one encoding, such as how a sched_switch or a TrackEvent is laid out. TrackEvent is the protobuf event that apps
-emit through the Perfetto SDK.</p>
-<p>Parsers keep no state across events. They call <b>trackers</b>, which are format-agnostic state machines that each own one concept and
-write rows. Because of this split, a slice from a JSON trace and a slice from a protobuf trace pass through the same <code>SliceTracker</code>.
-They end up identical in the table.</p>
+<p>Events leaving the sorter arrive in non-decreasing trace time, so downstream code can safely maintain call stacks, open intervals and thread lifecycles.
+Trace processor splits that work into two layers so format details do not leak into domain state machines.</p>
+<p>Each sorted event reaches its stream’s sink, which calls the format’s <b>parser</b>.
+A parser knows one wire encoding — such as how a kernel <code>sched_switch</code> bundle or an SDK <code>TrackEvent</code> protobuf message is laid out — and keeps no state across events.
+It decodes fields and calls <b>trackers</b>: format-agnostic state machines that own one relational concept each and write rows into dataframes.
+Because of that boundary, a slice from a Chrome JSON trace and a slice from a Perfetto protobuf trace pass through the same <code>SliceTracker</code> and produce identical table rows.</p>
 
 <table>
   <thead><tr><th>Layer</th><th>Examples</th><th>Order it sees</th><th>Job</th></tr></thead>
@@ -411,12 +426,12 @@ They end up identical in the table.</p>
 </table>
 
 <h3 id="slices">A slice row is written at its begin and patched at its end</h3>
-<p>Writing each row at begin time keeps the slice table sorted by start time. The ts column is declared <code>ColumnFlag.SORTED</code>.
-That is a promise to the storage layer that values never decrease, which lets queries binary-search it (Section 7).
-Children start after their parent. If rows were written at the end event, a child that ended first would land before its parent and break the order.</p>
-<p>So <code>SliceTracker::Begin</code> inserts the row at once, with the duration set to <code>kPendingDuration</code> (−1).
-It sets the depth to the stack size and the parent to the top of the stack. Events arrive in timestamp order, so rows are appended in start order.
-Stacks are kept per track, and nesting deeper than <code>kMaxDepth</code> (512) is dropped with an import log.</p>
+<p>A slice arrives as two separate events — begin and end — yet queries almost always filter the slice table by start timestamp (<code>ts</code>).
+If <code>SliceTracker</code> waited until the end event to insert a completed row, any nested child slice would finish before its parent and land earlier in the table, leaving <code>slice.ts</code> unsorted and forcing either a full table re-sort or linear scans on time ranges.
+Writing each row at begin time keeps <code>slice.ts</code> monotonically non-decreasing, fulfilling its <code>ColumnFlag.SORTED</code> promise so queries can binary-search it (Section 7).</p>
+<p><code>SliceTracker::Begin</code> therefore inserts the row immediately with duration set to <code>kPendingDuration</code> (−1), depth set to the current stack size, and <code>parent_id</code> pointing to the open slice on top of the track’s stack.
+Because events arrive from the sorter in timestamp order, rows are appended in start-time order across all tracks.
+Stacks are maintained per track, and nesting deeper than <code>kMaxDepth</code> (512) is dropped with an import log.</p>
 
 <figure>
 <figcaption><b>Figure 6. Rows go in at begin time, and the duration is filled in at end time.</b> A slice still open at end of file keeps a
@@ -455,9 +470,8 @@ slice’s stack entry and are written when the slice is popped. At end of file, 
 The holder and flush function names are in Numbers and method.</p>
 
 <h3 id="ptt">Threads, processes and tracks get stable ids</h3>
-<p><b>ProcessTracker</b> maps kernel thread and process ids to stable rows. The kernel reuses a tid or pid once its owner exits, so tables
-cannot be keyed by them. They are keyed by <code>UniqueTid</code>/<code>UniquePid</code> instead, shortened to utid and upid. These are row
-numbers in the thread and process tables. The main entry points:</p>
+<p>Raw kernel identifiers and repeated timeline descriptions create two hazards for relational tables: Linux recycles a numeric <code>tid</code> or <code>pid</code> once a thread or process exits, and millions of slice or counter events repeat the same logical timeline metadata.</p>
+<p><b>ProcessTracker</b> solves ID reuse by mapping active kernel thread and process IDs to monotonic row numbers in the <code>thread</code> and <code>process</code> tables: <code>UniqueTid</code> and <code>UniquePid</code>, written <code>utid</code> and <code>upid</code> in SQL. The main entry points:</p>
 <ul>
   <li><code>GetOrCreateThread(tid)</code> finds or creates the current thread for a tid.</li>
   <li><code>StartNewThread</code>, called on task_newtask, forces a new utid so a recycled tid does not merge with its predecessor.</li>
@@ -481,9 +495,9 @@ each has its own TrackTracker, so the same thread can get two tracks
 
 <!-- ───────────── Args ───────────── -->
 <h2 id="args"><span class="n">4</span>Args live in one shared table, deduplicated and written once per row</h2>
-<p>Events carry open-ended key/value data, such as debug annotations, proto extensions and ftrace fields. A column per key would mean thousands
-of mostly empty columns. Instead, most tables have an arg_set_id column that points into one shared key/value table,
-<code>__intrinsic_args</code>, exposed as the args view.</p>
+<p>Trace events carry open-ended key/value annotations: SDK debug arguments, protobuf extensions and per-event ftrace fields.
+Giving every distinct key its own table column would create thousands of nearly empty columns, while packing annotations into a JSON string per row would force queries to reparse text on every row.
+Instead, tables store a single nullable <code>arg_set_id</code> integer that points into one shared key/value dataframe, <code>__intrinsic_args</code> (exposed in SQL as the <code>args</code> view), laid out so that identical sets are stored once and lookups jump straight to the first matching row without a binary search.</p>
 
 <h3>Args are buffered in memory, then committed in one step</h3>
 <p>An inserter collects a row’s args and writes them only when it goes away. A tracker asks for an <b>ArgsInserter</b> bound to one row’s
@@ -556,9 +570,11 @@ For a slice it is when the slice is popped, at its end event or at end of file. 
 <div class="part">Part II · Storage</div>
 
 <h2 id="rowcol"><span class="n">5</span>Storing columns instead of rows makes scans cheap</h2>
-<p>Trace queries read a few columns of many rows, such as “all slices longer than 16 ms” or “total duration per track”.
-In a <b>row layout</b>, which SQLite’s own tables use, each row’s fields sit together. Scanning durations then drags every other field through
-the cache too. In <b>column storage</b> each column is its own array, so a cache line holds consecutive durations and nothing else.</p>
+<p>Part II explains how trace processor holds tens of millions of imported rows in memory (Sections 5 to 8).
+Storage has to satisfy two competing phases: during import, trackers append rows and patch cells such as <code>dur</code> and <code>arg_set_id</code> out of order; once import ends, analytical queries scan a few columns across millions of rows and never mutate them again.</p>
+<p>Analytical trace queries read narrow slices of wide tables, such as “all slices longer than 16 ms” or “total duration per track”.
+In a <b>row layout</b> — the B-tree record format SQLite’s native tables use — all fields of one row sit side by side, so scanning durations drags timestamps, names, depths and parent IDs through CPU caches too.
+In <b>column storage</b>, each column is its own contiguous typed array, so every 64-byte cache line fetched during a scan carries eight <code>int64_t</code> durations and nothing else.</p>
 
 <figure>
 <figcaption><b>Figure 8. A duration scan needs only the highlighted cells.</b> In the row layout (red) each cache line fetched is mostly other
@@ -602,9 +618,10 @@ implicit id, the value is the row number and needs no storage at all. The rest o
 
 <!-- ───────────── Column ───────────── -->
 <h2 id="column"><span class="n">6</span>Each column carries metadata the planner can rely on</h2>
-<p>Every column records its type, NULL layout and sort order in typed fields that the planner reads. A table is a
-<code>dataframe::Dataframe</code>: column names, a vector of shared columns, and a row count. Each column has five parts
-(<code>src/trace_processor/core/dataframe/types.h</code>):</p>
+<p>Plain arrays make full-column scans fast, but avoiding scans altogether requires knowing what invariants a column obeys — whether its values are unique, sorted or dense, and how its missing values are packed.
+A table is a <code>dataframe::Dataframe</code>: column names, a vector of shared columns, and a row count.
+Strings are stored not as variable-length byte runs inside the column, which would break fixed-stride indexing, but as 32-bit <code>StringPool::Id</code> handles into a trace-wide <b>StringPool</b> that interns each distinct slice or thread name once and turns string equality into a 32-bit integer comparison.
+Each column records five structural properties that the query planner reads directly (<code>src/trace_processor/core/dataframe/types.h</code>):</p>
 
 <table>
   <thead><tr><th>Field</th><th>Values</th><th>What it buys</th></tr></thead>
@@ -679,9 +696,8 @@ Columns that need writes should use DenseNull.</p>
 
 <!-- ───────────── Flags ───────────── -->
 <h2 id="flags"><span class="n">7</span>Python flags declare intent, and a generator picks the layout</h2>
-<p>Table authors say how a column will be used, and a generator chooses its layout. Each layout trades memory against write speed, and there
-are over a hundred tables. So instead of choosing layouts by hand in C++, authors declare tables in Python under <code>src/trace_processor/tables/*.py</code>
-with a few intent-level knobs.</p>
+<p>Choosing among five NULL layouts by hand across more than a hundred built-in tables would be error-prone: picking a sparse layout on a column that a tracker patches after insertion silently turns import into a quadratic <code>memmove</code> bottleneck, while picking <code>DenseNull</code> everywhere wastes hundreds of megabytes on rarely populated columns.
+Instead, table authors declare usage intent in Python schemas under <code>src/trace_processor/tables/*.py</code>, and a code generator selects the tightest layout that satisfies those access guarantees.</p>
 <p>The generator in
 <code>python/generators/trace_processor_table/serialize.py</code>
 turns each column into a <code>dataframe::ColumnSpec</code>: storage type, nullability, sort state and duplicate state. It also generates typed
@@ -751,9 +767,9 @@ parent_id, make it <code>READ_AND_HIGH_PERF_WRITE</code>. A sparse layout turns 
 
 <!-- ───────────── Finalize ───────────── -->
 <h2 id="finalize"><span class="n">8</span>At end of file the tables are shrunk and frozen</h2>
-<p>Finalization is a one-way switch from tables that are cheap to change to tables that are compact and read-only. During import, tables must
-be cheap to append to and patch. During queries, they should be compact and must not change under a running query.
-At end of file, <code>TraceProcessorImpl::NotifyEndOfFile</code> runs four stages, numbered so in its comments.</p>
+<p>Import and querying want opposite data structures: import needs growable buffers with spare capacity, temporary prefix-popcount arrays for C++ cell lookups and live tracker maps; queries want minimal resident memory, fixed column addresses that never reallocate under an open SQLite cursor, cardinality statistics and pre-built indexes.
+Finalization is the one-way transition between those two worlds.
+When the last byte chunk has been fed in, <code>TraceProcessorImpl::NotifyEndOfFile</code> runs four ordered stages.</p>
 
 <figure>
 <figcaption><b>Figure 10. End of file runs four stages, and the tables are read-only from stage 3 on.</b>
@@ -798,10 +814,10 @@ Stage 3 destroys the parsing context but keeps the tables themselves.</figcaptio
 From then on the tables are read-only. <code>AddIndex</code> returns a new Dataframe that shares the columns rather than changing the old one.</p>
 
 <h3 id="bounds">Trace bounds come from the data, not from trace metadata</h3>
-<p>Trace processor works out the start and end of the trace from the rows it imported. Many queries need them, for example to clip slices
-that never ended or to express a duration as a share of the trace. Each plugin may report <code>GetTimestampBounds()</code>.
-<code>AggregatePluginTimestampBounds</code> takes the earliest start and the latest end over all plugins. It returns <code>(0, 0)</code> when no
-plugin has data, and widens a zero-length interval to one nanosecond.</p>
+<p>Trace files rarely carry trustworthy start and end timestamps in a header: text formats have no header at all, ring buffers overwrite their earliest packets, and slices left open with <code>dur = -1</code> have no end timestamp.
+Yet almost every UI timeline and utilization query needs accurate trace bounds to clip unfinished intervals or compute time fractions.
+Trace processor therefore derives the trace start and end directly from the rows it imported.
+Each plugin may report <code>GetTimestampBounds()</code>, and <code>AggregatePluginTimestampBounds</code> takes the earliest start and latest end across all plugins, returning <code>(0, 0)</code> when no plugin has data and widening a zero-length span to one nanosecond.</p>
 <p>Most of the bounds come from the storage_tables plugin. It scans ts in a fixed list of tables: ftrace events, sched, counters, slices,
 thread state, logs, heap profiles and graphs, smaps, profiler samples and __intrinsic_state. For interval tables it uses
 <code>ts + max(dur, 0)</code> as the end. So a slice left open with <code>dur = -1</code> contributes only its start.</p>
@@ -823,10 +839,11 @@ The code comment insists the two lists match.
 <div class="part">Part III · Queries</div>
 
 <h2 id="vtab"><span class="n">9</span>SQLite plans the query and reads the columns through a virtual table</h2>
-<p>Trace processor reuses SQLite’s parser and planner, but not its storage. SQLite stores tables as row-oriented B-trees, which would give up the
-column layout and metadata of Part II. For foreign data SQLite offers the <b>virtual table</b>: a module registers a set of callbacks, and
-SQLite calls them instead of reading its own storage. Every finalized table is exposed through <code>DataframeModule</code>
-(<code>src/trace_processor/perfetto_sql/engine/dataframe_module.cc</code>). The callbacks that matter:</p>
+<p>Part III follows how SQL queries read finalized dataframes (Sections 9 to 15).
+Building a full SQL parser, join reorderer, window-function engine and expression evaluator from scratch would duplicate years of database engineering, whereas storing trace rows in SQLite’s own row-oriented B-trees would forfeit Part II’s memory density and cache-line scan speed.</p>
+<p>Trace processor gets both by embedding SQLite for SQL planning and expression evaluation while keeping all trace rows in dataframes behind SQLite’s <b>virtual table</b> (<code>vtab</code>) interface.
+A virtual-table module registers C callbacks that SQLite invokes in place of B-tree page reads.
+Every finalized dataframe is exposed through <code>DataframeModule</code> (<code>src/trace_processor/perfetto_sql/engine/dataframe_module.cc</code>). The callbacks that define the boundary:</p>
 <ul>
   <li><b>xBestIndex</b>, at prepare time. SQLite lists the WHERE constraints on this table, the ORDER BY and the columns used. It asks which
     ones the table can handle itself, and at what cost. Taking a filter here is <b>constraint push-down</b>: the filter runs inside the table,
@@ -919,12 +936,11 @@ and <code>name LIKE 'foo%'</code> is not.
 
 <!-- ───────────── Bytecode ───────────── -->
 <h2 id="bytecode"><span class="n">10</span>A small bytecode interpreter runs each filter over many rows at once</h2>
-<p>Trace processor compiles each query into a few specialized instructions, so it never branches on type or operator per row.
-A generic filter loop would check the column’s type, whether it is nullable and which operator to apply, for every row. Those branches would
-cost more than the comparison itself.</p>
-<p>Instead, a small <b>bytecode interpreter</b> runs a short list of instructions. Each is specialized for one column type, null layout and
-operator, and each processes a whole range or list of rows. Dispatch, one switch per instruction in <code>Interpreter::Execute</code>, is paid
-once per instruction, not once per row.</p>
+<p>Pushing filters down through <code>xBestIndex</code> only pays off if the dataframe evaluates them far faster than SQLite’s per-row loop would.
+A naive C++ loop that inspected a column’s data type, null representation and comparison operator on every row would spend more CPU cycles on branches than on the comparisons themselves.</p>
+<p>Instead, trace processor compiles a table’s pushed-down constraints once at prepare time into a short program for a specialized <b>bytecode interpreter</b>.
+Each instruction is monomorphized for one exact combination of storage type, null layout and operator, and processes a whole contiguous range or index list in a tight inner loop.
+Instruction dispatch — a single <code>switch</code> in <code>Interpreter::Execute</code> — runs once per filter stage rather than once per row.</p>
 <p>It is a <b>register</b> interpreter: instructions read and write numbered slots that hold intermediate results, rather than pushing them on
 a stack. Registers hold a Range (a begin and end pair), a span of row indices, slabs, cast filter values, or storage pointers. A slab is an owned
 scratch buffer that spans point into.</p>
@@ -982,9 +998,13 @@ against “scan” well, and should not be read as more than that.</p>
 
 <!-- ───────────── Indexes ───────────── -->
 <h2 id="indexes"><span class="n">11</span>Indexes speed up equality on columns that are not sorted</h2>
-<p>An <b>index</b> is a permutation vector: the table’s row numbers in the order of one or more columns (<code>dataframe::Index</code>).
-With it, equality on an unsorted column becomes a binary search over the permutation. The planner uses an index for a run of = or IN
-filters that match the index’s leading columns. An IN ends the run, because its output is no longer contiguous in the index.</p>
+<p>Binary search works out of the box on <code>id</code> and <code>ts</code>, but trace queries routinely join or filter on unsorted columns such as <code>track_id</code>, <code>utid</code>, <code>upid</code> or keys in materialized helper tables.
+Because SQLite executes joins as nested loops, an unsorted inner join column triggers a full linear scan of the inner dataframe for every outer row.
+Building a traditional B-tree or hash table per column would bring back pointer-heavy memory overhead on read-only data.</p>
+<p>Trace processor instead uses two compact structures tailored to immutable columns.
+First, an <b>index</b> (<code>dataframe::Index</code>) is a plain 4-byte-per-row permutation vector holding the table’s row numbers sorted by one or more target columns.
+With it, equality on an unsorted column becomes a binary search over the permutation vector.
+The planner uses an index for a prefix of <code>=</code> or <code>IN</code> filters matching the index’s leading columns; an <code>IN</code> filter ends the prefix because its matches are no longer contiguous in the permutation.</p>
 <p>Only tables created from SQL can get an index from SQL. <code>CREATE PERFETTO INDEX</code> works only on tables the SQL engine owns, that
 is, <code>CREATE PERFETTO TABLE</code> results. On a built-in table it fails with “indexes on intrinsic table … must be declared at compile
 time, not via SQL”. Those indexes are attached at registration and built after finalization (Section 8).</p>
@@ -1000,16 +1020,11 @@ If you then join on a column that is neither sorted nor SmallValueEq, add <code>
 
 <!-- ───────────── Pipes ───────────── -->
 <h2 id="pipes"><span class="n">12</span>Pipe syntax keeps multi-stage interval work out of SQLite</h2>
-<p>The experimental pipe syntax runs whole multi-stage queries on columns, and crosses into SQLite only at the end. On the vtab path, only the
-filters run on columns. Joins, GROUP BY and window functions run in SQLite’s own row-at-a-time bytecode engine, the <b>VDBE</b>, and every
-intermediate row crosses the vtab boundary.</p>
-<p>Trace analysis is full of multi-stage interval work, such as intersecting two sets of intervals, flattening nested slices or accumulating
-over a tree. That work pays the crossing cost at every stage.</p>
-<p>PerfettoSQL’s pipe syntax is documented in
-<code>docs/analysis/perfetto-sql-pipe-syntax.md</code>.
-A query starts from a source and chains stages with <code>|&gt;</code>. Each stage consumes the table produced by the previous one.
-<code>PERFETTO PRAGMA pipelines = 1</code> switches it on. The implementation notes open with a warning that syntax and execution behaviour may
-change without notice. It runs on a separate engine.</p>
+<p>The virtual-table contract has a structural ceiling: <code>xBestIndex</code> plans one table scan in isolation.
+As soon as a query joins tables, groups rows, evaluates expressions or chains multi-step interval operations — intersecting scheduling spans with app slices, flattening nested call stacks, or summing durations up a slice tree — every intermediate row must step out through <code>xNext</code> and <code>xColumn</code> into SQLite’s row-at-a-time bytecode engine, the <b>VDBE</b> (Virtual Database Engine), and back again.</p>
+<p>PerfettoSQL’s experimental pipe syntax removes that per-stage row boundary by compiling whole multi-stage pipelines onto a C++ columnar batch executor and crossing into SQLite only once at the end.
+Documented in <code>docs/analysis/perfetto-sql-pipe-syntax.md</code>, a pipeline starts from a table or subquery source and chains stages left-to-right with <code>|&gt;</code>, each stage consuming the table produced by the previous one.
+<code>PERFETTO PRAGMA pipelines = 1</code> enables it for user queries (implementation notes warn that syntax and execution details may still change).</p>
 <pre><code><span class="src">docs/analysis/perfetto-sql-pipe-getting-started.md (PRAGMA line from its intro)</span>PERFETTO PRAGMA pipelines = 1;
 FROM (SELECT ts, dur, track_id FROM slice WHERE dur &gt; 0)
 |&gt; INTERVAL FLATTEN PER track_id AGGREGATE COUNT(*) AS active;</code></pre>
@@ -1059,12 +1074,11 @@ copied into a new dataframe.
 
 <!-- ───────────── Plugins ───────────── -->
 <h2 id="plugins"><span class="n">13</span>Plugins package each feature and declare what it depends on</h2>
-<p>Each trace processor feature is a plugin that declares its dependencies, so the framework can create them in a valid order. Trace processor
-has dozens of features. Each registers some mix of importers, tables and SQL functions, and some depend on others. For example, the descendant
-table functions below build on ancestor. A <b>plugin</b> is a class that contributes through a fixed set of hooks.</p>
-<p>Several dozen live under src/trace_processor/plugins/, from span_join_operator and interval_intersect to storage_tables, which registers
-many of the built-in tables. The mechanism is in
-<code>src/trace_processor/core/plugin/plugin.h</code>.</p>
+<p>As trace processor grew from core scheduling and slice tables to dozens of domain subsystems — heap profilers, Android Binder and Winscope analyzers, Linux perf importers, and structural table functions such as <code>ancestor_slice</code> and <code>descendant_slice</code> — wiring every importer, dataframe and SQL function inside one central startup file became brittle.
+Features depend on one another’s tables and helpers, and some hooks run once when trace processor starts while others run per SQL connection.</p>
+<p>Trace processor isolates each feature into a <b>plugin</b> that declares its compile-time and runtime dependencies explicitly, letting the engine topologically sort and initialize them in a valid order.
+Several dozen plugins live under <code>src/trace_processor/plugins/</code>, from <code>span_join_operator</code> and <code>interval_intersect</code> to <code>storage_tables</code>, which registers the core built-in tables.
+The base contract lives in <code>src/trace_processor/core/plugin/plugin.h</code>.</p>
 
 <figure>
 <figcaption><b>Figure 15. Plugins are registered, sorted by dependency once, then created in that order.</b>
@@ -1156,7 +1170,7 @@ TraceProcessorImpl constructor.
 
 <!-- ───────────── Bottlenecks ───────────── -->
 <h2 id="bottlenecks"><span class="n">14</span>What is already cheap, and what still costs</h2>
-<p>Each trick in this note removes one cost. Here they are in one place:</p>
+<p>Stepping back across ingestion, storage and query execution, every mechanism in this note exists to eliminate one specific systems bottleneck — and the boundaries between those mechanisms explain the costs that remain when importing large traces or tuning slow queries:</p>
 <table>
   <thead><tr><th>Trick</th><th>Where</th><th>What it saves</th></tr></thead>
   <tbody>

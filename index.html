@@ -36,12 +36,12 @@ and explains the rest with figures and tables.</p>
   </a></li>
   <li><a href="native_memory_elf_malloc/index.html">
     <span class="note-title">Native memory on Android: where each page in smaps comes from</span>
-    <span class="note-sub">From the page up: how the kernel hands out memory, how the dynamic linker maps ELF files and shares RELRO, and how Scudo malloc carves up the heap.</span>
+    <span class="note-sub">From the page up: how the kernel hands out memory, how the dynamic linker maps ELF files and shares RELRO, and how Scudo backs malloc and carves up the heap.</span>
     <span class="note-meta">Pages · ELF · linker64 · RELRO · Scudo</span>
   </a></li>
   <li><a href="parcel_native_memory/index.html">
     <span class="note-title">How Parcel holds native memory: its buffers, the copy a Binder call makes, and what keeps that copy alive in system_server</span>
-    <span class="note-sub">How a Parcel lays out and grows its buffers, how a Binder call and a Bundle copy them into malloc, and which system_server structures keep app payloads alive.</span>
+    <span class="note-sub">Why a normal Binder call copies once into a kernel mapping, why a Bundle copies its slice onto the native heap via malloc, and which system_server structures keep app payloads alive.</span>
     <span class="note-meta">Parcel · Binder · Bundle · system_server</span>
   </a></li>
   <li><a href="oom_adjuster/index.html">
