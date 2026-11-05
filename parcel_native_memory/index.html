@@ -1,0 +1,1041 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Parcel lifecycle, system_server retention, and native memory accounting</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="Parcel buffers · Binder copies · Bundle retention · history">Parcel &amp; Native Memory</span>
+  <span class="tb-spacer"></span>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#glance">At a glance</a>
+  <div class="ph">I · Parcel &amp; Retention</div>
+  <a href="#parcel-anatomy">1 · Inside a Parcel</a>
+  <a href="#binder-bundle">2 · Binder mmap &amp; Bundle copies</a>
+  <a href="#holders">3 · system_server holders</a>
+  <div class="ph">II · History</div>
+  <a href="#history-timeline">4 · History (2009–2021)</a>
+  <a href="#sources">Sources</a>
+</nav>
+
+<main id="top">
+<h1>How Parcel holds native memory: its buffers, the copy a Binder call makes, and what keeps that copy alive in system_server</h1>
+<p class="lead">An incoming Binder transaction starts in a buffer the kernel maps into the receiving process. Reading a <code>Bundle</code> out of it copies the bytes into <code>malloc</code>, and that copy can stay allocated in <code>system_server</code> behind a <code>PendingIntent</code>, a notification, saved activity state, a queued broadcast, or an app widget.
+This note follows that path. It covers how a <code>Parcel</code> lays out and grows its buffers, how the Binder driver and <code>BaseBundle</code> copy them, which <code>system_server</code> structures hold on to app payloads, and how the Java <code>Parcel</code> class has reported its native memory over the years.</p>
+<p class="m">Checked against AOSP as of Android 17 (<code>frameworks/base</code>, <code>frameworks/native/libs/binder</code>, <code>libcore</code>) and the Android common kernel’s Binder driver.</p>
+
+<h2 id="glance">At a glance</h2>
+<ul>
+  <li><b>Java <code>Parcel</code> pools do not pool data buffers.</b> Calling <code>recycle()</code> invokes <code>Parcel::freeData()</code> immediately, freeing <code>mData</code> and <code>mObjects</code> back to Scudo. The 32-entry <code>sOwnedPool</code> caches only the Java object and its empty 120-byte C++ <code>Parcel</code> header.</li>
+  <li><b>Every lazy <code>Bundle</code> read from Binder copies into <code>malloc</code>.</b> Incoming transactions use a shared ~1 MiB driver <code>mmap</code> that <code>IPCThreadState</code> frees before sending the reply. <code>BaseBundle.readFromParcelInner()</code> copies its byte range into a heap <code>Parcel</code> via <code>appendFrom()</code>, duplicating every file descriptor and incrementing every embedded Binder strong reference.</li>
+  <li><b>One unread <code>LazyValue</code> retains the entire <code>Bundle</code> buffer.</b> When <code>system_server</code> reads a primitive or string key from a <code>Bundle</code>, top-level unparcelling leaves length-prefixed <code>Parcelable</code> entries (such as notification <code>Bitmap</code>s) wrapped in <code>Parcel.LazyValue</code>. Each <code>LazyValue.mSource</code> holds a strong reference to the whole copied <code>Parcel</code> and its duplicated <code>ashmem</code> or <code>memfd</code> descriptors.</li>
+  <li><b><code>Parcel</code> is freed by <code>finalize()</code>.</b> An unrecycled <code>Parcel</code> is cleaned up only when its Java object is finalized. ART’s garbage collector and Java heap dumps see the small Java object, not the native buffer bytes it owns.</li>
+  <li><b>The Java class once reported some native memory to the GC.</b> From 2015 to 2020, <code>Parcel</code> told ART about the size of open <code>ashmem</code> file descriptors (never <code>mData</code> or <code>mObjects</code>). That reporting was removed in 2020 (<a href="#history-timeline">§4</a>).</li>
+</ul>
+
+<p><b>Terms.</b></p>
+<ul>
+  <li><b>Owned <code>Parcel</code></b>: a C++ <code>android::Parcel</code> with <code>mOwner == nullptr</code> whose <code>mData</code> byte buffer and <code>mObjects</code> offset array live on the native heap (Scudo <code>malloc</code>).</li>
+  <li><b>Borrowed <code>Parcel</code></b>: a C++ <code>Parcel</code> initialized via <code>ipcSetDataReference()</code> with <code>mOwner != nullptr</code> whose pointers address the process's read-only ~1 MiB <code>/dev/binder</code> kernel mapping, released with <code>BC_FREE_BUFFER</code> rather than <code>free()</code>.</li>
+  <li><b><code>LazyValue</code></b>: a placeholder stored in <code>BaseBundle.mMap</code> during partial unparcelling for length-prefixed values (<code>Parcelable</code>, <code>List</code>, <code>Map</code>, arrays, <code>Serializable</code>); its <code>mSource</code> reference keeps the backing <code>Parcel</code> alive until that entry is read.</li>
+  <li><b><code>NativeAllocationRegistry</code> (NAR)</b>: a <code>libcore</code> helper that frees a Java object's native memory through a <code>Cleaner</code> once the Java object becomes unreachable, and records a native size that heap dumps can attribute to it.</li>
+  <li><b>Scudo</b>: Android's default native allocator, the code behind <code>malloc</code>, <code>realloc</code> and <code>free</code>.</li>
+  <li><b><code>ashmem</code> / <code>memfd</code></b>: kernel shared-memory files. A process passes one by sending its file descriptor (FD); the memory stays allocated while any process holds an open FD.</li>
+  <li><b><code>flat_binder_object</code> and <code>cookie</code></b>: the 24-byte record a <code>Parcel</code> writes for each Binder object or FD. For an FD, <code>Parcel</code> uses <code>cookie = 1</code> to mean “this <code>Parcel</code> owns the FD and must close it”.</li>
+  <li><b><code>BC_*</code> / <code>BR_*</code></b>: Binder driver commands. User space sends <code>BC_</code> commands (for example <code>BC_FREE_BUFFER</code>, <code>BC_REPLY</code>) and the driver returns <code>BR_</code> commands (for example <code>BR_TRANSACTION</code>).</li>
+  <li><b>Unparcel</b>: turn the bytes of a <code>Bundle</code> back into Java objects in its map.</li>
+</ul>
+
+<div class="part">Part I · How Parcel Allocates, Copies, and Stays Alive Across Processes</div>
+
+<h2 id="parcel-anatomy"><span class="n">1</span>Inside a Parcel: ownership modes, pools, wire layout, and buffer resize paths</h2>
+<p>One <code>Parcel</code> class name covers several configurations, spread across <code>Parcel.java</code>, <code>Parcel.h</code>, and <code>Parcel.cpp</code>. Three independent choices define them:</p>
+<ul>
+  <li><b>Who owns the C++ object (Java side).</b> A Java <code>Parcel</code> either owns a heap-allocated <code>android::Parcel</code> or temporarily wraps a stack-allocated C++ <code>Parcel</code> during an incoming Binder call.</li>
+  <li><b>Who owns the bytes (C++ side).</b> Its data pointer addresses either Scudo's <code>malloc</code> heap or the read-only <code>/dev/binder</code> kernel mapping.</li>
+  <li><b>Which transport.</b> Its object table is either kernel Binder (<code>KernelFields</code>) or socket-based RPC Binder (<code>RpcFields</code>), held in one <code>std::variant</code>.</li>
+</ul>
+<p>Most methods in <code>Parcel.cpp</code> branch on these three state variables before reading or writing bytes.</p>
+
+<h3>Two Java pools and two C++ buffer ownership modes</h3>
+<p>One Java flag and one C++ callback pointer determine who owns the C++ struct and who owns the payload buffers (Figure 1):</p>
+<ul>
+  <li><b>Java wrapper ownership (<code>mOwnsNativeParcelObject</code>):</b> In <code>Parcel.java</code>, each instance holds <code>mNativePtr</code> (the <code>android::Parcel*</code>) and <code>mOwnsNativeParcelObject</code>. Two static singly-linked lists guarded by <code>sPoolSync</code> cache up to <code>POOL_SIZE = 32</code> wrappers each:
+    <ul>
+      <li><b><code>sOwnedPool</code></b> backs public <code>Parcel.obtain()</code>: <code>mOwnsNativeParcelObject = true</code>, pointing to a 120-byte heap <code>new Parcel()</code> allocated via <code>nativeCreate()</code> in <code>android_os_Parcel.cpp</code>.</li>
+      <li><b><code>sHolderPool</code></b> backs the hidden <code>protected static</code> <code>Parcel.obtain(long ptr)</code> called by <code>Binder.java</code> during <code>execTransact()</code>: <code>mOwnsNativeParcelObject = false</code>, temporarily wrapping the C++ <code>Parcel buffer</code> and <code>Parcel reply</code> variables on the Binder thread's stack inside <code>IPCThreadState::executeCommand()</code>.</li>
+    </ul>
+  </li>
+  <li><b>C++ buffer ownership (<code>Parcel::mOwner</code>):</b> In <code>Parcel.cpp</code>, <code>mOwner == nullptr</code> means <b>the <code>Parcel</code> owns its heap buffers</b> (allocated with <code>malloc</code>/<code>realloc</code> and released with <code>free()</code>). When <code>mOwner != nullptr</code>, <code>mOwner</code> is a <code>release_func</code> callback (<code>IPCThreadState::freeBuffer</code>) and <code>mData</code> and <code>mObjects</code> point directly into the read-only ~1 MiB <code>/dev/binder</code> kernel mapping; zero bytes come from <code>malloc</code>.</li>
+</ul>
+
+<figure>
+<figcaption><b>Figure 1. The two-axis ownership model across <code>Parcel.java</code> and <code>Parcel.cpp</code>.</b> Left: caller-created and <code>Bundle</code>-retained parcels come from <code>sOwnedPool</code> (<code>mOwnsNativeParcelObject = true</code>, <code>mOwner == nullptr</code>) and allocate buffers on Scudo's heap. A <code>Parcel.obtain()</code> wrapper used to receive a reply is the exception: <code>IPCThreadState</code> points it at the kernel buffer with <code>ipcSetDataReference()</code>, so it borrows like the right-hand case. Right: incoming Binder transactions borrow a wrapper from <code>sHolderPool</code> (<code>mOwnsNativeParcelObject = false</code>) pointing to a stack <code>Parcel</code> whose <code>mOwner</code> callback returns the buffer to <code>/dev/binder</code>. Bottom: writing data to a borrowed <code>Parcel</code> triggers copy-on-write takeover into <code>malloc</code> (writing Binder objects or FDs to it is refused).</figcaption>
+<svg viewBox="0 0 1000 354" role="img" aria-label="Two-column comparison of sOwnedPool heap parcels versus sHolderPool borrowed kernel mmap parcels">
+  <text x="10" y="18" class="th">mode 1 · owned heap parcel — Parcel.obtain() / BaseBundle</text>
+  <rect x="10" y="28" width="478" height="232" rx="2" class="panel"/>
+
+  <rect x="24" y="42" width="206" height="86" rx="2" class="b"/>
+  <text x="36" y="62" class="tb">Java Parcel (sOwnedPool)</text>
+  <text x="36" y="80" class="tms">mOwnsNative = true</text>
+  <text x="36" y="96" class="tms">mNativePtr -&gt; heap Parcel*</text>
+  <text x="36" y="112" class="ts">Pool cap: 32 empty shells</text>
+
+  <path d="M230,84 L258,84" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="260" y="42" width="214" height="86" rx="2" class="ba"/>
+  <text x="272" y="62" class="tb ta">Heap android::Parcel (120 B)</text>
+  <text x="272" y="80" class="tms">mOwner = nullptr (self-owned)</text>
+  <text x="272" y="96" class="tms">mData -&gt; Scudo malloc/realloc</text>
+  <text x="272" y="112" class="tms">mObjects -&gt; Scudo malloc</text>
+
+  <path d="M367,128 L367,154" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="24" y="156" width="450" height="90" rx="2" class="bg"/>
+  <text x="36" y="176" class="tb tg">What recycle() does on Mode 1</text>
+  <text x="36" y="194" class="tms">1. freeBuffer() -&gt; nativeFreeBuffer() -&gt; Parcel::freeData()</text>
+  <text x="36" y="210" class="tms">2. releaseObjects() [decStrong + close FDs], free buffers</text>
+  <text x="36" y="226" class="ts">3. Pushes Java shell + empty 120 B C++ struct to sOwnedPool (cap = 0)</text>
+
+  <text x="512" y="18" class="th">mode 2 · borrowed ipc parcel — Binder.execTransact()</text>
+  <rect x="512" y="28" width="478" height="232" rx="2" class="panel"/>
+
+  <rect x="526" y="42" width="206" height="86" rx="2" class="b"/>
+  <text x="538" y="62" class="tb">Java Parcel (sHolderPool)</text>
+  <text x="538" y="80" class="tms">mOwnsNative = false</text>
+  <text x="538" y="96" class="tms">mNativePtr -&gt; C++ stack frame</text>
+  <text x="538" y="112" class="ts">Pool cap: 32 empty wrappers</text>
+
+  <path d="M732,84 L760,84" class="lnv" marker-end="url(#ahv)"/>
+
+  <rect x="762" y="42" width="214" height="86" rx="2" class="bv"/>
+  <text x="774" y="62" class="tb tv">Stack android::Parcel</text>
+  <text x="774" y="80" class="tms">mOwner = IPCThreadState::</text>
+  <text x="774" y="95" class="tms">         freeBuffer</text>
+  <text x="774" y="112" class="tms">mData -&gt; /dev/binder mmap</text>
+
+  <path d="M869,128 L869,154" class="lnv" marker-end="url(#ahv)"/>
+
+  <rect x="526" y="156" width="450" height="90" rx="2" class="b0"/>
+  <text x="538" y="176" class="tb">What recycle() + IPCThreadState teardown do on Mode 2</text>
+  <text x="538" y="194" class="tms">1. Java recycle(): mNativePtr = 0 (skips nativeFreeBuffer)</text>
+  <text x="538" y="210" class="tms">2. IPCThreadState: buffer.setDataSize(0) -&gt; close FDs</text>
+  <text x="538" y="226" class="tms">3. Calls mOwner() -&gt; BC_FREE_BUFFER frees kernel mmap slice</text>
+
+  <rect x="10" y="274" width="980" height="68" rx="2" class="bw"/>
+  <text x="24" y="294" class="tb tw">Copy-on-write transition (Mode 2 -&gt; Mode 1 inside Parcel::continueWrite)</text>
+  <text x="24" y="312" class="tms">Mutating a borrowed Parcel (desired &gt; 0): malloc(desired) + memcpy + reacquireObjects + set FD cookie = 1</text>
+  <text x="24" y="328" class="tms">-&gt; invokes mOwner() [BC_FREE_BUFFER] to release kernel mmap slice, then sets mOwner = nullptr (now Mode 1)</text>
+</svg>
+</figure>
+
+<p>When caller code invokes <code>parcel.recycle()</code> on an owned <code>Parcel</code>, Java calls <code>freeBuffer()</code> → <code>nativeFreeBuffer()</code> → <code>Parcel::freeData()</code> before returning the wrapper to <code>sOwnedPool</code>.
+That immediately frees <code>mData</code> and <code>mObjects</code> back to Scudo and resets capacities to zero; pooling saves only one Java object allocation and one 120-byte <code>new Parcel()</code> struct allocation.
+If <code>sOwnedPool</code> is full (32 entries) or a <code>Parcel</code> is dropped without <code>recycle()</code>, cleanup waits for <code>Parcel.finalize()</code> → <code>destroy()</code> → <code>delete parcel</code>.</p>
+
+<pre><code><span class="src">frameworks/base/core/java/android/os/Parcel.java · recycle() &amp; finalize()</span><span class="k">public final void</span> recycle() {
+    mRecycled = <span class="k">true</span>;
+<span class="hw">    freeBuffer(); <span class="c">// if (mOwnsNativeParcelObject) nativeFreeBuffer(mNativePtr) -&gt; free(mData)</span></span>
+    <span class="k">if</span> (mOwnsNativeParcelObject) {
+        <span class="k">synchronized</span> (sPoolSync) {
+            <span class="k">if</span> (sOwnedPoolSize &lt; POOL_SIZE) { <span class="c">// POOL_SIZE = 32; keeps 120 B C++ shell only</span>
+                mPoolNext = sOwnedPool; sOwnedPool = <span class="k">this</span>; sOwnedPoolSize++;
+            }
+        }
+    } <span class="k">else</span> {
+        mNativePtr = 0; <span class="c">// holder wrapper detaches from IPCThreadState stack Parcel</span>
+        <span class="k">synchronized</span> (sPoolSync) { <span class="k">if</span> (sHolderPoolSize &lt; POOL_SIZE) { ... } }
+    }
+}
+<span class="k">protected void</span> finalize() <span class="k">throws</span> Throwable { destroy(); } <span class="c">// no NativeAllocationRegistry</span></code></pre>
+
+<h3>Byte-level struct layout (120 B) and how mObjects indexes into mData</h3>
+<p><code>Parcel</code> serializes primitive values and kernel handles inline into the same <code>mData</code> buffer, then tracks the byte offsets of kernel handles in a separate array so the Binder driver can rewrite them during IPC.
+On 64-bit Android, <code>sizeof(android::Parcel)</code> is fixed at 120 bytes by a <code>static_assert</code> in <code>Parcel.cpp</code>.
+Figure 2 shows the 120-byte header and the two buffers it manages:</p>
+<ol>
+  <li><b><code>mData</code> (<code>mDataCapacity</code> bytes, 4-byte aligned stream):</b> Every primitive write widens sub-32-bit values (<code>bool</code>, <code>byte</code>, <code>char16_t</code>) to 4 bytes and pads strings and byte arrays with trailing zeroes to a 4-byte boundary so kernel structures stay aligned and uninitialized heap padding never leaks across processes. Three cursors track the stream: <code>mDataPos</code> (read/write cursor), <code>mDataSize</code> (high-water mark of valid bytes, updated whenever <code>mDataPos</code> advances past it), and <code>mDataCapacity</code> (allocated buffer length).</li>
+  <li><b><code>KernelFields::mObjects</code> (<code>mObjectsCapacity * 8</code> bytes):</b> Whenever code writes an <code>IBinder</code> or file descriptor, <code>writeObject()</code> writes a 24-byte <code>flat_binder_object</code> directly into <code>mData</code> at the current <code>mDataPos</code>, and appends that byte offset into the separate <code>mObjects[]</code> side-table. Two details in <code>Parcel.cpp</code> exist solely because of this dual structure:
+    <ul>
+      <li><b>Overwrite protection (<code>validateReadData</code>):</b> Before reading primitives or appending bytes, <code>Parcel</code> checks <code>mObjects[]</code> (using <code>mNextObjectHint</code>) to ensure sequential primitive reads or writes do not straddle or forge a <code>flat_binder_object</code> slot.</li>
+      <li><b>Reference counting &amp; FD ownership:</b> Writing an object calls <code>acquire_object()</code> (<code>IBinder::incStrong</code>, plus <code>fdsan</code> <code>FdTag</code> on owned FDs); freeing or truncating walks <code>mObjects[]</code> in reverse calling <code>release_object()</code> (<code>decStrong</code> and <code>FdTagClose</code> when <code>flat.cookie != 0</code>).</li>
+    </ul>
+  </li>
+  <li><b>Out-of-line shared memory descriptors:</b> <code>Parcel::writeBlob()</code> writes byte arrays up to <code>BLOB_INPLACE_LIMIT = 16 KiB</code> inline inside <code>mData</code>; above 16 KiB it allocates an <code>ashmem</code> region (<code>"Parcel Blob"</code>) and writes a <code>BINDER_TYPE_FD</code> record into <code>mData</code> + <code>mObjects</code>. Likewise, <code>Bitmap.cpp</code> writes pixel buffers up to 12 KiB inline and places larger Bitmaps into a sealed <code>memfd</code> file descriptor stored in <code>mObjects</code>.</li>
+</ol>
+
+<figure>
+<figcaption><b>Figure 2. Exact 120-byte layout of <code>android::Parcel</code> on 64-bit (LP64) builds and how <code>mObjects[]</code> cross-indexes 24-byte <code>flat_binder_object</code> records inside <code>mData</code>.</b> Primitives and strings serialize inline into <code>mData</code>; active kernel objects (<code>IBinder</code> pointers/handles and file descriptors) also serialize inline into <code>mData</code> while recording their byte offsets in <code>mObjects[]</code> so the kernel driver can translate them in flight and <code>releaseObjects()</code> can drop strong refs and close FDs.</figcaption>
+<svg viewBox="0 0 1000 366" role="img" aria-label="120-byte struct layout of android::Parcel and cross-indexed mData and mObjects wire format">
+  <text x="10" y="18" class="th">a · sizeof(android::Parcel) == 120 bytes on lp64 (static_assert in Parcel.cpp)</text>
+  <rect x="10" y="28" width="980" height="74" rx="2" class="panel"/>
+
+  <rect x="18" y="38" width="96" height="54" rx="2" class="b"/>
+  <text x="66" y="57" class="tms" text-anchor="middle">[0..8)</text>
+  <text x="66" y="73" class="tb" text-anchor="middle">mError</text>
+  <text x="66" y="86" class="ts" text-anchor="middle">4B + 4B pad</text>
+
+  <rect x="118" y="38" width="248" height="54" rx="2" class="ba"/>
+  <text x="242" y="56" class="tms ta" text-anchor="middle">[8..40) · 4 x 8B stream pointers</text>
+  <text x="242" y="72" class="tm" text-anchor="middle">mData · mDataSize</text>
+  <text x="242" y="86" class="tms" text-anchor="middle">mDataCapacity · mDataPos</text>
+
+  <rect x="370" y="38" width="334" height="54" rx="2" class="bv"/>
+  <text x="537" y="56" class="tms tv" text-anchor="middle">[40..96) · mVariantFields (56 B inline)</text>
+  <text x="537" y="72" class="tm" text-anchor="middle">KernelFields { mObjects, Size, Cap, ... }</text>
+  <text x="537" y="86" class="tms" text-anchor="middle">or RpcFields { mSession, vector&lt;pos&gt;, mImpl }</text>
+
+  <rect x="708" y="38" width="92" height="54" rx="2" class="b"/>
+  <text x="754" y="56" class="tms" text-anchor="middle">[96..104)</text>
+  <text x="754" y="72" class="tb" text-anchor="middle">4 bools</text>
+  <text x="754" y="86" class="ts" text-anchor="middle">AllowFds/Zero</text>
+
+  <rect x="804" y="38" width="104" height="54" rx="2" class="bw"/>
+  <text x="856" y="56" class="tms tw" text-anchor="middle">[104..112)</text>
+  <text x="856" y="72" class="tb tw" text-anchor="middle">mOwner</text>
+  <text x="856" y="86" class="ts" text-anchor="middle">release_func</text>
+
+  <rect x="912" y="38" width="70" height="54" rx="2" class="b0"/>
+  <text x="947" y="56" class="tms" text-anchor="middle">[112..120)</text>
+  <text x="947" y="73" class="ts" text-anchor="middle">mReserved</text>
+  <text x="947" y="86" class="tms" text-anchor="middle">8 B</text>
+
+  <text x="10" y="130" class="th">b · wire layout inside mData[] and cross-index from KernelFields::mObjects[]</text>
+
+  <text x="18" y="150" class="tms">mData -&gt;</text>
+  <rect x="84" y="138" width="98" height="64" rx="2" class="b"/>
+  <text x="133" y="157" class="tms" text-anchor="middle">0x00 (4 B)</text>
+  <text x="133" y="174" class="tb" text-anchor="middle">int32</text>
+  <text x="133" y="190" class="ts" text-anchor="middle">4B-aligned</text>
+
+  <rect x="184" y="138" width="166" height="64" rx="2" class="b"/>
+  <text x="267" y="157" class="tms" text-anchor="middle">0x04..0x18 (20 B)</text>
+  <text x="267" y="174" class="tb" text-anchor="middle">String16 + 0 pad</text>
+  <text x="267" y="190" class="ts" text-anchor="middle">len + UTF-16 + NUL</text>
+
+  <rect x="352" y="138" width="222" height="64" rx="2" class="bv"/>
+  <text x="463" y="157" class="tms tv" text-anchor="middle">0x18..0x30 (24 B)</text>
+  <text x="463" y="174" class="tb tv" text-anchor="middle">flat_binder_object</text>
+  <text x="463" y="190" class="tms" text-anchor="middle">TYPE_HANDLE · handle=7</text>
+
+  <rect x="576" y="138" width="228" height="64" rx="2" class="bw"/>
+  <text x="690" y="157" class="tms tw" text-anchor="middle">0x30..0x48 (24 B)</text>
+  <text x="690" y="174" class="tb tw" text-anchor="middle">flat_binder_object</text>
+  <text x="690" y="190" class="tms" text-anchor="middle">TYPE_FD · fd=42 · cookie=1</text>
+
+  <rect x="806" y="138" width="184" height="64" rx="2" fill="url(#hatch)" stroke="var(--bd)"/>
+  <text x="898" y="166" class="ts" text-anchor="middle">spare capacity</text>
+  <text x="898" y="184" class="tms" text-anchor="middle">[mDataSize..mDataCap)</text>
+
+  <line x1="352" y1="208" x2="352" y2="222" class="lna"/>
+  <text x="352" y="234" class="tms ta" text-anchor="middle">^ mDataPos (cursor)</text>
+  <line x1="806" y1="208" x2="806" y2="222" class="ln"/>
+  <text x="806" y="234" class="tms" text-anchor="start">^ mDataSize (valid end)</text>
+
+  <rect x="84" y="262" width="320" height="86" rx="2" class="bv"/>
+  <rect x="98" y="272" width="138" height="42" rx="2" class="b0"/>
+  <text x="167" y="290" class="tms tv" text-anchor="middle">mObjects[0] = 0x18</text>
+  <text x="167" y="305" class="ts" text-anchor="middle">offset of IBinder</text>
+  <rect x="248" y="272" width="142" height="42" rx="2" class="b0"/>
+  <text x="319" y="290" class="tms tw" text-anchor="middle">mObjects[1] = 0x30</text>
+  <text x="319" y="305" class="ts" text-anchor="middle">offset of FD 42</text>
+  <text x="244" y="334" class="tb tv" text-anchor="middle">KernelFields::mObjects (binder_size_t[])</text>
+
+  <path d="M167,272 L167,248 L452,248 L452,204" class="lnv" marker-end="url(#ahv)"/>
+  <path d="M319,272 L319,255 L640,255 L640,204" class="lnw" marker-end="url(#ahw)"/>
+
+  <rect x="448" y="262" width="250" height="86" rx="2" class="ba"/>
+  <text x="462" y="282" class="tb ta">ProcessState / BpBinder</text>
+  <text x="462" y="300" class="tms">acquire_object -&gt; incStrong()</text>
+  <text x="462" y="316" class="tms">release_object -&gt; decStrong()</text>
+  <text x="462" y="332" class="ts">Keeps remote BBinder alive</text>
+
+  <path d="M490,202 L530,260" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="716" y="262" width="274" height="86" rx="2" class="bw"/>
+  <text x="730" y="282" class="tb tw">Kernel anon_inode (memfd/ashmem)</text>
+  <text x="730" y="300" class="tms">Bitmap &gt;12 KiB or Blob &gt;16 KiB</text>
+  <text x="730" y="316" class="tms">cookie=1 -&gt; FdTagClose(42) on free</text>
+  <text x="730" y="332" class="ts">Not counted in mDataCapacity</text>
+
+  <path d="M712,202 L742,260" class="lnw" marker-end="url(#ahw)"/>
+</svg>
+</figure>
+
+<h3>Buffer growth, truncation, and reset: growData, continueWrite, restartWrite, and appendFrom</h3>
+<p><code>Parcel.cpp</code> splits buffer resizing across four helpers because sequential writes, slice copies, truncation, and full buffer replacement treat <code>mDataCapacity</code> and <code>mObjects</code> differently (Figures 3 and 4):</p>
+<ul>
+  <li><b>Sequential writes (<code>writeInt32</code>, <code>writeString16</code>, <code>writeInplace</code>) call <code>growData(len)</code>:</b> computes <code>newSize = ((mDataSize + len) * 3) / 2</code> (1.5x geometric growth) and calls <code>continueWrite(max(newSize, 128))</code>, so the minimum is 128 B.</li>
+  <li><b><code>appendFrom()</code> uses the same growth rule:</b> if <code>mDataPos + len</code> exceeds <code>mDataCapacity</code>, it calls <code>growData(len)</code>. Even the first copy into an empty <code>Parcel</code>, which is the path <code>BaseBundle.readFromParcelInner()</code> takes, allocates <code>max(len * 3 / 2, 128)</code> bytes, so a long-lived <code>Bundle</code> copy can carry up to a third more capacity than its payload. Growth of <code>mObjects</code> inside <code>appendFrom()</code> also scales by 1.5x.</li>
+  <li><b><code>continueWrite(desired)</code> is a three-way state machine:</b> first, if <code>desired &lt; mDataSize</code>, it sorts <code>mObjects</code> and identifies any objects sitting past <code>desired</code> so their references and FDs can be released. Then it branches on buffer state:
+    <ol>
+      <li><code>mOwner != nullptr</code> (borrowed kernel <code>mmap</code>): if <code>desired == 0</code>, calls <code>freeData()</code>; otherwise performs copy-on-write takeover into fresh <code>malloc(desired)</code> + <code>calloc</code> object array, calls <code>reacquireObjects()</code>, flips kept FD cookies to <code>1</code>, closes dropped FDs, invokes <code>mOwner()</code> to release the kernel buffer, and clears <code>mOwner = nullptr</code>.</li>
+      <li><code>mData != nullptr</code> (already heap-owned): releases any truncated objects and shrinks <code>mObjects</code> via <code>realloc</code>, then if <code>desired &gt; mDataCapacity</code> runs <code>realloc(mData, desired)</code>; if <code>desired &lt;= mDataCapacity</code> (such as <code>setDataSize(0)</code>), it <b>clamps <code>mDataSize</code> and <code>mDataPos</code> without shrinking <code>mDataCapacity</code></b>.</li>
+      <li><code>mData == nullptr</code> (first allocation on an owned <code>Parcel</code>): runs <code>malloc(desired)</code>.</li>
+    </ol>
+  </li>
+  <li><b>Only <code>restartWrite(desired)</code>, <code>freeData()</code>, and <code>~Parcel()</code> shrink or release <code>mData</code>:</b> <code>restartWrite()</code> (called by the C++ <code>Parcel::setData()</code>) releases all objects right away and calls <code>realloc(mData, desired)</code> even when <code>desired &lt; mDataCapacity</code>. Meanwhile, <code>dumpsys meminfo</code>'s <code>Parcel memory</code> counter (<code>gParcelGlobalAllocSize</code>) tracks only owned <code>mDataCapacity</code>, ignoring the 120-byte struct, <code>mObjects</code>, borrowed Binder <code>mmap</code> pages, and <code>ashmem</code>/<code>memfd</code> regions.</li>
+</ul>
+
+<figure>
+<figcaption><b>Figure 3. Full memory lifecycle of an owned <code>Parcel</code>: pool pop, Scudo <code>realloc</code> growth, the <code>appendFrom</code> copy, truncation that keeps capacity, pool reuse, and <code>finalize()</code> cleanup.</b> Top: how <code>mData</code> and <code>mObjects</code> evolve across five lifecycle stages. Bottom left: <code>sOwnedPool</code> recycles only empty 120-byte shells after <code>freeData()</code> releases heap buffers. Bottom right: a large <code>realloc</code> that does not fit the current block moves the payload into a new secondary block, and the old block goes to Scudo's block cache.</figcaption>
+<svg viewBox="0 0 1000 372" role="img" aria-label="Full Parcel memory lifecycle across obtain, Scudo realloc growth, appendFrom, setDataSize vs restartWrite, sOwnedPool reuse, and finalize">
+  <text x="10" y="18" class="th">a · five-stage buffer &amp; capacity timeline on an owned parcel</text>
+
+  <rect x="10" y="28" width="152" height="162" rx="2" class="b0"/>
+  <text x="20" y="47" class="tb">1. obtain()</text>
+  <text x="20" y="64" class="ts">Pop sOwnedPool</text>
+  <text x="20" y="79" class="ts">or nativeCreate()</text>
+  <rect x="20" y="96" width="132" height="82" rx="2" class="b"/>
+  <text x="86" y="118" class="tb" text-anchor="middle">120 B C++ shell</text>
+  <text x="86" y="136" class="tms" text-anchor="middle">mData = null</text>
+  <text x="86" y="152" class="tms" text-anchor="middle">mObjects = null</text>
+  <text x="86" y="168" class="ts" text-anchor="middle">cap = 0 B</text>
+
+  <path d="M162,108 L176,108" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="178" y="28" width="198" height="162" rx="2" class="b0"/>
+  <text x="188" y="47" class="tb">2a. write*() loop</text>
+  <text x="188" y="64" class="tms">growData: 1.5x (min 128B)</text>
+  <rect x="188" y="76" width="178" height="30" rx="2" fill="url(#hatch)" stroke="var(--bd)"/>
+  <text x="277" y="95" class="tms" text-anchor="middle">up to 33% tail slack</text>
+  <rect x="188" y="106" width="178" height="44" rx="2" class="ba"/>
+  <text x="277" y="125" class="tms ta" text-anchor="middle">mData grows 1.5x per step</text>
+  <text x="277" y="141" class="ts" text-anchor="middle">realloc on overflow</text>
+  <rect x="188" y="154" width="178" height="24" rx="2" class="bv"/>
+  <text x="277" y="170" class="tms tv" text-anchor="middle">mObjects: 1.5x realloc</text>
+
+  <rect x="388" y="28" width="194" height="162" rx="2" class="b0"/>
+  <text x="398" y="47" class="tb">2b. appendFrom copy</text>
+  <text x="398" y="64" class="tms">BaseBundle copy (1.5x)</text>
+  <rect x="398" y="76" width="174" height="68" rx="2" class="bg"/>
+  <text x="485" y="98" class="tb tg" text-anchor="middle">malloc(len * 3/2)</text>
+  <text x="485" y="116" class="tms" text-anchor="middle">cap &gt; mDataSize</text>
+  <text x="485" y="132" class="ts" text-anchor="middle">memcpy slice bytes</text>
+  <rect x="398" y="148" width="174" height="30" rx="2" class="bw"/>
+  <text x="485" y="167" class="tms tw" text-anchor="middle">dup FDs + incStrong</text>
+
+  <path d="M582,108 L596,108" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="598" y="28" width="194" height="162" rx="2" class="b0"/>
+  <text x="608" y="47" class="tb">3. Truncate vs Shrink</text>
+  <text x="608" y="64" class="ts">Two distinct C++ paths:</text>
+  <rect x="608" y="76" width="174" height="50" rx="2" fill="url(#hatchr)" stroke="var(--bad-bd)"/>
+  <text x="695" y="95" class="tms tr" text-anchor="middle">setDataSize(k &lt; size)</text>
+  <text x="695" y="111" class="ts" text-anchor="middle">Frees objs; KEEPS mDataCap</text>
+  <rect x="608" y="132" width="174" height="46" rx="2" class="bv"/>
+  <text x="695" y="151" class="tms tv" text-anchor="middle">restartWrite(k)</text>
+  <text x="695" y="167" class="ts" text-anchor="middle">SHRINKS mData via realloc</text>
+
+  <path d="M792,108 L806,108" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="808" y="28" width="182" height="162" rx="2" class="b0"/>
+  <text x="818" y="47" class="tb">4. Recycle vs Drop</text>
+  <text x="818" y="64" class="ts">Buffer release paths:</text>
+  <rect x="818" y="76" width="162" height="50" rx="2" class="bg"/>
+  <text x="899" y="95" class="tms tg" text-anchor="middle">recycle() -&gt; freeData()</text>
+  <text x="899" y="111" class="ts" text-anchor="middle">Frees mData; pools shell</text>
+  <rect x="818" y="132" width="162" height="46" rx="2" class="br"/>
+  <text x="899" y="151" class="tms tr" text-anchor="middle">Dropped / pool &gt; 32</text>
+  <text x="899" y="167" class="ts" text-anchor="middle">GC -&gt; finalize -&gt; delete</text>
+
+  <text x="10" y="218" class="th">b · sOwnedPool shell reuse (why pooling keeps 0 payload bytes)</text>
+  <rect x="10" y="228" width="478" height="132" rx="2" class="panel"/>
+
+  <rect x="22" y="242" width="196" height="56" rx="2" class="bg"/>
+  <text x="34" y="261" class="tb tg">sOwnedPool[0..31]</text>
+  <text x="34" y="278" class="tms">Java Parcel + 120B C++</text>
+  <text x="34" y="291" class="ts">mData = null (0 B heap)</text>
+
+  <path d="M218,258 L266,258" class="lna" marker-end="url(#aha)"/>
+  <text x="242" y="251" class="tms ta" text-anchor="middle">obtain</text>
+
+  <rect x="268" y="242" width="208" height="56" rx="2" class="ba"/>
+  <text x="280" y="261" class="tb ta">Active Owned Parcel</text>
+  <text x="280" y="278" class="tms">mData (e.g. 64 KiB)</text>
+  <text x="280" y="291" class="tms">+ mObjects + dup'd FDs</text>
+
+  <path d="M372,298 L372,324 L120,324 L120,298" class="lng" marker-end="url(#ahg)"/>
+  <text x="248" y="344" class="tms tg" text-anchor="middle">recycle(): free(mData) + free(mObjects) + close FDs FIRST</text>
+
+  <text x="510" y="218" class="th">c · scudo primary vs secondary realloc during continueWrite</text>
+  <rect x="510" y="228" width="480" height="132" rx="2" class="panel"/>
+
+  <rect x="522" y="242" width="206" height="104" rx="2" class="b"/>
+  <text x="534" y="261" class="tb">Small (≤64 KiB): Primary</text>
+  <text x="534" y="278" class="tms">Size-class slab chunks</text>
+  <text x="534" y="294" class="ts">realloc stays in place if it</text>
+  <text x="534" y="310" class="ts">fits, else copies to a larger</text>
+  <text x="534" y="326" class="ts">class and frees the old slot.</text>
+
+  <path d="M728,294 L758,294" class="lnw" marker-end="url(#ahw)"/>
+  <text x="743" y="286" class="tms tw" text-anchor="middle">&gt;64K</text>
+
+  <rect x="760" y="242" width="218" height="104" rx="2" class="bw"/>
+  <text x="772" y="261" class="tb tw">Large (&gt;64 KiB): Secondary</text>
+  <text x="772" y="278" class="tms">Dedicated anon mmap/chunk</text>
+  <text x="772" y="294" class="ts">realloc that doesn't fit gets</text>
+  <text x="772" y="310" class="ts">a new block + memcpy; old</text>
+  <text x="772" y="326" class="tms tr">block goes to a cache.</text>
+</svg>
+</figure>
+
+<figure>
+<figcaption><b>Figure 4. Call graph and branch map for buffer-mutating methods in <code>Parcel.cpp</code>.</b> Almost every public write, resize, or copy method funnels into <code>continueWrite(desired)</code>, which behaves completely differently depending on whether the <code>Parcel</code> currently borrows a kernel buffer (<code>mOwner != nullptr</code>), already owns a heap buffer (<code>mData != nullptr</code>), or is empty.</figcaption>
+<svg viewBox="0 0 1000 344" role="img" aria-label="Flowchart of Parcel.cpp buffer mutation methods funneling into continueWrite, restartWrite, and freeDataNoInit">
+  <text x="10" y="18" class="th">public / jni entry points</text>
+  <text x="292" y="18" class="th">sizing policy</text>
+  <text x="546" y="18" class="th">Parcel::continueWrite(desired) &amp; teardown branches</text>
+
+  <rect x="10" y="30" width="236" height="46" rx="2" class="b"/>
+  <text x="22" y="50" class="tb">writeInt32 / writeInplace(len)</text>
+  <text x="22" y="66" class="tms">when mDataPos + len &gt; mDataCap</text>
+  <path d="M246,53 L288,53" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="290" y="30" width="212" height="58" rx="2" class="ba"/>
+  <text x="302" y="50" class="tb ta">growData(len)</text>
+  <text x="302" y="67" class="tms">max((size + len)*3/2, 128)</text>
+  <text x="302" y="81" class="ts">1.5x geometric growth</text>
+  <path d="M502,58 L544,58" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="10" y="88" width="236" height="58" rx="2" class="bg"/>
+  <text x="22" y="108" class="tb tg">appendFrom(src, off, len)</text>
+  <text x="22" y="125" class="tms">same rule when out of space:</text>
+  <text x="22" y="139" class="ts">calls growData(len) ^</text>
+  <path d="M128,88 L128,80 L340,80 L340,88" class="ln" stroke-opacity="0"/>
+  <path d="M246,116 L544,116" class="lng" marker-end="url(#ahg)"/>
+  <text x="395" y="110" class="tms tg" text-anchor="middle">via growData: even a first copy gets 1.5x</text>
+
+  <rect x="10" y="158" width="236" height="46" rx="2" class="b"/>
+  <text x="22" y="178" class="tb">setDataSize(sz) / setDataCap</text>
+  <text x="22" y="194" class="tms">truncates or pre-reserves</text>
+  <path d="M246,181 L544,181" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="546" y="28" width="444" height="204" rx="2" class="panel"/>
+  <text x="558" y="46" class="tms">continueWrite(desired): drops objects past desired if truncating</text>
+
+  <rect x="558" y="56" width="420" height="52" rx="2" class="bw"/>
+  <text x="570" y="75" class="tb tw">Branch 1: if (mOwner != nullptr) — borrowed mmap</text>
+  <text x="570" y="92" class="tms">desired==0 ? freeData() : malloc + memcpy + set FD cookie=1</text>
+  <text x="570" y="104" class="ts">Calls mOwner() to free kernel slice, then sets mOwner = nullptr</text>
+
+  <rect x="558" y="116" width="420" height="58" rx="2" class="ba"/>
+  <text x="570" y="135" class="tb ta">Branch 2: else if (mData != nullptr) — heap-owned</text>
+  <text x="570" y="152" class="tms">desired &gt; cap: realloc(mData, desired) + update global size</text>
+  <text x="570" y="167" class="tms tr">desired &lt;= cap: clamps Size &amp; Pos ONLY (mDataCapacity kept)</text>
+
+  <rect x="558" y="182" width="420" height="40" rx="2" class="bg"/>
+  <text x="570" y="201" class="tb tg">Branch 3: else — empty owned Parcel</text>
+  <text x="570" y="216" class="tms">mData = malloc(desired); mDataCapacity = desired; pos=size=0</text>
+
+  <rect x="10" y="220" width="236" height="48" rx="2" class="b"/>
+  <text x="22" y="240" class="tb">Parcel::setData(bytes, len)</text>
+  <text x="22" y="256" class="tms">C++ callers</text>
+  <path d="M246,244 L288,244" class="lnv" marker-end="url(#ahv)"/>
+
+  <rect x="290" y="220" width="238" height="48" rx="2" class="bv"/>
+  <text x="302" y="240" class="tb tv">restartWrite(desired)</text>
+  <text x="302" y="256" class="tms">releaseObjects + realloc(desired)</text>
+
+  <rect x="10" y="280" width="236" height="50" rx="2" class="br"/>
+  <text x="22" y="300" class="tb tr">recycle() / ~Parcel()</text>
+  <text x="22" y="316" class="tms">freeBuffer() / nativeDestroy()</text>
+  <path d="M246,305 L544,305" class="lnr" marker-end="url(#ahr)"/>
+
+  <rect x="546" y="244" width="444" height="86" rx="2" class="br"/>
+  <text x="558" y="264" class="tb tr">freeData() -&gt; freeDataNoInit() + initState()</text>
+  <text x="558" y="282" class="tms">if (mOwner): closeFileDescriptors(0) + mOwner(...) [BC_FREE_BUFFER]</text>
+  <text x="558" y="298" class="tms">else:        releaseObjects() + free(mData) + free(mObjects)</text>
+  <text x="558" y="315" class="ts">Resets mData=null, mDataCap=0, mObjects=null, mOwner=null</text>
+</svg>
+</figure>
+
+<p class="m"><b>Table 1.</b> The <code>Parcel.cpp</code> methods that allocate, resize or free buffers.</p>
+<div class="tbl-wrap"><table>
+  <thead>
+    <tr>
+      <th>Parcel.cpp method</th>
+      <th>Typical caller</th>
+      <th>Effect on mData</th>
+      <th>Effect on mObjects &amp; FDs</th>
+      <th>Implementation detail</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space:nowrap"><code>ipcSetDataReference</code></td>
+      <td><code>IPCThreadState</code> on <code>BR_TRANSACTION</code> / reply</td>
+      <td>Points <code>mData</code> at kernel <code>mmap</code>; 0 B <code>malloc</code></td>
+      <td>Tags incoming <code>BINDER_TYPE_FD</code> with <code>fdsan</code>; <code>cookie</code> keeps whatever value the sender wrote</td>
+      <td>Sets <code>mOwner = freeBuffer</code>; this <code>Parcel</code> owns every FD in the buffer, whatever its <code>cookie</code></td>
+    </tr>
+    <tr>
+      <td style="white-space:nowrap"><code>growData(len)</code></td>
+      <td><code>writeAligned</code>, <code>writeInplace</code>, non-empty <code>appendFrom</code></td>
+      <td>Requests <code>max((size+len)*3/2, 128)</code> via <code>continueWrite</code></td>
+      <td>Preserves existing objects</td>
+      <td>Fails with <code>BAD_VALUE</code> if <code>mDataPos &gt; mDataSize</code></td>
+    </tr>
+    <tr>
+      <td style="white-space:nowrap"><code>continueWrite(desired)</code></td>
+      <td><code>growData</code>, <code>setDataSize</code>, <code>setDataCapacity</code></td>
+      <td>Copy-on-write <code>malloc</code> if <code>mOwner</code>; <code>realloc</code> only if <code>desired &gt; cap</code>; never shrinks <code>mData</code></td>
+      <td>Releases objects past <code>desired</code> and shrinks <code>mObjects</code> via <code>realloc</code></td>
+      <td>When switching <code>mOwner -&gt; nullptr</code>, sets <code>flat.cookie = 1</code> so <code>release_object</code> will close FDs later</td>
+    </tr>
+    <tr>
+      <td style="white-space:nowrap"><code>restartWrite(desired)</code></td>
+      <td><code>Parcel::setData</code> (C++ callers)</td>
+      <td><code>realloc(mData, desired)</code>—can both grow and shrink capacity</td>
+      <td>Calls <code>releaseObjects()</code> and <code>free(mObjects)</code> unconditionally</td>
+      <td>Resets <code>mDataPos = mDataSize = 0</code>; preserves RPC session if <code>RpcFields</code></td>
+    </tr>
+    <tr>
+      <td style="white-space:nowrap"><code>appendFrom(src, off, len)</code></td>
+      <td><code>BaseBundle.readFromParcelInner</code>, <code>LazyValue.writeToParcel</code></td>
+      <td>1.5x <code>growData</code> whenever the data does not fit, including the first copy</td>
+      <td>1.5x <code>realloc</code> on <code>mObjects</code>; <code>incStrong</code> on binders; <code>F_DUPFD_CLOEXEC</code> on FDs</td>
+      <td>Sets <code>flat.cookie = 1</code> on every duplicated FD so the new heap <code>Parcel</code> owns its copy</td>
+    </tr>
+    <tr>
+      <td style="white-space:nowrap"><code>freeDataNoInit()</code></td>
+      <td><code>freeData()</code> (Java <code>recycle()</code>) and <code>~Parcel()</code></td>
+      <td><code>mOwner()</code> if borrowed; <code>free(mData)</code> if owned</td>
+      <td><code>closeFileDescriptors(0)</code> if <code>mOwner</code>; <code>releaseObjects()</code> + <code>free(mObjects)</code> if owned</td>
+      <td>Why two FD paths exist: a borrowed <code>Parcel</code> owns every FD whatever its <code>cookie</code>, so it closes them all with <code>closeFileDescriptors</code> instead of going through <code>release_object</code></td>
+    </tr>
+  </tbody>
+</table></div>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A recycled <code>Parcel</code> retains only its 120-byte C++ header and zero buffer bytes. Long-lived <code>Parcel</code> memory comes from owned instances kept unrecycled—primarily lazy <code>Bundle</code> copies—and when those wrappers become unreachable without an explicit <code>destroy()</code>, ART's garbage collector sees only a 56-byte Java object with a <code>finalize()</code> method.
+</blockquote>
+
+<h2 id="binder-bundle"><span class="n">2</span>Kernel Binder translation, appendFrom FD duplication, and the BaseBundle + LazyValue state machine</h2>
+<p>Incoming Binder transactions arrive in kernel-mapped memory, yet reading a <code>Bundle</code> from one in <code>system_server</code> ends with a <code>malloc</code> copy made by <code>Parcel::appendFrom</code>.
+Following one transaction from the kernel driver into <code>android.os.BaseBundle</code> shows where each buffer copy, strong reference, and duplicated file descriptor is created.</p>
+
+<h3>Across the Binder call: one kernel copy, FD installation, and pre-reply free</h3>
+<p>When a process opens <code>/dev/binder</code>, <code>ProcessState.cpp</code> maps <code>BINDER_VM_SIZE = 1 MiB - 2 * PAGE_SIZE</code> (1,016 KiB with 4 KiB pages, 992 KiB with 16 KiB pages) as <code>PROT_READ</code>, <code>MAP_PRIVATE | MAP_NORESERVE</code>.
+During <code>ioctl(BINDER_WRITE_READ)</code>, the kernel driver copies the sender's user-space <code>mData</code> buffer once into pages mapped inside the receiver's <code>mVMStart</code> range. While copying, it walks <code>mObjects[]</code> to translate local <code>BINDER_TYPE_BINDER</code> pointers into remote <code>BINDER_TYPE_HANDLE</code> descriptors and takes a reference on the file behind every <code>BINDER_TYPE_FD</code> entry. The receiving thread installs those files in its own FD table when it reads the transaction (Figure 5).</p>
+<p>In <code>IPCThreadState.cpp</code>, <code>executeCommand(BR_TRANSACTION)</code> wraps that kernel slice in a stack <code>Parcel buffer</code> via <code>ipcSetDataReference(..., freeBuffer)</code>.
+Because all concurrent incoming transactions share that ~1 MiB mapping, <code>system_server</code> cannot retain pointers into <code>mVMStart</code> after <code>onTransact</code> returns; for synchronous transactions, <code>IPCThreadState</code> runs <code>buffer.setDataSize(0)</code>, which closes the buffer's FDs and queues <code>BC_FREE_BUFFER</code> so it goes to the driver ahead of <code>BC_REPLY</code>.
+When <code>BaseBundle</code> copies its slice via <code>appendFrom()</code> (Figure 5), <code>appendFrom()</code> calls <code>fcntl(fd, F_DUPFD_CLOEXEC, 0)</code> to create a second FD (with <code>cookie = 1</code>) owned by the heap <code>Parcel</code>. When <code>IPCThreadState</code> closes the transient kernel-installed FD at transaction teardown, the duplicate FD keeps the shared <code>memfd</code> or <code>ashmem</code> inode open in <code>system_server</code>.</p>
+
+<figure>
+<figcaption><b>Figure 5. End-to-end kernel translation and FD duplication swimlane from sender app to <code>system_server</code> heap.</b> This sequence explains why <code>Parcel.cpp</code> tracks FD ownership two ways (a kernel-borrowed buffer owns every FD in it and closes them all with <code>closeFileDescriptors()</code>, while a heap <code>Parcel</code> closes only FDs marked <code>cookie == 1</code>, which <code>appendFrom</code> sets on each duplicate), and how an app's <code>memfd</code> Bitmap becomes an independent open file descriptor pinned inside <code>system_server</code>.</figcaption>
+<svg viewBox="0 0 1000 312" role="img" aria-label="Swimlane of Binder transaction from sender Parcel through kernel driver to IPCThreadState and BaseBundle appendFrom">
+  <text x="10" y="18" class="th">1 · sender app (heap parcel)</text>
+  <text x="262" y="18" class="th">2 · /dev/binder driver</text>
+  <text x="506" y="18" class="th">3 · IPCThreadState (stack parcel)</text>
+  <text x="758" y="18" class="th">4 · BaseBundle (heap parcel)</text>
+
+  <rect x="10" y="28" width="236" height="270" rx="2" class="panel"/>
+  <rect x="260" y="28" width="230" height="270" rx="2" class="panel"/>
+  <rect x="504" y="28" width="238" height="270" rx="2" class="panel"/>
+  <rect x="756" y="28" width="234" height="270" rx="2" class="panel"/>
+
+  <rect x="22" y="42" width="212" height="78" rx="2" class="b"/>
+  <text x="34" y="61" class="tb">Write Bundle + Bitmap</text>
+  <text x="34" y="78" class="tms">mOwner = nullptr (malloc)</text>
+  <text x="34" y="94" class="tms">TYPE_BINDER (local ptr)</text>
+  <text x="34" y="110" class="tms">TYPE_FD: fd=23 (memfd)</text>
+
+  <path d="M234,80 L270,80" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="272" y="42" width="206" height="94" rx="2" class="ba"/>
+  <text x="284" y="61" class="tb ta">binder_transaction()</text>
+  <text x="284" y="78" class="tms">1 copy -&gt; target mmap</text>
+  <text x="284" y="94" class="tms">BINDER -&gt; TYPE_HANDLE</text>
+  <text x="284" y="110" class="tms">FD: fget() + fixup queued</text>
+  <text x="284" y="126" class="ts">cookie passed through as sent</text>
+
+  <path d="M478,88 L514,88" class="lnv" marker-end="url(#ahv)"/>
+
+  <rect x="516" y="42" width="214" height="94" rx="2" class="bv"/>
+  <text x="528" y="61" class="tb tv">ipcSetDataReference()</text>
+  <text x="528" y="78" class="tms">mOwner = freeBuffer</text>
+  <text x="528" y="94" class="tms">mData -&gt; ~1 MiB mmap</text>
+  <text x="528" y="110" class="tms">fd=94 installed on read</text>
+  <text x="528" y="126" class="ts">0 B in Scudo malloc</text>
+
+  <path d="M730,104 L766,104" class="lnr" marker-end="url(#ahr)"/>
+
+  <rect x="768" y="42" width="210" height="114" rx="2" class="br"/>
+  <text x="780" y="61" class="tb tr">p.appendFrom(buf, ...)</text>
+  <text x="780" y="78" class="tms">mOwner = nullptr</text>
+  <text x="780" y="94" class="tms">malloc(max(1.5x len, 128))</text>
+  <text x="780" y="110" class="tms">IBinder-&gt;incStrong()</text>
+  <text x="780" y="126" class="tms tw">dup(94) -&gt; fd=95 [cookie=1]</text>
+  <text x="780" y="142" class="ts">Stored in mParcelledData</text>
+
+  <path d="M623,136 L623,178" class="lng" marker-end="url(#ahg)"/>
+
+  <rect x="516" y="180" width="214" height="104" rx="2" class="bg"/>
+  <text x="528" y="200" class="tb tg">Before BC_REPLY</text>
+  <text x="528" y="218" class="tms">buffer.setDataSize(0):</text>
+  <text x="528" y="234" class="tms">-&gt; closeFileDescriptors(0)</text>
+  <text x="528" y="250" class="tms">   closes transient fd=94</text>
+  <text x="528" y="266" class="tms">-&gt; BC_FREE_BUFFER queued</text>
+
+  <path d="M516,258 L478,258" class="lng" marker-end="url(#ahg)"/>
+
+  <rect x="272" y="214" width="206" height="70" rx="2" class="bg"/>
+  <text x="284" y="234" class="tb tg">mmap slice reclaimed</text>
+  <text x="284" y="251" class="ts">Ready for next incoming</text>
+  <text x="284" y="267" class="ts">Binder transaction</text>
+
+  <rect x="22" y="214" width="212" height="70" rx="2" class="b0" stroke-dasharray="4 3"/>
+  <text x="34" y="234" class="tb">Sender recycles / exits</text>
+  <text x="34" y="251" class="tms">Closes sender fd=23</text>
+  <text x="34" y="267" class="ts">Process can even die</text>
+
+  <rect x="768" y="180" width="210" height="104" rx="2" class="bw"/>
+  <text x="780" y="200" class="tb tw">Survives in system_server</text>
+  <text x="780" y="218" class="tms">Heap mData + mObjects</text>
+  <text x="780" y="234" class="tms">fd=95 keeps memfd pages</text>
+  <text x="780" y="250" class="tms">HANDLE keeps BpBinder</text>
+  <text x="780" y="266" class="ts">Until destroy() or GC</text>
+</svg>
+</figure>
+
+<h3>BaseBundle.readFromParcelInner and the four-state LazyValue lifecycle</h3>
+<p>Apps pass custom <code>Parcelable</code> classes inside <code>Intent</code> extras, notification extras, and saved-state bundles.
+Because <code>system_server</code> lacks the app's APK <code>ClassLoader</code>—and running untrusted app <code>Parcelable</code> constructors inside <code>system_server</code> would open deserialization exploits—<code>BaseBundle.java</code> defers deserialization by copying the raw bytes into an owned heap <code>Parcel</code> during <code>readFromParcelInner()</code>:</p>
+
+<pre><code><span class="src">frameworks/base/core/java/android/os/BaseBundle.java · readFromParcelInner()</span>Parcel p = Parcel.obtain();
+p.setDataPosition(0);
+<span class="hl">p.appendFrom(parcel, offset, length); <span class="c">// malloc(max(length * 3/2, 128)) + memcpy + incStrong(binders) + dup(FDs)</span></span>
+p.adoptClassCookies(parcel);
+mParcelledData = p; <span class="c">// State 1: mMap remains null until any key is read</span></code></pre>
+
+<p>From that initial copy, a <code>BaseBundle</code> moves through a four-state machine governed by <code>mParcelledData</code>, <code>mMap</code>, <code>mWeakParcelledData</code>, <code>mLazyValues</code>, and <code>mOwnsLazyValues</code> (Figures 6 and 7):</p>
+<ol>
+  <li><b>State 1 — Fully parcelled (<code>mParcelledData != null</code>, <code>mMap == null</code>):</b> Zero keys have been read yet (for example, <code>ActivityRecord.mIcicle</code> or <code>PendingIntentRecord.Key.requestIntent.mExtras</code>). Calling <code>bundle.hasFileDescriptors()</code> scans <code>mParcelledData</code> directly in C++ without unparcelling. Cloning via <code>new Intent(orig)</code> or <code>new Bundle(orig)</code> calls <code>appendFrom()</code> again, allocating a second heap buffer and duplicating every FD a second time.</li>
+  <li><b>State 2a — Unparcelled with zero lazy items (<code>numLazyValues == 0</code>):</b> When code reads any key (e.g. <code>extras.getBoolean(...)</code>), <code>initializeFromParcelLocked()</code> runs <code>Parcel.readArrayMap()</code>. Primitives, <code>String</code>s, and nested <code>Bundle</code>s are materialized eagerly (each nested <code>Bundle</code> makes its own <code>appendFrom()</code> copy). If every entry was eager, <code>BaseBundle</code> calls <code>parcelledData.recycle()</code> immediately, freeing <code>mData</code>.</li>
+  <li><b>State 2b — Partially unparcelled with <code>LazyValue</code> entries (<code>mLazyValues &gt; 0</code>):</b> Length-prefixed values—<code>VAL_PARCELABLE</code>, <code>VAL_LIST</code>, <code>VAL_MAP</code>, <code>VAL_PARCELABLEARRAY</code>, <code>VAL_OBJECTARRAY</code>, <code>VAL_SPARSEARRAY</code>, and <code>VAL_SERIALIZABLE</code>—store a 4-byte byte-length header right after their 4-byte type tag in <code>mData</code> (Figure 7b). <code>Parcel.readLazyValue()</code> reads <code>type</code> and <code>length</code>, advances <code>mDataPos</code> by <code>length</code> bytes in O(1) without loading any <code>ClassLoader</code>, and inserts <code>new Parcel.LazyValue(sourceParcel, startPos, totalLen, type, bundle)</code> into <code>mMap</code>. <code>BaseBundle</code> clears <code>mParcelledData = null</code> and stores <code>mWeakParcelledData = new WeakReference&lt;&gt;(parcelledData)</code>; each <code>LazyValue.mSource</code> strong reference keeps the entire backing <code>Parcel</code>—including already-parsed string bytes and duplicated FDs—allocated.</li>
+  <li><b>State 3 vs State 4 — Early <code>destroy()</code> vs shared <code>LazyValue</code> copies:</b> Calling <code>getParcelable(key)</code> invokes <code>unwrapLazyValueFromMapLocked()</code>, which runs <code>LazyValue.apply()</code> (deserializing the slice and setting <code>LazyValue.mSource = null</code>), replaces the map entry with the materialized object, and decrements <code>mLazyValues</code>. When <code>mOwnsLazyValues</code> is true and <code>mLazyValues</code> reaches <code>0</code>, <code>BaseBundle</code> calls <code>mWeakParcelledData.get().destroy()</code> immediately. If code copies an already-unparcelled <code>Bundle</code> via <code>new Bundle(unparcelledSrc)</code>, the copy constructor shares the same <code>LazyValue</code> objects across both <code>ArrayMap</code>s and sets <code>mOwnsLazyValues = false</code> on both bundles, skipping eager <code>parcel.destroy()</code> so the native buffer remains allocated until GC and finalization.</li>
+</ol>
+
+<figure>
+<figcaption><b>Figure 6. Overview from transient Binder <code>mmap</code> to heap copy to <code>LazyValue</code> retention in <code>system_server</code>.</b> Step 1 borrows the ~1 MiB driver <code>mmap</code> and frees it before replying. Step 2 copies the <code>Bundle</code> slice into Scudo <code>malloc</code> and duplicates FDs. Step 3 reads one boolean key, leaving unread <code>Parcelable</code> entries wrapped in <code>LazyValue</code> instances that pin the entire heap <code>Parcel</code>.</figcaption>
+<svg viewBox="0 0 1000 306" role="img" aria-label="Flow from Binder mmap to BaseBundle appendFrom copy to LazyValue retention">
+  <text x="10" y="18" class="th">1 · binder driver mmap (transient)</text>
+  <rect x="10" y="28" width="276" height="258" rx="2" class="panel"/>
+  <rect x="22" y="40" width="252" height="50" rx="2" class="b"/>
+  <text x="34" y="60" class="tb">App process calls system_server</text>
+  <text x="34" y="78" class="tms">notify() / getIntentSender() / stop</text>
+
+  <path d="M148,90 L148,112" class="lna" marker-end="url(#aha)"/>
+  <text x="156" y="105" class="tms">1 kernel copy</text>
+
+  <rect x="22" y="114" width="252" height="86" rx="2" class="ba"/>
+  <text x="34" y="134" class="tb ta">/dev/binder mmap (~1 MiB)</text>
+  <text x="34" y="152" class="tms">stack Parcel: ipcSetDataReference</text>
+  <text x="34" y="168" class="tms">mOwner = IPCThreadState::freeBuffer</text>
+  <text x="34" y="184" class="ts">0 B in malloc · shared process-wide</text>
+
+  <path d="M148,200 L148,222" class="lng" marker-end="url(#ahg)"/>
+  <rect x="22" y="224" width="252" height="48" rx="2" class="bg"/>
+  <text x="34" y="244" class="tb tg">Freed before BC_REPLY</text>
+  <text x="34" y="261" class="tms">setDataSize(0) -&gt; BC_FREE_BUFFER</text>
+
+  <path d="M274,154 L322,154" class="lnr" marker-end="url(#ahr)"/>
+  <text x="298" y="146" class="tms tr" text-anchor="middle">copy</text>
+
+  <text x="324" y="18" class="th">2 · BaseBundle copy (heap)</text>
+  <rect x="324" y="28" width="308" height="258" rx="2" class="panel"/>
+  <rect x="336" y="40" width="284" height="58" rx="2" class="b"/>
+  <text x="348" y="60" class="tb">BaseBundle (parcelled state)</text>
+  <text x="348" y="78" class="tms">mParcelledData = p · mMap = null</text>
+  <text x="348" y="92" class="ts">safe without app ClassLoader</text>
+
+  <path d="M478,98 L478,120" class="lnr" marker-end="url(#ahr)"/>
+
+  <rect x="336" y="122" width="284" height="92" rx="2" class="br"/>
+  <text x="348" y="142" class="tb tr">Heap Parcel p (Parcel::appendFrom)</text>
+  <text x="348" y="160" class="tms">mData = malloc(max(1.5x len, 128))</text>
+  <text x="348" y="176" class="tms">mObjects = malloc(cap * 8)</text>
+  <text x="348" y="192" class="tms">acquire_object: IBinder-&gt;incStrong</text>
+  <text x="348" y="206" class="tms">fcntl(F_DUPFD_CLOEXEC) on every FD</text>
+
+  <rect x="336" y="224" width="284" height="48" rx="2" class="bw"/>
+  <text x="348" y="244" class="tb tw">new Intent(orig) / new Bundle(orig)</text>
+  <text x="348" y="261" class="ts">runs appendFrom again -&gt; 2nd malloc + dup</text>
+
+  <path d="M620,70 L668,70" class="lnw" marker-end="url(#ahw)"/>
+  <text x="644" y="62" class="tms tw" text-anchor="middle">get*()</text>
+
+  <text x="670" y="18" class="th">3 · partial unparcel -&gt; LazyValue pin</text>
+  <rect x="670" y="28" width="320" height="258" rx="2" class="panel"/>
+  <rect x="682" y="40" width="296" height="90" rx="2" class="b"/>
+  <text x="694" y="60" class="tb">BaseBundle (unparcelled mMap)</text>
+  <text x="694" y="78" class="tms">mParcelledData = null</text>
+  <text x="694" y="94" class="tms">"android.allowDuringSetup" -&gt; TRUE (eager)</text>
+  <text x="694" y="110" class="tms tr">"android.picture" -&gt; LazyValue(pos,len)</text>
+  <text x="694" y="124" class="tms tr">"app_custom_obj"  -&gt; LazyValue(pos,len)</text>
+
+  <path d="M736,130 L736,156" class="lnr" marker-end="url(#ahr)"/>
+  <text x="746" y="148" class="tms tr">LazyValue.mSource (strong ref)</text>
+
+  <rect x="682" y="158" width="296" height="114" rx="2" class="br"/>
+  <text x="694" y="178" class="tb tr">Entire source Parcel stays live</text>
+  <text x="694" y="196" class="ts">Even already-parsed strings stay in mData</text>
+  <rect x="694" y="206" width="132" height="54" rx="2" fill="url(#hatchr)" stroke="var(--bad-bd)"/>
+  <text x="760" y="230" class="tms tr" text-anchor="middle">dead mData</text>
+  <text x="760" y="246" class="tms tr" text-anchor="middle">bytes</text>
+  <rect x="834" y="206" width="132" height="54" rx="2" class="bw"/>
+  <text x="900" y="228" class="tms tw" text-anchor="middle">dup'd memfd</text>
+  <text x="900" y="245" class="tms tw" text-anchor="middle">+ IBinder refs</text>
+</svg>
+</figure>
+
+<figure>
+<figcaption><b>Figure 7. <code>BaseBundle</code> state transitions and how <code>Parcel.LazyValue</code> skips and pins length-prefixed slices inside <code>mData</code>.</b> Top: unparcelling frees the <code>Parcel</code> immediately only when <code>numLazyValues == 0</code>, whereas shallow-copying an unparcelled <code>Bundle</code> clears <code>mOwnsLazyValues</code> on both copies and disables eager <code>destroy()</code>. Bottom: exact wire header (<code>[type | length | payload]</code>) recorded by <code>LazyValue</code> in <code>Parcel.java</code>.</figcaption>
+<svg viewBox="0 0 1000 356" role="img" aria-label="BaseBundle four-state lifecycle machine and LazyValue wire header layout">
+  <text x="10" y="18" class="th">a · BaseBundle &amp; LazyValue state machine (BaseBundle.java)</text>
+
+  <rect x="10" y="30" width="218" height="118" rx="2" class="ba"/>
+  <text x="22" y="50" class="tb ta">State 1: Parcelled</text>
+  <text x="22" y="68" class="tms">mParcelledData = P</text>
+  <text x="22" y="84" class="tms">mMap = null</text>
+  <text x="22" y="100" class="tms">mOwnsLazyValues = true</text>
+  <text x="22" y="118" class="ts">new Bundle(s1) -&gt; appendFrom</text>
+  <text x="22" y="134" class="ts">(2nd malloc + 2nd dup FDs)</text>
+
+  <path d="M228,60 L284,60" class="lng" marker-end="url(#ahg)"/>
+  <text x="256" y="52" class="tms tg" text-anchor="middle">lazy == 0</text>
+
+  <rect x="286" y="28" width="246" height="58" rx="2" class="bg"/>
+  <text x="298" y="48" class="tb tg">State 2a: All-Eager Map</text>
+  <text x="298" y="65" class="tms">P.recycle() runs immediately</text>
+  <text x="298" y="79" class="ts">0 B native Parcel kept</text>
+
+  <path d="M228,116 L284,116" class="lnr" marker-end="url(#ahr)"/>
+  <text x="256" y="108" class="tms tr" text-anchor="middle">lazy &gt; 0</text>
+
+  <rect x="286" y="96" width="294" height="84" rx="2" class="br"/>
+  <text x="298" y="116" class="tb tr">State 2b: Partial Unparcel (Pinned)</text>
+  <text x="298" y="133" class="tms">mParcelledData = null · mLazyValues = K</text>
+  <text x="298" y="149" class="tms">mWeakParcelledData = WeakRef(P)</text>
+  <text x="298" y="165" class="tms">Each LazyValue.mSource = P (strong ref)</text>
+
+  <path d="M580,114 L608,114 L608,60 L690,60" class="lng" marker-end="url(#ahg)"/>
+  <text x="649" y="52" class="tms tg" text-anchor="middle">unwrap last</text>
+
+  <rect x="692" y="28" width="298" height="66" rx="2" class="bg"/>
+  <text x="704" y="48" class="tb tg">State 3: Fully Unwrapped</text>
+  <text x="704" y="65" class="tms">mLazyValues==0 &amp;&amp; mOwnsLazyValues</text>
+  <text x="704" y="81" class="tms">-&gt; mWeakParcelledData.get().destroy()</text>
+
+  <path d="M580,152 L690,152" class="lnw" marker-end="url(#ahw)"/>
+  <text x="635" y="144" class="tms tw" text-anchor="middle">copy Bundle</text>
+
+  <rect x="692" y="106" width="298" height="74" rx="2" class="bw"/>
+  <text x="704" y="126" class="tb tw">State 4: Shared LazyValues</text>
+  <text x="704" y="143" class="tms">mOwnsLazyValues = false on BOTH</text>
+  <text x="704" y="159" class="ts">Even after all keys unwrap, destroy() is</text>
+  <text x="704" y="173" class="ts">skipped; P waits for GC + finalize()</text>
+
+  <text x="10" y="208" class="th">b · wire slice skipped by Parcel.readLazyValue() inside P.mData</text>
+  <rect x="10" y="218" width="980" height="126" rx="2" class="panel"/>
+
+  <rect x="24" y="232" width="166" height="58" rx="2" fill="url(#hatchr)" stroke="var(--bad-bd)"/>
+  <text x="107" y="254" class="tb tr" text-anchor="middle">Entry 0 (eager read)</text>
+  <text x="107" y="272" class="tms" text-anchor="middle">"android.allowDuringSetup"</text>
+  <text x="107" y="285" class="ts" text-anchor="middle">dead bytes stay in mData</text>
+
+  <rect x="194" y="232" width="118" height="58" rx="2" class="b"/>
+  <text x="253" y="254" class="tb" text-anchor="middle">Entry 1 key</text>
+  <text x="253" y="272" class="tms" text-anchor="middle">"android.picture"</text>
+
+  <rect x="316" y="232" width="128" height="58" rx="2" class="bv"/>
+  <text x="380" y="251" class="tms tv" text-anchor="middle">offset a (4 B)</text>
+  <text x="380" y="268" class="tb tv" text-anchor="middle">VAL_PARCELABLE</text>
+  <text x="380" y="283" class="tms" text-anchor="middle">mType = 4</text>
+
+  <rect x="446" y="232" width="128" height="58" rx="2" class="bv"/>
+  <text x="510" y="251" class="tms tv" text-anchor="middle">offset b (4 B)</text>
+  <text x="510" y="268" class="tb tv" text-anchor="middle">length = d - c</text>
+  <text x="510" y="283" class="tms" text-anchor="middle">byte count</text>
+
+  <rect x="576" y="232" width="268" height="58" rx="2" class="bw"/>
+  <text x="710" y="251" class="tms tw" text-anchor="middle">offset c .. d (skipped in O(1))</text>
+  <text x="710" y="268" class="tb tw" text-anchor="middle">Creator name + Bitmap + TYPE_FD</text>
+  <text x="710" y="283" class="ts" text-anchor="middle">Unparsed until LazyValue.apply() runs</text>
+
+  <rect x="846" y="232" width="130" height="58" rx="2" class="b"/>
+  <text x="911" y="256" class="tb" text-anchor="middle">Entry 2 ...</text>
+  <text x="911" y="274" class="tms" text-anchor="middle">setDataPos(d)</text>
+
+  <line x1="316" y1="298" x2="844" y2="298" class="lnv"/>
+  <line x1="316" y1="293" x2="316" y2="303" class="lnv"/>
+  <line x1="844" y1="293" x2="844" y2="303" class="lnv"/>
+  <text x="580" y="315" class="tms tv" text-anchor="middle">LazyValue { mSource = P, mPosition = a, mLength = d - a }  (re-serialization calls out.appendFrom(P, a, d - a))</text>
+  <text x="580" y="333" class="ts" text-anchor="middle">Because system_server rarely reads "android.picture" or custom app keys, mSource stays non-null for the lifetime of the Bundle</text>
+</svg>
+</figure>
+
+<h2 id="holders"><span class="n">3</span>Cross-process retention and system_server holders</h2>
+<p>Three kernel mechanisms allow a <code>Parcel</code> or Binder token in one process to keep memory allocated in another:</p>
+<ol>
+  <li><b>Remote <code>BpBinder</code> → local <code>JavaBBinderExt</code> JNI global ref.</b> When an app holds a <code>BinderProxy</code> (or an unrecycled <code>Parcel</code> containing <code>BINDER_TYPE_HANDLE</code>), <code>BpBinder.cpp</code> holds a kernel strong reference (<code>BC_ACQUIRE</code>) on the target binder node. In the owning process, <code>android_util_Binder.cpp</code> keeps a JNI <code>NewGlobalRef</code> inside <code>JavaBBinderExt</code> until the kernel delivers <code>BR_RELEASE</code>. Any Java fields reachable from that <code>Binder</code> subclass—including parcelled <code>Bundle</code> buffers—cannot be garbage-collected while any client proxy lives.</li>
+  <li><b>Duplicated <code>ashmem</code> and <code>memfd</code> descriptors.</b> Because <code>Parcel::appendFrom()</code> duplicates every file descriptor in <code>mObjects</code>, <code>system_server</code>'s copy of a <code>Bundle</code> holds its own open file description on the underlying anonymous shared memory inode. Even if the sending app unmaps its <code>Bitmap</code> or dies and gets reaped, those physical RAM or zram pages persist until <code>system_server</code> destroys its <code>Parcel</code>.</li>
+  <li><b>Unreleased Binder <code>mmap</code> slices.</b> A client that forgets to call <code>reply.recycle()</code> pins a slice of its own ~1 MiB Binder <code>mmap</code> until finalization; if enough slices accumulate, subsequent incoming calls fail with <code>FAILED_TRANSACTION</code>.</li>
+</ol>
+
+<figure>
+<figcaption><b>Figure 8. Two cross-process retention loops between an app and <code>system_server</code>.</b> Left: an app holding a <code>PendingIntent</code> (<code>BpBinder</code>) keeps <code>JavaBBinderExt</code>'s JNI global reference rooted in <code>system_server</code>, pinning <code>PendingIntentRecord.Key.requestIntent</code> and its heap <code>Parcel</code>. Right: a posted notification's <code>LazyValue</code> holds a duplicated <code>memfd</code> descriptor that keeps pixel pages resident even after the posting app is killed.</figcaption>
+<svg viewBox="0 0 1000 248" role="img" aria-label="Cross-process memory retention via JavaBBinderExt global ref and duplicated memfd">
+  <text x="10" y="18" class="th">loop a · app proxy pins system_server heap parcel</text>
+  <rect x="10" y="28" width="476" height="208" rx="2" class="panel"/>
+
+  <rect x="22" y="42" width="180" height="72" rx="2" class="b"/>
+  <text x="34" y="62" class="tb">Client App Process</text>
+  <text x="34" y="80" class="tms">PendingIntent</text>
+  <text x="34" y="96" class="tms">-&gt; BinderProxy / BpBinder</text>
+
+  <path d="M202,78 L266,78" class="lnv" marker-end="url(#ahv)"/>
+  <text x="234" y="70" class="tms tv" text-anchor="middle">BC_ACQUIRE</text>
+
+  <rect x="268" y="42" width="204" height="72" rx="2" class="bv"/>
+  <text x="280" y="62" class="tb tv">JavaBBinderExt</text>
+  <text x="280" y="80" class="tms">JNI NewGlobalRef (GC root)</text>
+  <text x="280" y="96" class="tms">-&gt; PendingIntentRecord</text>
+
+  <path d="M370,114 L370,142" class="lnr" marker-end="url(#ahr)"/>
+
+  <rect x="22" y="144" width="450" height="78" rx="2" class="br"/>
+  <text x="34" y="164" class="tb tr">PendingIntentRecord.Key.requestIntent.mExtras</text>
+  <text x="34" y="182" class="tms">Copied via new Intent(intent) -&gt; appendFrom() into Scudo malloc</text>
+  <text x="34" y="198" class="ts">No DeathRecipient; released only after all proxies drop + system_server GC + 2 finalizers</text>
+
+  <text x="514" y="18" class="th">loop b · system_server LazyValue pins shared memfd after app death</text>
+  <rect x="514" y="28" width="476" height="208" rx="2" class="panel"/>
+
+  <rect x="526" y="42" width="186" height="72" rx="2" class="b0" stroke-dasharray="4 3"/>
+  <text x="538" y="62" class="tb">Posting App (later killed)</text>
+  <text x="538" y="80" class="tms">notify(Notification)</text>
+  <text x="538" y="96" class="ts">process exits; app FD closed</text>
+
+  <path d="M712,78 L764,78" class="lnw" marker-end="url(#ahw)"/>
+  <text x="738" y="70" class="tms tw" text-anchor="middle">dup FD</text>
+
+  <rect x="766" y="42" width="212" height="72" rx="2" class="ba"/>
+  <text x="778" y="62" class="tb ta">NotificationRecord</text>
+  <text x="778" y="80" class="tms">extras.mMap["android.picture"]</text>
+  <text x="778" y="96" class="tms">-&gt; LazyValue.mSource (Parcel)</text>
+
+  <path d="M872,114 L872,142" class="lnw" marker-end="url(#ahw)"/>
+
+  <rect x="526" y="144" width="452" height="78" rx="2" class="bw"/>
+  <text x="538" y="164" class="tb tw">Kernel memfd / ashmem inode + Parcel mData + mObjects</text>
+  <text x="538" y="182" class="tms">Bitmap &gt;12 KiB sealed memfd FD owned by Parcel mObjects[i]</text>
+  <text x="538" y="198" class="ts">Survives app death; stays resident until notification cancel or package removal</text>
+</svg>
+</figure>
+
+<h3>System_server subsystems that retain app Parcel memory</h3>
+<p>Native allocation stacks point at <code>BaseBundle.readFromParcelInner</code>, which records where buffers are allocated rather than which Java objects retain them.
+Across <code>frameworks/base/services</code>, nine subsystems retain most app-originated <code>Parcel</code> and shared-memory buffers (Table 2):</p>
+<ul>
+  <li><b><code>PendingIntentRecord</code> (<code>PendingIntentRecord.java</code>, <code>PendingIntentController.java</code>).</b> A client's <code>PendingIntent</code> wraps only an <code>IIntentSender</code> Binder token; the actual <code>Intent</code> and its <code>mExtras</code> live in <code>system_server</code> inside <code>PendingIntentRecord.Key</code> (<code>requestIntent</code>, <code>allIntents</code>, <code>options</code>). In <code>ActivityManagerService.java</code>, <code>getIntentSenderWithFeatureAsApp()</code> checks <code>intent.hasFileDescriptors()</code> directly on <code>mParcelledData</code> without unparcelling, then clones via <code>new Intent(intent)</code>, producing a fresh <code>appendFrom()</code> heap buffer that sits parcelled. The controller's map (<code>mIntentSenderRecords</code>) stores only a <code>WeakReference</code>; what keeps the record alive is <code>JavaBBinderExt</code>'s JNI global ref while any client process holds a proxy, or local references from alarms and notifications. No <code>DeathRecipient</code> is used.</li>
+  <li><b><code>NotificationRecord</code> (<code>NotificationRecord.java</code>, <code>NotificationManagerService.java</code>).</b> Holds <code>StatusBarNotification</code> → <code>Notification.java</code>, including <code>extras</code> (lazy <code>Bundle</code>), <code>contentView</code>/<code>bigContentView</code> (eager <code>RemoteViews</code>), and <code>contentIntent</code> (pinning a <code>PendingIntentRecord</code>). Enqueueing runs <code>fixNotification()</code>. For senders other than the system, the <code>NotificationRecord</code> constructor also walks every URI in the notification (<code>Notification.visitUris()</code>), which unwraps message lists, people and most icon extras. The big picture (<code>"android.picture"</code>) and keys the system does not know stay <code>LazyValue</code> entries that pin the <code>Parcel</code> buffer and its duplicated <code>memfd</code> descriptors even after the posting app dies. Behind a feature flag, Android 17 can instead replace the big picture with a content-URI icon. Historical <code>Archive</code> entries call <code>cloneLight()</code> → <code>lightenPayload()</code> to strip <code>Parcelable</code> and array entries.</li>
+  <li><b><code>AppWidgetServiceImpl.Widget</code> (<code>AppWidgetServiceImpl.java</code>, where <code>Widget</code> is a nested class).</b> Stores <code>views</code>, <code>maskedViews</code> (<code>RemoteViews.java</code>), and <code>options</code> (lazy <code>Bundle</code>), alongside <code>Provider.generatedPreviews</code>. Unlike <code>Bundle</code>, <code>RemoteViews(Parcel)</code> unparcels its action list and <code>BitmapCache</code> eagerly on receipt (capped by <code>AppWidgetServiceImpl</code>'s <code>mMaxWidgetBitmapMemory</code> at <code>6 * screenWidth * screenHeight</code> bytes, with Bitmaps above 12 KiB backed by <code>memfd</code>), except reflection actions of type <code>BUNDLE</code>, which retain lazy <code>Parcel</code> copies.</li>
+  <li><b><code>ActivityRecord</code> saved state (<code>ActivityRecord.java</code>, <code>ActivityClientController.java</code>).</b> When a backgrounded activity stops, <code>activityStopped()</code> verifies <code>!icicle.hasFileDescriptors()</code> without unparcelling and stores <code>mIcicle</code> completely parcelled in <code>system_server</code> alongside <code>ActivityRecord.intent</code>. If <code>lmkd</code> (the low-memory killer daemon) kills the cached app, <code>mIcicle</code> stays in <code>system_server</code>'s native heap so Android can recreate the activity later, releasing only when the activity resumes (<code>setSavedState(null)</code>) or finishes.</li>
+  <li><b><code>JobStatus</code>, <code>Alarm</code>, <code>StickyBroadcast</code>, <code>ClipboardService</code>, and <code>MediaSessionRecord</code>.</b> <code>JobInfo.java</code> holds lazy <code>extras</code> (<code>PersistableBundle</code>) and <code>transientExtras</code> (<code>Bundle</code>, which can carry arbitrary <code>Parcelable</code>s and <code>IBinder</code>s); <code>Alarm.java</code> pins <code>PendingIntentRecord</code> via <code>operation</code>; <code>BroadcastController.java</code> retains cloned <code>StickyBroadcast.intent</code> extras across sender death; <code>ClipboardService.java</code> retains per-user <code>primaryClip</code> extras; and <code>MediaSessionRecord.java</code> unparcels string URIs in <code>mMetadata</code> while leaving album-art <code>Bitmap</code>s as <code>LazyValue</code> entries until session close or <code>binderDied()</code>.</li>
+</ul>
+
+<p class="m"><b>Table 2.</b> <code>system_server</code> holders of app-originated <code>Parcel</code> memory.</p>
+<div class="tbl-wrap"><table>
+  <thead>
+    <tr>
+      <th>Subsystem holder</th>
+      <th>Retained payload fields</th>
+      <th>Parcel / buffer state</th>
+      <th>Survives app death</th>
+      <th>When native memory frees</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>PendingIntentRecord</code></td>
+      <td><code>Key.requestIntent</code>, <code>allIntents</code>, <code>options</code></td>
+      <td>Parcelled <code>mParcelledData</code> (<code>appendFrom</code> copy via <code>new Intent</code>)</td>
+      <td class="warn">Yes, if held by another process, alarm, or notification</td>
+      <td>Explicit cancel, package removal/force-stop, or last <code>BpBinder</code> drop + GC + finalizers</td>
+    </tr>
+    <tr>
+      <td><code>NotificationRecord</code></td>
+      <td><code>Notification.extras</code>, <code>contentView</code>, <code>contentIntent</code></td>
+      <td>Top-level unparcelled; <code>LazyValue</code> pins <code>Parcel</code> + <code>memfd</code> Bitmaps</td>
+      <td class="bad">Yes (active notifications stay posted)</td>
+      <td><code>cancelNotification</code>, package removal/restart, user stop, plus <code>Parcel.finalize()</code> if dropped</td>
+    </tr>
+    <tr>
+      <td><code>AppWidgetServiceImpl.Widget</code></td>
+      <td><code>views</code>, <code>maskedViews</code>, <code>options</code>, <code>generatedPreviews</code></td>
+      <td><code>RemoteViews</code> eager (<code>Bitmap</code> NAR + <code>memfd</code>); <code>options</code> + reflection bundles lazy</td>
+      <td class="bad">Yes (persists for launcher host)</td>
+      <td>Widget/host deletion, provider reset, or package uninstall</td>
+    </tr>
+    <tr>
+      <td><code>ActivityRecord</code></td>
+      <td><code>mIcicle</code>, <code>mPersistentState</code>, <code>intent</code>, <code>results</code></td>
+      <td><code>mIcicle</code> kept 100% parcelled (<code>mParcelledData</code>, no FDs allowed)</td>
+      <td class="bad">Yes (kept specifically to restore killed cached apps)</td>
+      <td><code>activityResumedLocked</code> (<code>setSavedState(null)</code>) or activity finish/destroy</td>
+    </tr>
+    <tr>
+      <td><code>JobStatus</code></td>
+      <td><code>JobInfo.extras</code>, <code>transientExtras</code>, <code>clipData</code></td>
+      <td>Lazy <code>mParcelledData</code> until read or persisted to XML</td>
+      <td class="bad">Yes (scheduled jobs outlive app process)</td>
+      <td>Job completion, explicit cancel, or <code>ACTION_PACKAGE_FULLY_REMOVED</code></td>
+    </tr>
+    <tr>
+      <td><code>AlarmManagerService.Alarm</code></td>
+      <td><code>operation</code> (<code>PendingIntent</code>) or <code>listener</code></td>
+      <td>Pins <code>PendingIntentRecord.Key</code> heap <code>Parcel</code></td>
+      <td class="bad">Yes for <code>PendingIntent</code>; no for <code>IAlarmListener</code> (<code>linkToDeath</code>)</td>
+      <td>Alarm delivery/cancel or package removal (<code>binderDied</code> for direct listeners)</td>
+    </tr>
+    <tr>
+      <td><code>StickyBroadcast</code></td>
+      <td><code>StickyBroadcast.intent</code> (<code>mExtras</code>)</td>
+      <td>Parcelled <code>appendFrom</code> copy via <code>new Intent(intent)</code></td>
+      <td class="bad">Yes (no death recipient on sender)</td>
+      <td>Matching sticky overwrite, <code>removeStickyBroadcast</code>, or user removal</td>
+    </tr>
+    <tr>
+      <td><code>ClipboardService</code></td>
+      <td><code>PerUserClipboard.primaryClip</code> (<code>Intent</code>, <code>mExtras</code>)</td>
+      <td>Lazy <code>Bundle</code> / <code>PersistableBundle</code> copies</td>
+      <td class="bad">Yes</td>
+      <td>Primary clip overwrite, auto-clear timeout, or user stop</td>
+    </tr>
+    <tr>
+      <td><code>MediaSessionRecord</code></td>
+      <td><code>mMetadata</code> (<code>MediaMetadata.mBundle</code>), <code>mExtras</code></td>
+      <td>Top-level unparcelled; artwork <code>Bitmap</code>s stay <code>LazyValue</code> + <code>memfd</code></td>
+      <td class="good">No (<code>linkToDeath</code> calls <code>onSessionDied</code>)</td>
+      <td>Session release, metadata replacement, or app process death</td>
+    </tr>
+  </tbody>
+</table></div>
+
+<div class="part">Part II · History</div>
+
+<h2 id="history-timeline"><span class="n">4</span>How Parcel has reported its native memory, 2009–2021</h2>
+<p>The history of <code>Parcel.java</code> and <code>android_os_Parcel.cpp</code> from Android 1.5 to Android 17 explains why <code>Parcel</code> uses static JNI methods, why it started reporting <code>ashmem</code> sizes to the GC in 2015, and why that reporting was removed in 2020 (Table 3).
+The 2020 change assumed that callers free a <code>Parcel</code>'s buffers with <code>recycle()</code> before it is garbage-collected. That holds for short request and reply parcels, but the <code>Parcel.LazyValue</code> mechanism added in Android 13 keeps <code>Bundle</code> copies unrecycled for as long as an unread entry remains (§2).</p>
+
+<p class="m"><b>Table 3.</b> Changes to how <code>Parcel</code> reports native memory. Commit IDs are in AOSP <code>frameworks/base</code>.</p>
+<div class="tbl-wrap"><table>
+  <thead>
+    <tr>
+      <th>Date &amp; Android release</th>
+      <th>Commit</th>
+      <th>What changed in Parcel.java &amp; android_os_Parcel.cpp</th>
+      <th>Impact on native memory accounting</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td data-sort="2009.03"><b>Mar 2009</b><br><span class="m">Android 1.5 (Cupcake)</span></td>
+      <td><code>9066cfe9886a</code> (initial AOSP import)</td>
+      <td>Initial open-source <code>Parcel.java</code>. Stores <code>private int mObject</code> and <code>private int mOwnObject</code>; every JNI method is an instance call that looks up <code>gParcelOffsets.mObject</code> via <code>parcelForJavaObject(env, obj)</code>; caches 6 instances in <code>Parcel[6]</code> arrays; uses <code>finalize() -&gt; destroy()</code>.</td>
+      <td class="bad">0 B reported to the Dalvik GC; <code>finalize()</code> is the only fallback for unrecycled <code>Parcel</code>s.</td>
+    </tr>
+    <tr>
+      <td data-sort="2012.03"><b>Mar 2012</b><br><span class="m">Android 4.1 (Jelly Bean)</span></td>
+      <td><code>047238ced42e</code></td>
+      <td><i>"Switch Parcel to static JNI calls, pass pointer."</i> Replaces instance JNI calls with <code>static</code> JNI methods taking an explicit <code>int nativePtr</code> (~3x faster <code>writeInt()</code>). Renames <code>mObject</code> → <code>mNativePtr</code> and <code>mOwnObject</code> → <code>boolean mOwnsNativeParcelObject</code>.</td>
+      <td>From here on, the C++ side of each JNI call receives only the native pointer, not the Java <code>Parcel</code> object.</td>
+    </tr>
+    <tr>
+      <td data-sort="2014.01"><b>Jan 2014</b><br><span class="m">Android 5.0 (Lollipop)</span></td>
+      <td><code>8ab665dda40a</code></td>
+      <td>64-bit ARM (<code>arm64-v8a</code>) transition widens <code>mNativePtr</code> and all JNI pointer parameters from <code>int</code> to <code>long</code>.</td>
+      <td><code>mNativePtr</code> widens from 4 to 8 bytes on LP64.</td>
+    </tr>
+    <tr>
+      <td data-sort="2015.10"><b>Oct 2015</b><br><span class="m">Android 7.0 (Nougat)</span></td>
+      <td><code>0450565d9a6d</code></td>
+      <td><b><code>Parcel</code> starts reporting <code>ashmem</code> sizes to the GC</b> (<i>"Track ashmem memory usage in Parcel"</i>). Unrecycled <code>Bundle</code>s could hold <code>Parcel</code>s with duplicated <code>ashmem</code> FDs while ART saw only small Java objects. The change makes 5 JNI downcalls (<code>nativeSetDataSize</code>, <code>nativeWriteFileDescriptor</code>, <code>nativeFreeBuffer</code>, <code>nativeUnmarshall</code>, <code>nativeAppendFrom</code>) return <code>jlong</code> (<code>parcel-&gt;getOpenAshmemSize()</code>) instead of <code>void</code>, and adds <code>updateNativeSize(long)</code>, which passes the change in size to <code>VMRuntime.registerNativeAllocation(delta)</code> / <code>registerNativeFree(-delta)</code>.</td>
+      <td class="warn">Reports open <code>ashmem</code> FD bytes to the ART GC, but <b>never <code>mData</code> or <code>mObjects</code> heap buffers</b>.</td>
+    </tr>
+    <tr>
+      <td data-sort="2019.10"><b>Oct 2019 – Jun 2020</b><br><span class="m">Android 11 / 12</span></td>
+      <td><code>012ab8e9faf8</code><br><code>bfac2652b0f4</code></td>
+      <td>Marks non-primitive marshalling methods <code>@FastNative</code> (~80 ns faster per call) and converts <code>nativeWrite{Int,Long,Float,Double}</code> to <code>@CriticalNative</code> returning <code>int</code> (<code>status_t</code>) instead of throwing exceptions from C++.</td>
+      <td>Primitive writers no longer receive <code>JNIEnv*</code> or leave the Runnable state.</td>
+    </tr>
+    <tr>
+      <td data-sort="2020.09"><b>Sep 2020</b><br><span class="m">Android 12 (S)</span></td>
+      <td><code>c20809950691</code></td>
+      <td><b>The <code>ashmem</code> size reporting is removed.</b> Deletes <code>updateNativeSize()</code> and <code>import dalvik.system.VMRuntime</code>, and turns the 5 JNI methods back to <code>void</code>, for a ~3% <code>ParcelObtainPerfTest</code> improvement. The reasoning is that variable-sized allocations are already freed by explicit <code>recycle()</code> before GC runs. (The linked-list pool had replaced the 6-slot arrays in an earlier, separate change.)</td>
+      <td class="bad">Removes all GC native accounting from <code>Parcel</code>.</td>
+    </tr>
+    <tr>
+      <td data-sort="2021.09"><b>2021</b><br><span class="m">Android 13 (T)</span></td>
+      <td><code>5e5d77690644</code><br><code>9293dca91c5a</code></td>
+      <td>Android 13 adds item-wise <code>Parcel.LazyValue</code> unparcelling to <code>BaseBundle.java</code>. Unread length-prefixed entries stay wrapped in <code>LazyValue</code> instances whose <code>mSource</code> field holds a strong reference to the backing <code>Parcel</code>. These two follow-up commits make <code>LazyValue.writeToParcel()</code> use <code>appendFrom</code> and synchronize <code>LazyValue.get()</code>.</td>
+      <td class="bad">In <code>system_server</code>, reading one primitive key from a <code>Bundle</code> leaves <code>mSource</code> unrecycled for as long as any unread length-prefixed key remains in the map.</td>
+    </tr>
+    <tr>
+      <td data-sort="2021.10"><b>Oct 2021</b><br><span class="m">Android 13 (T)</span></td>
+      <td><code>4760ca91def2</code></td>
+      <td>Renames the standalone <code>@CriticalNative</code> helper <code>getBlobAshmemSize()</code> → <code>getOpenAshmemSize()</code> in <code>Parcel.java</code>. It is <code>@hide</code> and documented as being for testing.</td>
+      <td><code>nativeGetOpenAshmemSize</code> can still be called on demand, but nothing reports its result to the GC or to heap dumps.</td>
+    </tr>
+  </tbody>
+</table></div>
+
+
+<h2 id="sources">Sources</h2>
+<p class="m">All paths are in AOSP as of Android 17, except the Binder driver, which is in the Android common kernel.</p>
+<ul>
+  <li><code>Parcel</code> and Binder, Java and JNI: <code>frameworks/base/core/java/android/os/Parcel.java</code> (pools, <code>recycle()</code>, <code>LazyValue</code>), <code>frameworks/base/core/java/android/os/Binder.java</code> (<code>execTransact()</code>), <code>frameworks/base/core/jni/android_os_Parcel.cpp</code> (JNI methods), <code>frameworks/base/core/jni/android_util_Binder.cpp</code> (<code>JavaBBinderExt</code> global references).</li>
+  <li><code>Parcel</code> and Binder, C++: <code>frameworks/native/libs/binder/Parcel.cpp</code> and <code>frameworks/native/libs/binder/include/binder/Parcel.h</code> (layout, buffer growth, object tracking), <code>frameworks/native/libs/binder/IPCThreadState.cpp</code> (incoming transactions, <code>freeBuffer</code>), <code>frameworks/native/libs/binder/ProcessState.cpp</code> (the Binder <code>mmap</code>), <code>frameworks/native/libs/binder/BpBinder.cpp</code> (remote references).</li>
+  <li>Kernel: <code>drivers/android/binder.c</code> in the Android common kernel (transaction copy, handle and FD translation).</li>
+  <li><code>Bundle</code> and <code>Bitmap</code>: <code>frameworks/base/core/java/android/os/BaseBundle.java</code>, <code>frameworks/base/core/java/android/os/Bundle.java</code>, <code>frameworks/base/libs/hwui/jni/Bitmap.cpp</code> (inline vs <code>memfd</code> pixels), <code>frameworks/base/core/java/android/widget/RemoteViews.java</code>, <code>frameworks/base/core/java/android/app/Notification.java</code>.</li>
+  <li><code>system_server</code> holders: <code>frameworks/base/services/core/java/com/android/server/am/</code> (<code>PendingIntentRecord.java</code>, <code>PendingIntentController.java</code>, <code>ActivityManagerService.java</code>, <code>BroadcastController.java</code>), <code>frameworks/base/services/core/java/com/android/server/notification/</code> (<code>NotificationRecord.java</code>, <code>NotificationManagerService.java</code>), <code>frameworks/base/services/appwidget/java/com/android/server/appwidget/</code> (<code>AppWidgetServiceImpl.java</code>, including the nested <code>Widget</code> class), <code>frameworks/base/services/core/java/com/android/server/wm/</code> (<code>ActivityRecord.java</code>, <code>ActivityClientController.java</code>), <code>frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobInfo.java</code>, <code>frameworks/base/apex/jobscheduler/service/java/com/android/server/alarm/Alarm.java</code>, <code>frameworks/base/services/core/java/com/android/server/clipboard/ClipboardService.java</code>, <code>frameworks/base/services/core/java/com/android/server/media/MediaSessionRecord.java</code>.</li>
+  <li>Runtime and allocator: <code>libcore/luni/src/main/java/libcore/util/NativeAllocationRegistry.java</code>, <code>external/scudo/standalone/combined.h</code> (primary and secondary allocators).</li>
+</ul>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,1296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Trace merging across machines and on one machine</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="Clocks · snapshots · archives · machines · same-device pitfalls">Trace merging</span>
+  <span class="tb-spacer"></span>
+  <a class="tb-x" href="../trace_processor_internals/index.html">Trace Processor internals</a>
+  <a class="tb-x" href="../perfettosql_next/index.html">PerfettoSQL parsing</a>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#glance">At a glance</a>
+  <a href="#overview">Overview</a>
+  <div class="ph">I · Clocks</div>
+  <a href="#clocks">1 · A timestamp needs its clock</a>
+  <a href="#graph">2 · Snapshots and the clock graph</a>
+  <a href="#remote">3 · Timing a round trip</a>
+  <a href="#bridge">4 · Files nothing measured</a>
+  <div class="ph">II · How Trace Processor merges</div>
+  <a href="#inputs">5 · Three ways in</a>
+  <a href="#archive">6 · Which file anchors</a>
+  <a href="#ids">7 · Machines, files, trace time</a>
+  <a href="#scopes">8 · Shared and per-file state</a>
+  <a href="#secondary">9 · A second file on one machine</a>
+  <a href="#sec-usual" style="padding-left:18px">the usual order works</a>
+  <a href="#sec-early" style="padding-left:18px">an early conversion cuts it off</a>
+  <div class="ph">III · Where same-machine merging breaks</div>
+  <a href="#cat">10 · Joining with cat</a>
+  <a href="#tracks">11 · Duplicate tracks</a>
+  <a href="#sched">12 · Duplicate scheduler rows</a>
+  <a href="#manifest">13 · Manifest pitfalls</a>
+  <a href="#reboot">14 · Reboots</a>
+  <a href="#ringbuf">15 · Ring-buffer trace pairs</a>
+  <div class="ph">IV · Practice</div>
+  <a href="#recipes">16 · Checklist and recipes</a>
+  <a href="#checking">17 · Checking a merged trace</a>
+  <a href="#method">18 · Numbers and method</a>
+  <a href="#sources">Sources</a>
+</nav>
+
+<main id="top">
+<h1>Trace merging lines up files from different machines well, but two files from one phone need care</h1>
+<p class="lead">Perfetto’s Trace Processor can load several trace files as one trace, on one timeline.
+Files from different machines line up through a measured offset or their wall clocks.
+Two files from the same phone can merge wrongly, and most of these failures load without any error.</p>
+<p class="m">Code excerpts are from the upstream Perfetto repository at commit <code>9843f023eb</code> (8 October 2026). Paths are relative to
+<code>src/trace_processor/</code> unless stated. Excerpts marked <em>shape</em> are simplified. The rest are quoted with comments trimmed.
+Symbols are given instead of line numbers.</p>
+
+<h2 id="glance">At a glance</h2>
+<ul>
+<li><b>What merging does.</b> It puts several files on one timeline and in one set of SQL tables, and keeps each event tied to its machine.</li>
+<li><b>Across machines.</b> Machines recorded together are aligned by a measured offset. Machines recorded apart are aligned through their wall clocks.</li>
+<li><b>On one phone.</b> Two files share thread identity, so they join. But scheduler data that both recorded is stored twice, and a reboot between them misplaces the second file.</li>
+<li><b>Usually silent.</b> Most of these failures load without an error. The queries in Section 17 catch them.</li>
+<li><b>What to do.</b> Merge one phone’s files onto one machine only if they share a boot and do not record the same kind of data. Otherwise give each file its own machine name.</li>
+</ul>
+<p><b>Terms.</b> <b>Trace time</b> is the one shared clock that every event is placed on.
+A <b>machine</b> is one device or VM as Trace Processor models it. Each file is assigned to one machine.
+An <b>archive</b> is a TAR or ZIP file whose members are the traces.
+A <b>manifest</b> is an optional JSON member of the archive that names each file’s machine and relates clocks.
+The <b>primary</b> file is the first file read on a machine. Later files on that machine are <b>secondary</b>.
+A <b>proto trace</b> is a trace in Perfetto’s own protobuf format, such as a <code>.pftrace</code> file.
+A <b>data source</b> is one kind of data a trace records, such as kernel scheduler events or stack samples.
+<code>traced</code> is Perfetto’s tracing service, and <code>traced_relay</code> forwards a guest machine’s (VM’s) trace data to the host’s <code>traced</code>.</p>
+
+<!-- ═════════════════════════ OVERVIEW ═════════════════════════ -->
+<h2 id="overview">Merging puts several files on one timeline and one set of tables</h2>
+<p>One trace is often not enough, so Trace Processor can merge several. A host and its VM, two phones talking to each other,
+or one phone recorded by two tracing sessions each produce their own file. <b>Trace Processor</b> is Perfetto’s engine that
+imports traces into SQL tables. Merging lets you follow cause and effect across the files.</p>
+<p>Merging has three jobs:</p>
+<ul>
+  <li>Place every event on trace time.</li>
+  <li>Keep every event tied to its machine, so that pid 1500 on a phone and on a VM stay different processes.</li>
+  <li>Keep state that belongs to one file inside that file. Examples are clocks private to one writer (Section 1) and
+  <b>interned strings</b>: strings sent once with a short id that later packets refer to.</li>
+</ul>
+
+<div class="cards">
+  <div class="card"><div class="lbl">What works</div>
+  <p>Different machines. A host and guest recorded live through <code>traced_relay</code> are aligned by a measured offset (Section 3).
+  Separately recorded devices with their own machine names are aligned through their wall clocks (Section 4). One phone, one boot,
+  with different data in each file also merges well. Both files share thread ids, so they join.</p></div>
+  <div class="card"><div class="lbl">What breaks on one device</div>
+  <p>Files on one machine share thread and CPU identity but keep separate bookkeeping. If both recorded the same scheduler events,
+  every scheduling row is stored twice and some stay open (Sections 11 and 12). A reboot between the files puts the second one at the
+  wrong time (Section 14). A few manifest and packet-order cases drop data or fail the load (Sections 9 and 13).</p></div>
+  <div class="card"><div class="lbl">What to do instead</div>
+  <p>Merge one phone’s files onto one machine only when their data sources do not overlap and they come from one boot. Otherwise
+  decompress them and give each file its own machine name in a manifest. Joins between the files then go through the kernel thread
+  id instead of a shared thread row. Run the checks in Section 17 before trusting any join.</p></div>
+</div>
+
+<p>Trace Processor takes a single input, so you merge by handing it one archive. The archive can also hold a manifest.
+The manifest is recognised by its content. By convention it is named <code>perfetto_manifest.json</code>.</p>
+<p>The other way in is one proto trace recorded through <code>traced_relay</code>. That one trace already holds several machines and their measured clock offsets.</p>
+<p>Figure 1 shows the path from archive to tables. Later sections explain each part:</p>
+<table>
+  <thead><tr><th>Part</th><th>Job</th><th>Section</th></tr></thead>
+  <tbody>
+    <tr><td><code>TarTraceReader</code></td><td>Unpacks the archive and decides the order</td><td>6</td></tr>
+    <tr><td><code>ForwardingTraceParser</code></td><td>One per member: detects the format and hands the bytes to the matching reader</td><td>6</td></tr>
+    <tr><td><b>Context</b> (<code>TraceProcessorContext</code>)</td><td>The set of trackers (the objects that turn events into rows) and tables one parser writes through</td><td>8</td></tr>
+    <tr><td><b>Trace file id</b></td><td>The file’s row in the <code>trace_file</code> table</td><td>7</td></tr>
+    <tr><td><b>Machine id</b></td><td>The file’s row in the <code>machine</code> table</td><td>7</td></tr>
+    <tr><td><code>ClockTracker</code></td><td>One per file: converts that file’s timestamps to trace time</td><td>2, 7</td></tr>
+    <tr><td><code>ClockSynchronizer</code></td><td>Shared: holds every clock relation</td><td>2</td></tr>
+    <tr><td><code>TraceSorter</code></td><td>Shared: orders all events by trace time</td><td></td></tr>
+    <tr><td><code>TraceStorage</code></td><td>Shared: holds the tables</td><td></td></tr>
+  </tbody>
+</table>
+
+<figure>
+<figcaption><b>Figure 1. Each file gets its own parser, but all files share one clock graph, one sorter and one set of tables.</b>
+The rest of the page fills in the middle three columns: which file is read first, which context it gets, and how its clocks tie
+to the other files. In the archive, <em>ring</em> is a long ring-buffer system trace and <em>stacks</em> a stack-sampling trace from the same
+phone (Section 15). “ctx(trace 1, m 0)” is the context for trace file 1 on machine 0.</figcaption>
+<svg viewBox="0 0 1000 200" role="img" aria-label="Archive to shared storage pipeline">
+  <text x="10" y="18" class="th">input</text>
+  <text x="200" y="18" class="th">ordering</text>
+  <text x="400" y="18" class="th">one parser per file</text>
+  <text x="630" y="18" class="th">clocks</text>
+  <text x="820" y="18" class="th">global state</text>
+  <rect x="10" y="30" width="160" height="130" rx="2" class="b2"/>
+  <text x="22" y="52" class="tb">merged.tar</text>
+  <text x="22" y="76" class="tms">perfetto_manifest.json</text>
+  <text x="22" y="96" class="tms">00_ring.pftrace.gz</text>
+  <text x="22" y="116" class="tms">01_stacks.pftrace.gz</text>
+  <text x="22" y="136" class="tms">notes.json</text>
+  <path d="M170,95 L196,95" class="ln" marker-end="url(#ah)"/>
+  <rect x="200" y="62" width="170" height="66" rx="2" class="b0"/>
+  <text x="212" y="86" class="tb">TarTraceReader</text>
+  <text x="212" y="104" class="ts">sort by priority, name,</text>
+  <text x="212" y="118" class="ts">then position</text>
+  <path d="M370,95 L396,95" class="ln" marker-end="url(#ah)"/>
+  <rect x="400" y="30" width="200" height="40" rx="2" class="ba"/>
+  <text x="412" y="55" class="tms">file 1: ctx(trace 1, m 0)</text>
+  <rect x="400" y="76" width="200" height="40" rx="2" class="bv"/>
+  <text x="412" y="101" class="tms">file 2: ctx(trace 2, m 0)</text>
+  <rect x="400" y="122" width="200" height="40" rx="2" class="b0"/>
+  <text x="412" y="147" class="tms">file 3: ctx(trace 3, m 0)</text>
+  <path d="M600,95 L626,95" class="ln" marker-end="url(#ah)"/>
+  <rect x="630" y="62" width="160" height="66" rx="2" class="b0"/>
+  <text x="642" y="86" class="tb">ClockTracker</text>
+  <text x="642" y="104" class="ts">per file: timestamp</text>
+  <text x="642" y="118" class="ts">→ trace time</text>
+  <path d="M790,95 L816,95" class="lna" marker-end="url(#aha)"/>
+  <rect x="820" y="40" width="170" height="110" rx="2" class="ba"/>
+  <text x="832" y="64" class="tb">Shared by all files</text>
+  <text x="832" y="86" class="ts">one ClockSynchronizer</text>
+  <text x="832" y="102" class="ts">one TraceSorter</text>
+  <text x="832" y="118" class="ts">one TraceStorage</text>
+  <text x="832" y="134" class="ts">(all SQL tables)</text>
+  <text x="10" y="188" class="ts">Each member gets its own ForwardingTraceParser and a forked TraceProcessorContext keyed by (trace file id, machine). Clock graph, sorter and tables are global.</text>
+</svg>
+</figure>
+
+<!-- ═════════════════════════ PART I ═════════════════════════ -->
+<div class="part">Part I · Clocks</div>
+
+<h2 id="clocks"><span class="n">1</span>A timestamp means nothing until you know its clock and its machine</h2>
+<p>Two files can share a timeline only once you know what their timestamps mean. A timestamp is a reading of some clock, and
+the number alone does not say which clock or which machine. Trace Processor calls each distinct clock it tracks a
+<b>clock domain</b>: one clock on one machine. For the private clocks in the table, the domain is also limited to one file or one sequence.</p>
+<p>Timestamps in the same domain compare directly. Timestamps in different domains cannot be compared until something relates them.
+Linux exposes several clocks, and Perfetto names them in <code>BuiltinClock</code>
+(<code>protos/perfetto/common/builtin_clock.proto</code>):</p>
+<table>
+  <thead><tr><th>Clock</th><th>Id</th><th>What it counts</th></tr></thead>
+  <tbody>
+    <tr><td><b>BOOTTIME</b></td><td>6</td><td>Nanoseconds since boot, including time in <b>suspend</b>, the low-power sleep where the CPUs stop and the screen is off. Perfetto’s default trace clock on Android and Linux.</td></tr>
+    <tr><td><b>MONOTONIC</b></td><td>3</td><td>Nanoseconds since boot, but it stops while the device is suspended.</td></tr>
+    <tr><td><b>REALTIME</b></td><td>1</td><td>Wall-clock time since 1970. It jumps forwards or backwards when the user sets the time or on an <b>NTP step</b>: a jump to the correct time made by NTP, the Network Time Protocol daemon that keeps the wall clock in line with a time server.</td></tr>
+    <tr><td><b>Sequence-scoped clocks</b></td><td>64–127</td><td>Defined by one trace writer for its own packets, often as deltas, where each timestamp counts from the previous one. TrackEvent, Perfetto’s in-app instrumentation API, uses them.</td></tr>
+    <tr><td><b>TRACE_FILE</b></td><td>11</td><td>A private timeline for one file. Used for formats with no absolute clock, such as Chrome JSON.</td></tr>
+  </tbody>
+</table>
+<p>A <b>sequence</b> is the stream of packets from one writer, usually one thread of one producer. A producer is a process
+that writes trace data. The trace identifies each sequence by <code>trusted_packet_sequence_id</code>.</p>
+<p>Converting a timestamp from one clock to another means adding an <b>offset</b>: clock B minus clock A at the same instant.
+On one device, the offset between two clocks is constant most of the time. BOOTTIME − MONOTONIC changes only across a suspend.
+REALTIME − BOOTTIME changes only when the wall clock is stepped (Figure 2).</p>
+<p>Across devices, BOOTTIME values are unrelated, because each device booted at a different instant. REALTIME values are close
+only if both devices synchronised their wall clocks. Even then the offset slowly changes, because two crystals never tick at
+exactly the same rate. That slow change is <b>drift</b>.</p>
+
+<figure>
+<figcaption><b>Figure 2. On one device, the offsets between clocks change at suspends and wall-clock steps.</b>
+Converting between clocks needs the offset that held at the instant of the event.</figcaption>
+<svg viewBox="0 0 1000 230" role="img" aria-label="Three clocks on one device">
+  <rect x="470" y="28" width="170" height="150" class="bw"/>
+  <text x="482" y="44" class="th">device suspended</text>
+  <text x="10" y="74" class="tb">BOOTTIME</text>
+  <line x1="130" y1="70" x2="980" y2="70" class="lna"/>
+  <text x="10" y="114" class="tb">MONOTONIC</text>
+  <line x1="130" y1="110" x2="470" y2="110" class="lna"/>
+  <line x1="470" y1="110" x2="640" y2="110" class="ln dash"/>
+  <line x1="640" y1="110" x2="980" y2="110" class="lna"/>
+  <text x="490" y="128" class="ts">stopped</text>
+  <text x="10" y="154" class="tb">REALTIME</text>
+  <line x1="130" y1="150" x2="820" y2="150" class="lna"/>
+  <line x1="820" y1="150" x2="820" y2="138" class="lnw"/>
+  <line x1="820" y1="138" x2="980" y2="138" class="lna"/>
+  <text x="830" y="166" class="ts tw">NTP step +2 s</text>
+  <line x1="300" y1="56" x2="300" y2="162" class="ln dash"/>
+  <line x1="760" y1="56" x2="760" y2="162" class="ln dash"/>
+  <text x="306" y="64" class="tms">100 s</text><text x="306" y="104" class="tms">95 s</text><text x="306" y="144" class="tms">12:00:00</text>
+  <text x="766" y="64" class="tms">160 s</text><text x="766" y="104" class="tms">105 s</text><text x="766" y="144" class="tms">12:01:00</text>
+  <text x="130" y="200" class="ts">Between the two dashed instants 60 s pass: BOOTTIME advances 60 s, MONOTONIC only the 10 s the device was awake.</text>
+  <text x="130" y="216" class="ts">BOOTTIME − MONOTONIC went from 5 s to 55 s. REALTIME − BOOTTIME stays fixed until the NTP step.</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Two files from the same boot of the same device can share BOOTTIME directly. Two devices, or two boots, cannot. BOOTTIME means
+something different on each, and only a measured offset or the wall clock can relate them.
+</blockquote>
+
+<h2 id="graph"><span class="n">2</span>Clock snapshots link clocks into a graph that can convert any timestamp</h2>
+<p>Because offsets change, a trace records them as it goes, in clock snapshots. A <b>clock snapshot</b> is a set of clocks read
+back to back, close enough to count as the same instant. Each one says “when clock A read X, clock B read Y”. That gives the offset
+between A and B at that moment.</p>
+<p><code>traced</code> takes a snapshot when a session starts and writes it first in every trace. It also takes periodic snapshots
+into a small ring, a fixed-size buffer where each new entry replaces the oldest. It keeps a new one only if some clock drifted by at least 10 ms against BOOTTIME since the last one.
+Section 18 lists the code behind each of these rules.</p>
+<p>Trace Processor keeps every snapshot in one <code>ClockSynchronizer</code> (<code>util/clock_synchronizer.h</code>).
+It models them as a <b>clock graph</b> (Figure 3):</p>
+<ul>
+  <li><b>Nodes</b> are clocks. Each node keeps a time series of (snapshot id, timestamp) pairs. Snapshots that read the same clocks
+  share a series, grouped by a <b>snapshot hash</b> of their clock ids.</li>
+  <li><b>Edges</b> join every pair of clocks that one snapshot read, in both directions.</li>
+  <li><b>Conversion</b> follows a <b>path</b> of at most four edges, found by breadth-first search. On each hop it takes the latest
+  snapshot at or before the timestamp and adds that snapshot’s offset.</li>
+</ul>
+
+<figure>
+<figcaption><b>Figure 3. Two clocks that no single snapshot read are still related through a clock both share.</b>
+Each snapshot joins the clocks it read. Converting MONOTONIC to REALTIME here takes two hops, one offset per hop.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 170" role="img" aria-label="Clock graph with two snapshots and a two-hop conversion path">
+  <rect x="20" y="60" width="170" height="44" rx="2" class="b0"/><text x="34" y="87" class="tb">MONOTONIC</text>
+  <rect x="345" y="60" width="170" height="44" rx="2" class="ba"/><text x="359" y="87" class="tb">BOOTTIME</text>
+  <rect x="670" y="60" width="170" height="44" rx="2" class="b0"/><text x="684" y="87" class="tb">REALTIME</text>
+  <line x1="190" y1="82" x2="345" y2="82" class="ln"/>
+  <line x1="515" y1="82" x2="670" y2="82" class="ln"/>
+  <text x="206" y="72" class="ts">snapshot S1 read both</text>
+  <text x="531" y="72" class="ts">snapshot S2 read both</text>
+  <path d="M105,112 C105,150 425,150 425,112" class="lnv" marker-end="url(#ahv)"/>
+  <path d="M430,112 C430,150 755,150 755,112" class="lnv" marker-end="url(#ahv)"/>
+  <text x="200" y="160" class="ts tv">hop 1: add S1’s offset</text>
+  <text x="530" y="160" class="ts tv">hop 2: add S2’s offset</text>
+  <text x="20" y="30" class="th">clocks are nodes · a snapshot joins the clocks it read</text>
+</svg>
+</figure>
+
+<pre><code><span class="src">util/clock_synchronizer.cc · ConvertSlowpath, one hop (trimmed)</span>auto it = std::upper_bound(ts_vec.begin(), ts_vec.end(), ns);
+if (it != ts_vec.begin())
+  --it;                         <span class="c">// latest snapshot ≤ ns (or the first one)</span>
+uint32_t snapshot_id = cur_snap.snapshot_ids[index];
+<span class="c">// ... look up the same snapshot_id in the next clock's series ...</span>
+const int64_t hop_translation_ns = next_timestamp_ns - *it;
+ns += hop_translation_ns;</code></pre>
+
+<figure>
+<figcaption><b>Figure 4. Between snapshots, the offset is a constant step.</b> A timestamp before the first snapshot uses the
+first snapshot, because the search does not step back past the beginning.</figcaption>
+<svg viewBox="0 0 1000 230" role="img" aria-label="Converting with the latest snapshot">
+  <text x="10" y="64" class="tb">MONOTONIC</text>
+  <line x1="130" y1="60" x2="980" y2="60" class="ln"/>
+  <text x="10" y="164" class="tb">BOOTTIME</text>
+  <line x1="130" y1="160" x2="980" y2="160" class="ln"/>
+  <line x1="250" y1="60" x2="250" y2="160" class="lna dash"/>
+  <line x1="700" y1="60" x2="700" y2="160" class="lna dash"/>
+  <rect x="236" y="96" width="28" height="22" rx="2" class="ba"/><text x="242" y="112" class="tms">S1</text>
+  <rect x="686" y="96" width="28" height="22" rx="2" class="ba"/><text x="692" y="112" class="tms">S2</text>
+  <text x="256" y="52" class="tms">95.0 s</text><text x="256" y="178" class="tms">100.0 s</text>
+  <text x="706" y="52" class="tms">105.0 s</text><text x="706" y="178" class="tms">160.0 s</text>
+  <circle cx="420" cy="60" r="4" class="fv"/>
+  <text x="400" y="44" class="tms tv">e = 98.0 s</text>
+  <path d="M420,64 L420,154" class="lnv" marker-end="url(#ahv)"/>
+  <text x="428" y="196" class="tms tv">103.0 s  (S1: +5 s)</text>
+  <rect x="250" y="70" width="450" height="14" class="b2"/>
+  <text x="260" y="81" class="tms">S1 is used for MONOTONIC below 105.0</text>
+  <rect x="700" y="70" width="280" height="14" class="b2"/>
+  <text x="710" y="81" class="tms">S2 (+55 s) from 105.0 on</text>
+  <text x="130" y="220" class="ts">The offset and its valid range (here everything below 105.0) are cached (8 entries), so later conversions in that range are one addition.</text>
+</svg>
+</figure>
+
+<p>Two more rules matter for merging:</p>
+<ul>
+  <li><b>A clock that goes backwards loses its outgoing edges.</b> This happens to REALTIME after a backwards step. Conversions
+  can still go into REALTIME but no longer out of it. A REALTIME instant that happened twice cannot be mapped back to one
+  BOOTTIME value, but BOOTTIME → REALTIME stays well defined. If the clock that goes
+  backwards is trace time itself, adding the snapshot fails with “the trace clock … is not monotonic”.</li>
+  <li><b>The graph ignores time.</b> Once any snapshot connects two clocks, they count as connected for the whole trace,
+  even for timestamps long before or after that snapshot.</li>
+</ul>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Between snapshots the offset is assumed constant. That is exact for BOOTTIME ↔ REALTIME until a wall-clock step. It is wrong for
+MONOTONIC across a suspend until the next snapshot (Section 15).
+</blockquote>
+
+<h2 id="remote"><span class="n">3</span>Machines recorded together are aligned by timing a round trip</h2>
+<p>Machines recorded together through <code>traced_relay</code> are aligned by timing messages between them. Two machines cannot
+read each other’s clocks at one instant, because any message takes an unknown time to arrive. NTP solves this by timing a
+<b>round trip</b>: send a message, get the reply, and note both send and receive times. It assumes both directions take equally
+long, so the remote reading belongs at the midpoint.</p>
+<p><code>traced_relay</code> does this with four timestamps per round, and each timestamp is a full clock snapshot (Figure 5).
+The <b>client</b> is the guest machine running <code>traced_relay</code>. The <b>host</b> runs <code>traced</code>.</p>
+<ol>
+  <li>The client takes a snapshot and sends PING (t1c).</li>
+  <li>The host takes a snapshot when the ping arrives (t1h) and replies.</li>
+  <li>The client takes another snapshot and sends UPDATE (t2c).</li>
+  <li>The host takes a snapshot when that arrives (t2h).</li>
+</ol>
+<p>A new round starts every 30 seconds. The host keeps only the most recent exchanges, about two rounds’ worth.
+<code>traced</code> writes them once per session into one <code>RemoteClockSync</code> packet per machine. That packet holds
+(client snapshot, host snapshot) pairs. Section 18 gives the exact limits and code.</p>
+
+<figure>
+<figcaption><b>Figure 5. Each half of a round is a round trip, so equal delays in the two directions cancel.</b> The remote
+reading should sit at the midpoint of each round trip. Any difference between the two directions becomes error.</figcaption>
+<svg viewBox="0 0 1000 220" role="img" aria-label="Four-timestamp clock sync round">
+  <text x="10" y="64" class="tb">client</text><text x="10" y="80" class="ts">traced_relay</text>
+  <text x="10" y="164" class="tb">host</text><text x="10" y="180" class="ts">traced</text>
+  <line x1="150" y1="60" x2="670" y2="60" class="ln"/>
+  <line x1="150" y1="160" x2="670" y2="160" class="ln"/>
+  <circle cx="220" cy="60" r="4" class="fa"/><text x="206" y="48" class="tms ta">t1c</text>
+  <path d="M220,60 L336,156" class="lna" marker-end="url(#aha)"/>
+  <circle cx="340" cy="160" r="4" class="fa"/><text x="326" y="180" class="tms ta">t1h</text>
+  <text x="196" y="118" class="ts">PING</text>
+  <path d="M340,160 L456,64" class="ln dash" marker-end="url(#ah)"/>
+  <text x="404" y="118" class="ts">response</text>
+  <circle cx="470" cy="60" r="4" class="fv"/><text x="456" y="48" class="tms tv">t2c</text>
+  <path d="M470,60 L586,156" class="lnv" marker-end="url(#ahv)"/>
+  <circle cx="590" cy="160" r="4" class="fv"/><text x="576" y="180" class="tms tv">t2h</text>
+  <text x="560" y="118" class="ts">UPDATE</text>
+  <text x="600" y="48" class="ts">next round in 30 s</text>
+  <rect x="690" y="70" width="300" height="80" rx="2" class="b0"/>
+  <text x="702" y="94" class="tm">offset1 = (t1c + t2c)/2 − t1h</text>
+  <text x="702" y="114" class="tm">offset2 = t2c − (t1h + t2h)/2</text>
+  <text x="702" y="136" class="ts">client clock ≈ host clock + offset</text>
+  <text x="150" y="208" class="ts">Each timestamp is a full snapshot (all builtin clocks), so one round yields an offset per clock both sides reported.</text>
+</svg>
+</figure>
+
+<p>Trace Processor turns the packet into one fixed offset per clock. It pairs adjacent entries that belong to one round, computes
+both offsets, and <b>averages all offsets in the packet</b> into one number per clock:</p>
+
+<pre><code><span class="src">importers/proto/proto_trace_reader.cc · CalculateClockOffsets</span>int64_t offset1 =
+    (static_cast&lt;int64_t&gt;(t1c + t2c) / 2) - static_cast&lt;int64_t&gt;(t1h);
+int64_t offset2 =
+    static_cast&lt;int64_t&gt;(t2c) - (static_cast&lt;int64_t&gt;(t1h + t2h) / 2);
+raw_clock_offsets[clock_id].push_back(offset1);
+raw_clock_offsets[clock_id].push_back(offset2);
+<span class="c">// ... then, per clock:</span>
+int64_t avg_offset = std::accumulate(offsets.begin(), offsets.end(), 0LL) /
+                     static_cast&lt;int64_t&gt;(offsets.size());</code></pre>
+<p>It then adds one edge per clock between the host and the client. The host end sits at the last host reading of that clock,
+and the client end at that reading plus the offset. The client’s own snapshots from each round are also added on the client
+machine. They relate its other clocks to its BOOTTIME.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A relay-recorded trace aligns machines by one constant offset. It is averaged over the last minute or so of sync rounds before
+<code>traced</code> first wrote the trace out. Drift between the machines is not modelled, so in a long recording the error grows
+with distance from those rounds.
+</blockquote>
+
+<h2 id="bridge"><span class="n">4</span>Files nothing measured are placed by the wall clock or by assuming one boot</h2>
+<p>A file with no measured link to trace time gets a fallback link: the wall clock if it is on another machine and both sides
+have one, otherwise a same-boot guess. Most merges are like this: two files recorded separately, with no <code>RemoteClockSync</code>
+between them.</p>
+<p>Trace Processor plans the fallback when it opens the file. It registers a <b>deferred clock sync</b>: a reminder to link the
+clock the format’s timestamps use, which is BOOTTIME for proto, to trace time later. The link is added only at the file’s first
+timestamp conversion, and only if nothing better relates the two clocks by then. At that point Trace Processor tries four things
+in order (Figure 6). Step 2, the <b>REALTIME rendezvous</b>, joins the two machines’ wall clocks and assumes they agree.</p>
+
+<figure>
+<figcaption><b>Figure 6. A real clock relation always wins. The two fallbacks both assume an offset of zero.</b> The trace-time
+machine is the machine whose clock was chosen as trace time, usually the first file’s (Section 7).</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="BridgeToTraceTime decision ladder">
+  <rect x="10" y="14" width="400" height="48" rx="2" class="b0"/>
+  <text x="22" y="34" class="tb">1 · Already related?</text>
+  <text x="22" y="52" class="ts">a snapshot path, RemoteClockSync or manifest edge exists</text>
+  <path d="M410,38 L446,38" class="lng" marker-end="url(#ahg)"/>
+  <rect x="450" y="14" width="540" height="48" rx="2" class="bg"/>
+  <text x="462" y="42" class="t">use it; add nothing</text>
+  <rect x="10" y="72" width="400" height="48" rx="2" class="b0"/>
+  <text x="22" y="92" class="tb">2 · REALTIME rendezvous</text>
+  <text x="22" y="110" class="ts">this file and the trace-time machine both reach REALTIME</text>
+  <path d="M410,96 L446,96" class="lna" marker-end="url(#aha)"/>
+  <rect x="450" y="72" width="540" height="48" rx="2" class="ba"/>
+  <text x="462" y="92" class="t">add REALTIME(this machine) ↔ REALTIME(trace-time machine), offset 0</text>
+  <text x="462" y="110" class="ts">only when the two REALTIME nodes differ, i.e. the file is on another machine</text>
+  <rect x="10" y="144" width="400" height="48" rx="2" class="b0"/>
+  <text x="22" y="164" class="tb">3 · Same domain, or a private clock</text>
+  <text x="22" y="182" class="ts">BOOTTIME vs BOOTTIME elsewhere, or either side is TRACE_FILE</text>
+  <path d="M410,168 L446,168" class="lnw" marker-end="url(#ahw)"/>
+  <rect x="450" y="144" width="540" height="48" rx="2" class="bw"/>
+  <text x="462" y="172" class="t">add clock ↔ trace time, offset 0 (assume the same boot)</text>
+  <rect x="10" y="202" width="400" height="40" rx="2" class="b0"/>
+  <text x="22" y="226" class="tb">4 · Otherwise</text>
+  <path d="M410,222 L446,222" class="lnr" marker-end="url(#ahr)"/>
+  <rect x="450" y="202" width="540" height="40" rx="2" class="br"/>
+  <text x="462" y="226" class="t">no edge: events dropped, clock_sync_unrelatable_clock_domains logged</text>
+</svg>
+</figure>
+
+<pre><code><span class="src">importers/common/clock_tracker.cc · BridgeToTraceTime (shape)</span>if (clock_id == trace_time || sync_-&gt;Convert(clock_id, 0, trace_time)) return;
+ClockId realtime = Qualify(Machine(REALTIME), machine_id_, 0);
+ClockId global_realtime = Machine(trace_time.machine_id, REALTIME);
+if (realtime != global_realtime &amp;&amp; Convert(clock_id, 0, realtime) &amp;&amp;
+    Convert(global_realtime, 0, trace_time)) {
+  AddSnapshotInternal({{realtime, 0}, {global_realtime, 0}});  <span class="c">// if not already related</span>
+  return;
+}
+if (either_is_TRACE_FILE || clock_id.clock_id == trace_time.clock_id) {
+  AddSnapshotInternal({{clock_id, 0}, {trace_time, 0}});
+  return;
+}
+RecordAnalysisLog(stats::clock_sync_unrelatable_clock_domains, ...);</code></pre>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Two separately recorded devices line up through their wall clocks, as accurately as NTP kept them. A file on the trace-time machine
+never takes Step 2, because its REALTIME is already that machine’s REALTIME. A second proto file there is tied BOOTTIME to BOOTTIME at zero offset (Section 9). A file with a private clock
+is tied by Step 3. Both cases assume the files share one boot.
+</blockquote>
+
+<!-- ═════════════════════════ PART II ═════════════════════════ -->
+<div class="part">Part II · How Trace Processor merges</div>
+
+<h2 id="inputs"><span class="n">5</span>There are three ways to hand Trace Processor several machines’ data</h2>
+<p>How the files reach Trace Processor decides which machine each file belongs to. Part I showed how clocks get related. There
+are three shapes of input:</p>
+<table>
+  <thead><tr><th>Input</th><th>How machines are separated</th><th>How clocks are related</th></tr></thead>
+  <tbody>
+    <tr><td>One proto trace recorded through <code>traced_relay</code></td>
+        <td><code>TracePacket.machine_id</code> on guest packets. The reader creates a separate context per id.</td>
+        <td><code>RemoteClockSync</code> (Section 3)</td></tr>
+    <tr><td>TAR or ZIP of trace files</td>
+        <td>None by default: every file is on raw machine 0, the host (Section 7), unless its packets carry <code>machine_id</code> (traced_relay, or the Perfetto SDK initialised with <code>TracingInitArgs::machine_id</code>)</td>
+        <td>Snapshots inside the files, then the fallback (Section 4)</td></tr>
+    <tr><td>Archive plus <code>perfetto_manifest</code></td>
+        <td>Named machines per file (<code>machine</code>) or a remap of embedded ids (<code>machines</code>)</td>
+        <td>Optional <code>trace_time</code> choice and <code>clocks.sync_to</code> edges with <code>offset_ns</code></td></tr>
+  </tbody>
+</table>
+<p>The shell builds such an archive for you:</p>
+<pre><code><span class="src">shell/util_subcommand.cc</span>trace_processor util merge -o merged.tar [--manifest m.json] a b …</code></pre>
+<p>Members are named after the inputs’ base names, and the manifest is stored as <code>perfetto_manifest.json</code>. The command
+then runs a tokenize-only pass over the archive and warns if any events were dropped for clock reasons. That pass reads every file
+and converts its timestamps but skips the parsing stage that fills the event tables. It does not detect the duplicate rows of
+Sections 11 and 12. Section 18 lists the stats it checks.</p>
+
+<h2 id="archive"><span class="n">6</span>File type and name, not archive order, decide which file anchors the others</h2>
+<p>Trace Processor reads archive members sorted by file type first and name second, not in the order they sit in the archive.
+Order matters for two reasons. The manifest must be read before the files it configures. And the first trace read on a machine
+becomes its anchor: the file whose clocks the others are tied to (Section 7).</p>
+<p>So <code>TarTraceReader</code> first reads the whole archive. It skips hidden members, where any part of the path starts with a dot, such as macOS <code>._foo</code> files.
+It records each other member, guesses its format from the first bytes and sorts it. At the end of the input it walks the sorted
+list. Each member is parsed completely before the next one starts. The sort key is (priority, name, position):</p>
+<pre><code><span class="src">importers/archive/archive_entry.cc</span>bool ArchiveEntry::operator&lt;(const ArchiveEntry&amp; rhs) const {
+  return std::tie(priority, name, index) &lt;
+         std::tie(rhs.priority, rhs.name, rhs.index);
+}</code></pre>
+<p>Each importer sets its own priority in <code>TraceTypeDescriptor::archive_priority</code> (<code>util/trace_type.h</code>). Lower runs first:</p>
+<table>
+  <thead><tr><th>archive_priority</th><th>Importers</th><th>Why there</th></tr></thead>
+  <tbody>
+    <tr><td><code>-1</code></td><td><code>perfetto_manifest</code></td><td>Configures every later file. <code>ForwardingTraceParser::Init</code> rejects a manifest that is not first.</td></tr>
+    <tr><td><code>0</code></td><td><code>proto</code></td><td>Carries ClockSnapshots that other files may need.</td></tr>
+    <tr><td><code>1</code></td><td><code>gzip</code>, <code>zstd</code>, <code>tar</code>, <code>zip</code></td><td>Containers. A <code>.pftrace.gz</code> sorts here, not with proto.</td></tr>
+    <tr><td><code>2</code></td><td>everything else (JSON, systrace, ctrace, perf, …)</td><td>Default.</td></tr>
+    <tr><td><code>3</code></td><td><code>symbols</code> (a proto whose first packet is <code>ModuleSymbols</code>)</td><td>Symbolizes data already imported.</td></tr>
+  </tbody>
+</table>
+
+<figure>
+<figcaption><b>Figure 7. An uncompressed proto trace is read before compressed ones, whatever its name.</b> Within one priority the
+member name decides. The first trace parsed on a machine becomes its <em>primary</em> file (Section 7), so names and compression
+decide which file anchors the others.</figcaption>
+<svg viewBox="0 0 1000 260" role="img" aria-label="Archive order versus processing order">
+  <text x="10" y="18" class="th">order in the tar</text>
+  <text x="560" y="18" class="th">processing order</text>
+  <text x="900" y="18" class="th">priority</text>
+  <g>
+    <rect x="10" y="30" width="330" height="28" rx="2" class="b0"/><text x="22" y="49" class="tms">0  notes.json</text>
+    <rect x="10" y="64" width="330" height="28" rx="2" class="b0"/><text x="22" y="83" class="tms">1  symbols.pb</text>
+    <rect x="10" y="98" width="330" height="28" rx="2" class="b0"/><text x="22" y="117" class="tms">2  01_stacks.pftrace.gz</text>
+    <rect x="10" y="132" width="330" height="28" rx="2" class="b0"/><text x="22" y="151" class="tms">3  00_ring.pftrace.gz</text>
+    <rect x="10" y="166" width="330" height="28" rx="2" class="b0"/><text x="22" y="185" class="tms">4  perfetto_manifest.json</text>
+    <rect x="10" y="200" width="330" height="28" rx="2" class="b0"/><text x="22" y="219" class="tms">5  system.pftrace</text>
+  </g>
+  <path d="M360,128 L540,128" class="lna" marker-end="url(#aha)"/>
+  <text x="370" y="118" class="ts">sort by (priority, name, index)</text>
+  <g>
+    <rect x="560" y="30" width="430" height="28" rx="2" class="b2"/><text x="572" y="49" class="tms">perfetto_manifest.json</text><text x="910" y="49" class="tms">-1</text>
+    <rect x="560" y="64" width="430" height="28" rx="2" class="ba"/><text x="572" y="83" class="tms">system.pftrace</text><text x="910" y="83" class="tms">0</text>
+    <rect x="560" y="98" width="430" height="28" rx="2" class="bv"/><text x="572" y="117" class="tms">00_ring.pftrace.gz</text><text x="910" y="117" class="tms">1</text>
+    <rect x="560" y="132" width="430" height="28" rx="2" class="bv"/><text x="572" y="151" class="tms">01_stacks.pftrace.gz</text><text x="910" y="151" class="tms">1</text>
+    <rect x="560" y="166" width="430" height="28" rx="2" class="b0"/><text x="572" y="185" class="tms">notes.json</text><text x="910" y="185" class="tms">2</text>
+    <rect x="560" y="200" width="430" height="28" rx="2" class="b0"/><text x="572" y="219" class="tms">symbols.pb</text><text x="910" y="219" class="tms">3</text>
+  </g>
+  <text x="10" y="250" class="ts">Within a tier the member name decides: 00_ before 01_. The uncompressed system.pftrace (priority 0) beats both .gz files.</text>
+</svg>
+</figure>
+<p>A compressed member is only a container, so it gets no context of its own. Trace Processor decompresses it and reads the
+contents as a new, nested file. That inner file has an empty name. Its row in the <code>trace_file</code> table, not the
+compressed member’s, is the trace id the events are attributed to.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+To pick the anchor file, give all trace members the same compression and prefix their names (<code>00_</code>, <code>01_</code>). Mixing a raw
+<code>.pftrace</code> with <code>.pftrace.gz</code> members makes the raw one primary whatever it is called.
+</blockquote>
+
+<h2 id="ids"><span class="n">7</span>Each clock is keyed by machine and file, and the first file to claim trace time sets it</h2>
+<p>All clocks of all files live in one graph, so each clock node needs a name that cannot collide. That name, <code>ClockId</code>,
+has four fields:</p>
+<pre><code><span class="src">util/clock_synchronizer.h · ClockId (trimmed)</span>struct ClockId {
+  uint32_t clock_id = 0;       <span class="c">// BuiltinClock, or 64..127 for sequence clocks</span>
+  uint32_t seq_id = 0;         <span class="c">// trusted_packet_sequence_id, sequence clocks only</span>
+  uint32_t trace_file_id = 0;  <span class="c">// isolates files on the same machine</span>
+  uint32_t machine_id = 0;     <span class="c">// MachineTable row id; 0 is the host</span>
+
+  static constexpr ClockId Qualify(ClockId c, uint32_t machine,
+                                   uint32_t file_tag) {
+    c.machine_id = machine;
+    if (c.seq_id == 0 &amp;&amp; c.trace_file_id == 0)
+      c.trace_file_id = file_tag;
+    return c;
+  }
+};</code></pre>
+<p>The trace_file_id field holds the file’s trace file id from the Overview. Code and the stats table call it trace_id, and this
+page says “trace id”. Sequence clocks already include the trace id, so they are private to one file.</p>
+<p>Builtin clocks get a <b>file tag</b> from the file’s clock tracker. Tag zero means the machine’s <b>canonical</b> nodes, shared
+by every file on that machine. A non-zero tag is the file’s own id and means nodes private to that file.</p>
+
+<h3>How a file gets a machine</h3>
+<p>A file lands on machine zero unless a manifest or its own packets say otherwise (Figure 8).</p>
+<figure>
+<figcaption><b>Figure 8. Without a manifest or embedded machine ids, every file in an archive lands on the same machine.</b>
+The checks run top to bottom.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 196" role="img" aria-label="How a trace file is assigned to a machine">
+  <rect x="10" y="12" width="330" height="50" rx="2" class="b0"/>
+  <text x="22" y="33" class="tb">Manifest names a machine?</text>
+  <text x="22" y="51" class="ts">the file’s manifest entry has a machine name</text>
+  <path d="M340,37 L376,37" class="lng" marker-end="url(#ahg)"/>
+  <rect x="380" y="12" width="470" height="50" rx="2" class="bg"/>
+  <text x="392" y="33" class="t">that named machine</text>
+  <text x="392" y="51" class="ts">same name, same machine · row created before any trace</text>
+  <rect x="10" y="74" width="330" height="50" rx="2" class="b0"/>
+  <text x="22" y="95" class="tb">Packets carry a machine id?</text>
+  <text x="22" y="113" class="ts">a proto packet with a non-zero machine_id</text>
+  <path d="M340,99 L376,99" class="lna" marker-end="url(#aha)"/>
+  <rect x="380" y="74" width="470" height="50" rx="2" class="ba"/>
+  <text x="392" y="95" class="t">adopt it for this file, or fork a new reader for it</text>
+  <text x="392" y="113" class="ts">adopted only if the host machine is still unused</text>
+  <rect x="10" y="136" width="330" height="50" rx="2" class="b0"/>
+  <text x="22" y="165" class="tb">Otherwise</text>
+  <path d="M340,161 L376,161" class="lnw" marker-end="url(#ahw)"/>
+  <rect x="380" y="136" width="470" height="50" rx="2" class="bw"/>
+  <text x="392" y="157" class="t">raw machine 0, shared with every other such file</text>
+  <text x="392" y="175" class="ts">all files then share thread and CPU identity (Section 8)</text>
+</svg>
+</figure>
+<ul>
+  <li><b>Default.</b> <code>ForwardingTraceParser::Init</code> puts every trace file on raw machine id 0, unless a manifest entry gives it one.</li>
+  <li><b>Embedded ids.</b> When a proto packet carries a non-zero <code>machine_id</code>, the file <b>adopts</b> it: the file’s own machine
+  row is relabelled with that id instead of the host’s. This happens only if the host machine is still unused and no manifest remaps the file. Otherwise
+  Trace Processor starts a separate reader for that machine’s packets and adds a deferred BOOTTIME sync.</li>
+  <li><b>Manifest names.</b> Each distinct name gets a synthetic raw id, and its machine row is created up front in manifest order.</li>
+</ul>
+<p>A machine therefore has two ids. Its <b>raw id</b> is the one the input uses: 0 for the host, a packet’s <code>machine_id</code>,
+or a synthetic id for a manifest name. Its <b>row id</b> is its row in the machine table, assigned in creation order.
+In clock ids and in SQL, machine_id is the row id. The docs note that
+this id is not stable across versions. In queries, use <code>machine.raw_id</code> or <code>machine.name</code> instead.</p>
+
+<h3>Who owns trace time</h3>
+<p>Exactly one clock domain can be trace time, and the first file to claim it wins. Trace time starts as a placeholder
+TRACE_FILE clock. After the first claim, later claims are ignored (<code>TraceTimeState::TrySetClock</code>). Claims happen at different moments:</p>
+<ul>
+  <li>A manifest <code>trace_time</code> entry claims it before any trace is read.</li>
+  <li>Non-proto formats claim their source clock when the file is opened.</li>
+  <li>Proto claims at its first ClockSnapshot. It uses <code>primary_trace_clock</code>, a snapshot field naming the clock the
+  trace wants as its timeline. Without it, proto uses BOOTTIME if the snapshot has BOOTTIME and no TRACE_FILE.</li>
+</ul>
+<p>The claimed node is always the machine’s canonical one, with file tag zero.</p>
+
+<h3>Primary and secondary files</h3>
+<p>The first file on a machine is its <b>primary</b> file, and it always uses the canonical clock nodes. Every later file on that
+machine is <b>secondary</b>. A secondary file starts on the canonical nodes too. So a file without snapshots, such as JSON or
+systrace, converts through the primary’s snapshots. When a secondary file adds its own snapshot, it switches to its own private
+nodes (Section 9). Figure 9 shows both kinds of node.</p>
+
+<figure>
+<figcaption><b>Figure 9. Only a measured or asserted offset adds information. The other links between files and machines are zero-offset assumptions.</b>
+An <em>identity edge</em> (the same clock in two files, offset 0) joins files on one machine. A REALTIME rendezvous joins machines.
+A measured offset (RemoteClockSync) or an asserted one (written in a manifest) also joins machines.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="Clock nodes keyed by machine and file">
+  <path d="M900,80 L900,22 L18,22 L18,102 L28,102" class="lna" marker-end="url(#aha)"/>
+  <text x="300" y="16" class="ts ta">RemoteClockSync or manifest clocks edge: measured or asserted offset</text>
+  <rect x="10" y="34" width="610" height="256" rx="3" class="panel"/>
+  <text x="30" y="52" class="th">machine 0 (trace-time machine)</text>
+  <text x="30" y="72" class="ts">tf = 0 · canonical nodes, written by the primary file</text>
+  <rect x="30" y="80" width="150" height="44" rx="2" class="ba"/><text x="42" y="99" class="tb">BOOTTIME</text><text x="42" y="116" class="tms">trace time</text>
+  <rect x="230" y="80" width="150" height="44" rx="2" class="b0"/><text x="242" y="99" class="tb">MONOTONIC</text><text x="242" y="116" class="tms">(3, tf 0, m 0)</text>
+  <rect x="430" y="80" width="150" height="44" rx="2" class="b0"/><text x="442" y="99" class="tb">REALTIME</text><text x="442" y="116" class="tms">(1, tf 0, m 0)</text>
+  <line x1="180" y1="102" x2="230" y2="102" class="ln"/><line x1="380" y1="102" x2="430" y2="102" class="ln"/>
+  <text x="30" y="178" class="ts">tf = k · a secondary file after its own snapshot</text>
+  <rect x="30" y="186" width="150" height="44" rx="2" class="bv"/><text x="42" y="205" class="tb">BOOTTIME</text><text x="42" y="222" class="tms">(6, tf k, m 0)</text>
+  <rect x="230" y="186" width="150" height="44" rx="2" class="bv"/><text x="242" y="205" class="tb">MONOTONIC</text><text x="242" y="222" class="tms">(3, tf k, m 0)</text>
+  <rect x="430" y="186" width="150" height="44" rx="2" class="bv"/><text x="442" y="205" class="tb">REALTIME</text><text x="442" y="222" class="tms">(1, tf k, m 0)</text>
+  <line x1="180" y1="208" x2="230" y2="208" class="lnv"/><line x1="380" y1="208" x2="430" y2="208" class="lnv"/>
+  <path d="M105,186 L105,128" class="lnv dash" marker-end="url(#ahv)"/>
+  <text x="114" y="152" class="ts tv">deferred identity edge, offset 0 (Section 9)</text>
+  <text x="30" y="262" class="ts">The secondary’s REALTIME is not tied to tf 0: on the trace-time machine, REALTIME</text>
+  <text x="30" y="276" class="ts">bridging is skipped (bridge_realtime is false), so BOOTTIME is the only link.</text>
+  <rect x="640" y="34" width="350" height="256" rx="3" class="panel"/>
+  <text x="652" y="52" class="th">machine 1</text>
+  <text x="652" y="72" class="ts">tf = 0 · canonical nodes of machine 1</text>
+  <rect x="660" y="80" width="150" height="44" rx="2" class="bg"/><text x="672" y="99" class="tb">REALTIME</text><text x="672" y="116" class="tms">(1, tf 0, m 1)</text>
+  <rect x="830" y="80" width="140" height="44" rx="2" class="bg"/><text x="842" y="99" class="tb">BOOTTIME</text><text x="842" y="116" class="tms">(6, tf 0, m 1)</text>
+  <line x1="810" y1="102" x2="830" y2="102" class="lng"/>
+  <path d="M660,102 L582,102" class="lng dash" marker-end="url(#ahg)"/>
+  <text x="652" y="150" class="ts tg">dashed green: REALTIME rendezvous, offset 0,</text>
+  <text x="652" y="164" class="ts tg">added only if nothing better connects them</text>
+  <text x="652" y="200" class="ts">Machine ids are machine-table row ids.</text>
+  <text x="652" y="216" class="ts">File tags only matter for several files</text>
+  <text x="652" y="232" class="ts">on one machine.</text>
+</svg>
+</figure>
+
+<h2 id="scopes"><span class="n">8</span>Files on one machine share thread identity but keep separate bookkeeping</h2>
+<p>Two files on one machine share who each thread and CPU is, but each keeps its own record of what is in progress. That split
+decides what merges and what gets duplicated. Clocks are only half of merging. The other half is which importer state two files share.</p>
+<p>Trace Processor turns parsed events into rows through <b>trackers</b>. Each tracker owns one kind of data and remembers state
+between events. For example, the process tracker maps a pid to a thread row. The slice tracker keeps the stack of open
+<b>slices</b>, the named, nestable intervals that trace sections become. Whether two files get the same tracker or separate ones
+is the tracker’s <b>scope</b>.</p>
+<p>Two shared identities matter below:</p>
+<ul>
+  <li>A <b>utid</b> is a thread’s row id in the thread table. It is unique across the whole trace, even when thread ids are reused.</li>
+  <li>A <b>ucpu</b> is a CPU’s row id in the cpu table. CPU 0 on two machines gets two ucpus.</li>
+</ul>
+<p>Most of Part III is about scheduler data. <b>ftrace</b> is the Linux kernel’s built-in event tracer, which Perfetto reads for
+kernel events. Its <b>sched_switch</b> event fires every time a CPU stops running one thread and starts another. From sched_switch
+and wakeup events, Trace Processor builds two tables:</p>
+<ul>
+  <li><b>sched</b>: one row per stretch a thread ran on a CPU.</li>
+  <li><b>thread_state</b>: each thread’s state over time, such as running, runnable or sleeping.</li>
+</ul>
+<p>Every trace file is parsed with its own context, its set of trackers. When Trace Processor creates it, it shares global state, then either creates
+or reuses each other kind of state:</p>
+<pre><code><span class="src">trace_processor_context.cc · ForkContextForTrace (comments trimmed)</span>auto [it, inserted] =
+    forked_context_state-&gt;trace_and_machine_to_context.Insert(
+        std::pair(trace_id.value, default_raw_machine_id), nullptr);
+if (inserted) {
+  auto context = std::make_unique&lt;TraceProcessorContext&gt;();
+  CopyGlobalState(this, context.get());
+  auto [trace_it, trace_inserted] =
+      forked_context_state-&gt;trace_to_context.Insert(trace_id.value, context.get());
+  if (trace_inserted) InitPerTraceState(context.get(), trace_id);
+  else                CopyTraceState(*trace_it, context.get());
+  auto [machine_it, machine_inserted] =
+      forked_context_state-&gt;machine_to_context.Insert(default_raw_machine_id, context.get());
+  if (machine_inserted) InitPerMachineState(context.get(), default_raw_machine_id);
+  else                  CopyPerMachineState(*machine_it, context.get());
+<span class="hw">  InitPerTraceAndMachineState(context.get(), machine_inserted);</span>
+  *it = std::move(context);
+}</code></pre>
+<p>There are four scopes, declared as <code>GlobalPtr</code>, <code>PerTracePtr</code>, <code>PerMachinePtr</code> and
+<code>PerTraceAndMachinePtr</code> members. The highlighted call creates fresh trackers for every (trace, machine) pair. It also
+passes a flag saying whether this is the machine’s first file. That one flag is where “primary file” comes from.</p>
+<table>
+  <thead><tr><th>Scope</th><th>Keyed by</th><th>Members (from <code>types/trace_processor_context.h</code>)</th><th>Two files on machine 0</th></tr></thead>
+  <tbody>
+    <tr><td>Global</td><td>root</td><td><code>TraceStorage</code>, <code>TraceSorter</code>, <code>ClockSynchronizer</code>, <code>TraceTimeState</code>, <code>GlobalArgsTracker</code>, <code>StackProfileTracker</code>, <code>ProfilerSampleTracker</code>, <code>TraceManifestState</code>, …</td><td class="good">shared</td></tr>
+    <tr><td>Per trace</td><td>trace id</td><td><code>TraceState</code>, <code>ImportLogsTracker</code>, content analyzer</td><td>one each</td></tr>
+    <tr><td>Per machine</td><td>raw machine id</td><td><code>ProcessTracker</code>, <code>CpuTracker</code>, <code>MachineTracker</code>, <code>MappingTracker</code>, <code>SymbolTracker</code>, <code>GpuTracker</code>, <code>UserTracker</code></td><td class="good">shared: same pid → same utid, same cpu → same ucpu</td></tr>
+    <tr><td>Per trace + machine</td><td>(trace, machine)</td><td><code>ClockTracker</code>, <code>TrackTracker</code>, <code>TrackCompressor</code>, <code>SliceTracker</code>, <code>SchedEventTracker</code>, <code>EventTracker</code>, <code>FlowTracker</code>, <code>MetadataTracker</code>, <code>StatsTracker</code>. Lazily: <code>FtraceSchedEventTracker</code>, <code>ThreadStateTracker</code>, <code>BinderTracker</code>, <code>SystraceParser</code></td><td class="warn">one each</td></tr>
+  </tbody>
+</table>
+
+<figure>
+<figcaption><b>Figure 10. Who a thread or CPU is, is shared per machine. What is in progress is tracked per file.</b>
+Per-file bookkeeping covers interned tracks, open slices and the slice currently running on each CPU. Part III is mostly about this mismatch.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="Shared and per-file state for two files on one machine">
+  <text x="210" y="24" class="th">file A · trace 1 · machine 0</text>
+  <text x="615" y="24" class="th">file B · trace 2 · machine 0</text>
+  <text x="10" y="64" class="tb">Global</text>
+  <rect x="200" y="40" width="790" height="48" rx="2" class="ba"/>
+  <text x="212" y="61" class="tm">TraceStorage · TraceSorter · ClockSynchronizer · TraceTimeState</text>
+  <text x="212" y="78" class="ts">one instance; both files write rows into the same tables</text>
+  <text x="10" y="128" class="tb">Per machine</text>
+  <rect x="200" y="104" width="790" height="48" rx="2" class="bg"/>
+  <text x="212" y="125" class="tm">ProcessTracker · CpuTracker · MachineTracker · MappingTracker</text>
+  <text x="212" y="142" class="ts">shared: tid 1500 in A and in B resolve to the same utid; cpu 0 to the same ucpu</text>
+  <text x="10" y="192" class="tb">Per trace</text>
+  <rect x="200" y="168" width="385" height="48" rx="2" class="b0"/><text x="212" y="197" class="tm">TraceState · ImportLogsTracker</text>
+  <rect x="605" y="168" width="385" height="48" rx="2" class="b0"/><text x="617" y="197" class="tm">TraceState · ImportLogsTracker</text>
+  <text x="10" y="252" class="tb">Per (trace, machine)</text>
+  <rect x="200" y="232" width="385" height="56" rx="2" class="bw"/>
+  <text x="212" y="253" class="tms">ClockTracker (primary) · TrackTracker</text>
+  <text x="212" y="271" class="tms">SliceTracker · FtraceSchedEventTracker</text>
+  <rect x="605" y="232" width="385" height="56" rx="2" class="bw"/>
+  <text x="617" y="253" class="tms">ClockTracker (secondary) · TrackTracker</text>
+  <text x="617" y="271" class="tms">SliceTracker · FtraceSchedEventTracker</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Putting two files on one machine is what lets a stack sample in one file join a thread’s scheduling in the other through the utid.
+It is also what lets their per-file trackers write overlapping rows for that same utid or ucpu.
+</blockquote>
+
+<h2 id="secondary"><span class="n">9</span>A second file on one machine gets private clocks, and an early timestamp can cut it off</h2>
+<p>A secondary file moves to private clock nodes at its first snapshot, so that it cannot change how the primary file converts.
+Both files carry clock snapshots. If the second file’s snapshots went into the shared canonical nodes, they could shift the first
+file’s timestamps. The code comment gives the example of an in-app trace next to a system trace.</p>
+<p>The switch happens in <code>ClockTracker::AddSnapshot</code>, on the highlighted line:</p>
+<pre><code><span class="src">importers/common/clock_tracker.cc · AddSnapshot</span>if (PERFETTO_UNLIKELY(!is_primary_ &amp;&amp; current_file_tag_ == 0)) {
+  if (PERFETTO_UNLIKELY(num_conversions_ &gt; 0)) {
+    context_-&gt;import_logs_tracker-&gt;RecordAnalysisLog(
+        stats::clock_sync_mixed_clock_sources, ...);
+  }
+<span class="hw">  current_file_tag_ = own_file_id_;</span>
+}
+const bool bridge_realtime =
+    !is_primary_ &amp;&amp;
+    machine_id_ != context_-&gt;trace_time_state-&gt;clock_id.machine_id;</code></pre>
+<p>Once private, the file needs a link back to trace time. That link is the deferred sync of Section 4. It runs once, at the file’s
+first conversion, and ties the file’s private BOOTTIME to the canonical one:</p>
+<pre><code><span class="src">importers/common/clock_tracker.h / .cc · ToTraceTime and FlushDeferredClockSync (trimmed)</span>if (PERFETTO_UNLIKELY(deferred_clock_sync_.has_value()))
+  FlushDeferredClockSync();
+<span class="c">// FlushDeferredClockSync, identity case:</span>
+deferred_clock_sync_.reset();                     <span class="c">// runs at most once</span>
+ClockId qualified = ClockId::Qualify(sync.from, machine_id_, current_file_tag_);
+ClockId canonical = ClockId::Qualify(sync.from, machine_id_, 0);
+if (qualified != canonical &amp;&amp; !sync_-&gt;Convert(qualified, 0, canonical))
+  AddSnapshotInternal({{qualified, 0}, {canonical, 0}});
+BridgeToTraceTime(canonical, g);</code></pre>
+
+<h3 id="sec-usual">The usual order works</h3>
+<p><code>traced</code> writes its first clock snapshot as the first packet of every trace. So in a normal secondary file the
+snapshot arrives first and moves the file to its private tag, <i>k</i>. The first converted timestamp then adds
+BOOTTIME(tf <i>k</i>) ↔ BOOTTIME(tf 0) at zero offset. Every later conversion goes through that edge. For two files of one boot
+this is exact, because BOOTTIME is the same clock.</p>
+
+<h3 id="sec-early">A conversion before the snapshot cuts the file off</h3>
+<p>If the secondary file converts any timestamp <em>before</em> its first snapshot, the order inverts and the file loses its link
+to trace time (Figure 11):</p>
+<ol>
+  <li>The deferred sync runs while the file is still on tag zero. With tag zero, the file’s “private” node is the canonical
+  node itself, so the sync adds no edge, and it is used up.</li>
+  <li>The snapshot then moves the file to tag <i>k</i>.</li>
+  <li>From then on, the private BOOTTIME links only to the file’s own MONOTONIC and REALTIME. REALTIME is not bridged on the
+  trace-time machine (Step 2 of Section 4 applies only to other machines). Nothing connects the file to trace time.</li>
+</ol>
+
+<figure>
+<figcaption><b>Figure 11. One early timestamp makes everything after the snapshot fail.</b> The early packet itself converts,
+because it still uses the primary’s clocks.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Secondary file clock lifecycle in two packet orders">
+  <text x="10" y="18" class="th">usual: the ClockSnapshot comes first</text>
+  <rect x="10" y="28" width="170" height="36" rx="2" class="bv"/><text x="22" y="51" class="tb">ClockSnapshot</text>
+  <rect x="200" y="28" width="170" height="36" rx="2" class="b0"/><text x="212" y="51" class="tb">first timestamp</text>
+  <rect x="390" y="28" width="170" height="36" rx="2" class="b0"/><text x="402" y="51" class="tb">later packets</text>
+  <text x="22" y="82" class="ts">tag 0 → k</text>
+  <text x="212" y="82" class="ts">flush: add BOOTTIME(k) ↔</text>
+  <text x="212" y="96" class="ts">BOOTTIME(0), offset 0</text>
+  <text x="402" y="82" class="ts">convert via that edge</text>
+  <path d="M570,46 L606,46" class="lng" marker-end="url(#ahg)"/>
+  <rect x="610" y="28" width="380" height="36" rx="2" class="bg"/>
+  <text x="622" y="51" class="t">every timestamp reaches trace time</text>
+  <text x="10" y="134" class="th">early conversion: a timestamp with a clock id comes first</text>
+  <rect x="10" y="144" width="170" height="36" rx="2" class="bw"/><text x="22" y="167" class="tb">timestamped packet</text>
+  <rect x="200" y="144" width="170" height="36" rx="2" class="bv"/><text x="212" y="167" class="tb">ClockSnapshot</text>
+  <rect x="390" y="144" width="170" height="36" rx="2" class="b0"/><text x="402" y="167" class="tb">later packets</text>
+  <text x="22" y="198" class="ts">flush with tag 0: no edge,</text>
+  <text x="22" y="212" class="ts">deferred sync consumed</text>
+  <text x="212" y="198" class="ts">tag 0 → k; logs</text>
+  <text x="212" y="212" class="ts">mixed_clock_sources</text>
+  <text x="402" y="198" class="ts">BOOTTIME(k) has no</text>
+  <text x="402" y="212" class="ts">path to trace time</text>
+  <path d="M570,162 L606,162" class="lnr" marker-end="url(#ahr)"/>
+  <rect x="610" y="144" width="380" height="48" rx="2" class="br"/>
+  <text x="622" y="164" class="t">proto packets: deferred to EOF, then dropped</text>
+  <text x="622" y="182" class="ts">ftrace events: dropped as they are tokenized</text>
+</svg>
+</figure>
+
+<p>Few packets count as an early conversion, so files written by <code>traced</code> are normally safe. A proto packet is converted
+only if it names a clock: on the packet, in its sequence’s defaults, or as a trace-wide default. Proto sets no trace-wide default
+until its first snapshot. So a timestamped packet with no clock id before that passes through unconverted and does no harm.</p>
+<p>Two kinds of packet do convert:</p>
+<ul>
+  <li><b>Ftrace bundles</b>, packets holding a batch of ftrace events from one CPU, always convert. They use BOOTTIME or the bundle’s own ftrace clock.</li>
+  <li><b><code>traced</code>’s own service packets</b> name BOOTTIME explicitly, but they come after the first snapshot.</li>
+</ul>
+<p>A secondary file produced some other way can hit this. Examples are a converter, a tool that rewrites or reorders packets, or a
+writer that emits timestamped packets with explicit clock ids before any snapshot.</p>
+<p>When it happens, the stats table records it, and ftrace can fail the whole import:</p>
+<ul>
+  <li><code>clock_sync_mixed_clock_sources</code> is logged first, with <code>num_conversions_using_primary</code>.</li>
+  <li><code>clock_sync_failure_no_path</code> is logged for every failed conversion.</li>
+  <li>Proto packets are retried at the end of the file, then counted in <code>clock_sync_failure_undeferrable_packet_loss</code>.</li>
+  <li>Ftrace events get no retry. Bundles from newer Perfetto can carry a per-CPU start timestamp. If that value fails to convert,
+  the import fails with “Failed to convert timestamp to trace time”.</li>
+</ul>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+If a secondary file loses everything after its first snapshot, look for <code>clock_sync_mixed_clock_sources</code> on that trace id.
+Giving the file its own machine name in a manifest avoids the problem. It then becomes primary on its machine and stays on the canonical nodes.
+</blockquote>
+
+<!-- ═════════════════════════ PART III ═════════════════════════ -->
+<div class="part">Part III · Where same-machine merging breaks</div>
+
+<h2 id="cat"><span class="n">10</span>Joining traces with cat makes unrelated writers share state</h2>
+<p>Gluing two trace files together with <code>cat</code> gives a file that loads, but it is still one trace, and the two halves
+mix up their writers. This part lists where merging gives wrong or missing results when the files come from one device. Skipping
+the archive is the first trap.</p>
+<p>A Perfetto proto trace is a sequence of length-prefixed packets, so <code>cat a.pftrace b.pftrace</code> parses. But it has one
+context, one reader and one table of per-sequence state, keyed by sequence id. <code>traced</code> numbers sequences per session:
+1 for the service, then counting up for writers in the order they appear. So the two halves reuse the same ids for unrelated writers (Figure 12).</p>
+
+<figure>
+<figcaption><b>Figure 12. After cat, two unrelated writers share one sequence id. An archive keeps them apart.</b>
+Each session numbers its writers from the start, so the ids collide.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 210" role="img" aria-label="Sequence ids colliding after cat versus separate in an archive">
+  <text x="10" y="20" class="th">cat a.pftrace b.pftrace · one trace</text>
+  <text x="450" y="20" class="th">archive · two traces</text>
+  <rect x="10" y="32" width="400" height="168" rx="3" class="panel"/>
+  <text x="24" y="56" class="ts">sequence id</text><text x="130" y="56" class="ts">writer from a</text><text x="270" y="56" class="ts">writer from b</text>
+  <text x="24" y="86" class="tm">1</text>
+  <rect x="120" y="70" width="270" height="26" rx="2" class="b2"/><text x="132" y="88" class="ts">service (a), then service (b)</text>
+  <text x="24" y="122" class="tm">2</text>
+  <rect x="120" y="106" width="130" height="26" rx="2" class="ba"/><text x="132" y="124" class="ts">writer X</text>
+  <rect x="260" y="106" width="130" height="26" rx="2" class="br"/><text x="272" y="124" class="ts">writer P</text>
+  <text x="24" y="158" class="tm">3</text>
+  <rect x="120" y="142" width="130" height="26" rx="2" class="ba"/><text x="132" y="160" class="ts">writer Y</text>
+  <rect x="260" y="142" width="130" height="26" rx="2" class="br"/><text x="272" y="160" class="ts">writer Q</text>
+  <text x="24" y="190" class="ts tr">same key: clocks and state are shared</text>
+  <rect x="450" y="32" width="190" height="168" rx="3" class="panel"/>
+  <rect x="660" y="32" width="190" height="168" rx="3" class="panel"/>
+  <text x="464" y="56" class="ts">trace 1 (a)</text><text x="674" y="56" class="ts">trace 2 (b)</text>
+  <rect x="464" y="70" width="160" height="26" rx="2" class="b2"/><text x="476" y="88" class="ts">1 · service</text>
+  <rect x="464" y="106" width="160" height="26" rx="2" class="ba"/><text x="476" y="124" class="ts">2 · writer X</text>
+  <rect x="464" y="142" width="160" height="26" rx="2" class="ba"/><text x="476" y="160" class="ts">3 · writer Y</text>
+  <rect x="674" y="70" width="160" height="26" rx="2" class="b2"/><text x="686" y="88" class="ts">1 · service</text>
+  <rect x="674" y="106" width="160" height="26" rx="2" class="bg"/><text x="686" y="124" class="ts">2 · writer P</text>
+  <rect x="674" y="142" width="160" height="26" rx="2" class="bg"/><text x="686" y="160" class="ts">3 · writer Q</text>
+  <text x="464" y="190" class="ts tg">separate ids and state</text>
+  <text x="674" y="190" class="ts tg">per trace</text>
+</svg>
+</figure>
+
+<p>Sharing sequence ids causes four problems:</p>
+<ul>
+  <li><b>Interned data is only partly protected.</b> Each writer’s first packet normally sets a flag saying later packets will not
+  refer to interned data sent before it. So the second half’s writer starts with a clean interning table instead of reusing the
+  first half’s strings. Anything else keyed by sequence id is shared between the halves.</li>
+  <li><b>Private clocks collide.</b> Both halves feed the same sequence-scoped clock node. If the second half’s values are lower,
+  the clock goes backwards and loses its outgoing edges (Section 2).</li>
+  <li><b>Snapshots can be rejected.</b> If the second half was recorded before the first, its snapshots go backwards in trace time and are rejected.</li>
+  <li><b>Metadata is overwritten.</b> Single-value metadata, such as <code>trace_uuid</code> and <code>trace_config_pbtxt</code>,
+  has one row per key, machine and trace. Both halves share one trace id, so the second half’s value replaces the first’s.</li>
+</ul>
+<p>An archive avoids all of this, because each member gets its own trace id, reader and sequence state.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Never merge Perfetto traces with <code>cat</code>. Pack them into a TAR instead, for example with <code>trace_processor util merge</code> (Section 5).
+</blockquote>
+
+<h2 id="tracks"><span class="n">11</span>The same thread recorded by two files gets two tracks</h2>
+<p>When two files on one machine record slices for the same thread, Trace Processor creates two tracks for it, and the slices never
+nest. A <b>track</b> is a timeline that events hang off: a row in the track table that slices or counter values point to, drawn
+as one lane in the UI. The two files’ slices should share one track so that they nest and line up.</p>
+<p>They do not, because each file creates its own tracks. The track tracker creates each track once and reuses it. It looks tracks
+up in its own map, keyed by a hash of the track’s <b>blueprint</b> and its dimensions. The blueprint is the track’s type, such as
+“thread execution”. A dimension is a key such as the utid:</p>
+<pre><code><span class="src">importers/common/track_tracker.h · InternTrackInner</span>uint64_t hash = tracks::HashFromBlueprintAndDimensions(bp, dims);
+auto [it, inserted] = tracks_.Insert(hash, {});
+if (inserted) {
+  *it = CreateTrack(bp, dims, name, args, unit);   <span class="c">// new row in the track table</span>
+}
+return *it;</code></pre>
+<p>Each file has its own track tracker, so each map starts empty. If both files emit slices on one thread’s main track, each creates
+a row with the same type and the same utid (Figure 13). Each file’s slice tracker also keeps its own stacks, so the two sets of
+slices never nest in each other.</p>
+
+<figure>
+<figcaption><b>Figure 13. Two per-file track maps both miss, so one thread ends up with two tracks.</b> The thread itself is
+shared, because thread identity is per machine.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 196" role="img" aria-label="Two files creating two thread tracks for the same utid">
+  <rect x="10" y="20" width="250" height="60" rx="2" class="b0"/>
+  <text x="22" y="44" class="tb">file A’s track map</text>
+  <text x="22" y="64" class="ts">empty → miss → create</text>
+  <rect x="10" y="116" width="250" height="60" rx="2" class="b0"/>
+  <text x="22" y="140" class="tb">file B’s track map</text>
+  <text x="22" y="160" class="ts">empty → miss → create</text>
+  <path d="M260,50 L346,50" class="lna" marker-end="url(#aha)"/>
+  <path d="M260,146 L346,146" class="lnv" marker-end="url(#ahv)"/>
+  <rect x="350" y="20" width="250" height="60" rx="2" class="ba"/>
+  <text x="362" y="44" class="tb">track 41</text>
+  <text x="362" y="64" class="ts">thread execution · utid 7</text>
+  <rect x="350" y="116" width="250" height="60" rx="2" class="bv"/>
+  <text x="362" y="140" class="tb">track 42</text>
+  <text x="362" y="160" class="ts">thread execution · utid 7</text>
+  <path d="M600,50 L686,90" class="ln" marker-end="url(#ah)"/>
+  <path d="M600,146 L686,106" class="ln" marker-end="url(#ah)"/>
+  <rect x="690" y="74" width="160" height="48" rx="2" class="bg"/>
+  <text x="702" y="96" class="tb">utid 7</text>
+  <text x="702" y="113" class="ts">one shared thread</text>
+  <text x="10" y="192" class="ts">Track and utid numbers are illustrative.</text>
+</svg>
+</figure>
+
+<p>Counters behave the same way. The same counter recorded by both files becomes two counter tracks. A query that groups counter
+values by name rather than by track sees two interleaved series instead of one.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+If both files on one machine trace the same thread or counter, expect two tracks for it. Query by track id, or check for duplicates
+with the Section 17 query before aggregating.
+</blockquote>
+
+<h2 id="sched"><span class="n">12</span>Scheduler data recorded by both files is stored twice</h2>
+<p>If both files recorded scheduler events for the same time, every scheduling row in that time is stored twice. Most CPU and
+latency analyses start from the sched and thread_state tables. Both tables assume one row per thread or CPU at any instant.</p>
+<p>Each file’s ftrace scheduler tracker handles its own copy of the same kernel events. Each tracker remembers, per CPU, which slice
+is open and which pid was switched in. But both look up CPUs and threads in the shared per-machine trackers. So both write into the
+one sched table, with the same ucpu:</p>
+<pre><code><span class="src">importers/ftrace/ftrace_sched_event_tracker.cc · PushSchedSwitch (shape)</span>auto* pending_sched = sched_event_state_.GetPendingSchedInfoForCpu(cpu);  <span class="c">// per file</span>
+if (prev_pid == pending_sched-&gt;last_pid)
+  context_-&gt;sched_event_tracker-&gt;ClosePendingSlice(pending_slice_idx, ts, ...);
+auto new_slice_idx = context_-&gt;sched_event_tracker-&gt;AddStartSlice(
+    cpu, ts, next_utid, next_prio);        <span class="c">// dur = -1 until closed</span>
+ThreadStateTracker::GetOrCreate(context_)-&gt;PushSchedSwitchEvent(...);       <span class="c">// per file</span></code></pre>
+
+<figure>
+<figcaption><b>Figure 14. In the overlap every scheduling slice is stored twice, and the first file’s last slice never closes.</b>
+The same happens in thread_state: two per-file trackers write states for the same thread, each unaware of the other’s open state.</figcaption>
+<svg viewBox="0 0 1000 230" role="img" aria-label="Two files writing the same sched_switch events">
+  <rect x="330" y="20" width="550" height="166" class="bw"/>
+  <text x="340" y="34" class="th">overlap</text>
+  <text x="10" y="58" class="ts">file A sched_switch, cpu 0</text>
+  <line x1="180" y1="54" x2="980" y2="54" class="ln"/>
+  <line x1="200" y1="44" x2="200" y2="64" class="lna"/><line x1="330" y1="44" x2="330" y2="64" class="lna"/><line x1="520" y1="44" x2="520" y2="64" class="lna"/><line x1="700" y1="44" x2="700" y2="64" class="lna"/><line x1="880" y1="44" x2="880" y2="64" class="lna"/>
+  <text x="10" y="94" class="ts">file B sched_switch, cpu 0</text>
+  <line x1="180" y1="90" x2="980" y2="90" class="ln"/>
+  <line x1="330" y1="80" x2="330" y2="100" class="lnv"/><line x1="520" y1="80" x2="520" y2="100" class="lnv"/><line x1="700" y1="80" x2="700" y2="100" class="lnv"/><line x1="880" y1="80" x2="880" y2="100" class="lnv"/><line x1="960" y1="80" x2="960" y2="100" class="lnv"/>
+  <text x="10" y="134" class="ts">sched rows, ucpu 0 (A)</text>
+  <rect x="200" y="122" width="130" height="18" class="ba"/><rect x="330" y="122" width="190" height="18" class="ba"/><rect x="520" y="122" width="180" height="18" class="ba"/><rect x="700" y="122" width="180" height="18" class="ba"/>
+  <rect x="880" y="122" width="100" height="18" fill="url(#hatchr)" class="hatch-r"/>
+  <text x="10" y="160" class="ts">sched rows, ucpu 0 (B)</text>
+  <rect x="330" y="148" width="190" height="18" class="bv"/><rect x="520" y="148" width="180" height="18" class="bv"/><rect x="700" y="148" width="180" height="18" class="bv"/><rect x="880" y="148" width="80" height="18" class="bv"/>
+  <rect x="960" y="148" width="20" height="18" fill="url(#hatchr)" class="hatch-r"/>
+  <text x="884" y="135" class="tms tr">dur −1</text>
+  <text x="180" y="208" class="ts">In the overlap every slice is stored twice, so SUM(dur) per CPU doubles there and per-CPU intervals overlap.</text>
+  <text x="180" y="224" class="ts">A’s last slice on each CPU stays open (dur = −1): B’s later switches go to B’s tracker and never close it.</text>
+</svg>
+</figure>
+
+<p>Nothing in the import flags this, so queries silently give wrong answers. Any query that assumes intervals do not overlap per
+CPU or per thread is affected. Interval intersection keyed by ucpu or utid is one example. The duplication does not raise
+<code>mismatched_sched_switch_tids</code>, the stat counted when a switch’s outgoing thread is not the one last switched in on that
+CPU. Each tracker sees its own file’s consistent stream, so it never sees such a mismatch.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Merge two files onto one machine only when their data sources do not overlap. For example, one has scheduler data and the other only
+stack samples. If both have ftrace, give them separate machines, or crop one so the time ranges do not overlap.
+</blockquote>
+
+<h2 id="manifest"><span class="n">13</span>Two common manifest uses fail on files from one device</h2>
+<p>A manifest clock pin between two files on one machine either fails the load or misses the file it was meant for. Compressed
+members cannot be configured at all. The manifest is how you override the defaults of Part II: which machine a file belongs to,
+which clock is trace time, and fixed clock relations.</p>
+<p>A <code>clocks</code> entry relates one of this file’s clocks to a clock of another file. At a common instant, the other file’s
+clock reads this file’s value plus <code>offset_ns</code>. This page calls any such entry a <b>pin</b>. The reference doc reserves
+“pin” for the form without a clock, used for files with no clocks of their own.</p>
+<p>The layout below follows the manifest reference in Perfetto’s docs (<code>docs/reference/perfetto-manifest.md</code>).
+It is the recommended layout for two traces from one device when both record ftrace or a reboot separates them (Sections 12 and 14):</p>
+<pre><code><span class="src">perfetto_manifest.json (shape)</span>{
+  "perfetto_manifest": {
+    "version": 1,
+    "files": [
+      {"path": "system.pftrace", "machine": {"name": "phone-system"}},
+      {"path": "sampling.pftrace", "machine": {"name": "phone-sampling"},
+       "clocks": {"clock": "BOOTTIME",
+                  "sync_to": {"file": "system.pftrace", "clock": "BOOTTIME"},
+                  "offset_ns": 0}}
+    ]
+  }
+}</code></pre>
+<p>Two other uses of a pin go wrong when both files are on one machine.</p>
+<h3>A BOOTTIME-to-BOOTTIME pin on one machine fails the load</h3>
+<p>If neither file names a machine, a BOOTTIME-to-BOOTTIME pin joins a clock to itself, and the import fails (Figure 15).
+The manifest reader resolves both ends of a pin to machine rows. It then builds the edge from each machine’s canonical clocks:</p>
+<pre><code><span class="src">plugins/perfetto_manifest/perfetto_manifest_reader.cc · ApplyManifest (shape: TraceFile branches omitted)</span>uint32_t source_row = EnsureMachineRow(context_, source_raw);
+uint32_t ref_row = EnsureMachineRow(context_, ref_raw);
+ClockId source = ClockId::Machine(source_row, *co.source_clock);
+ClockId ref = ClockId::Machine(ref_row, *co.ref_clock);
+int64_t source_ts = co.offset_ns &lt; 0 ? -co.offset_ns : 0;
+int64_t ref_ts = co.offset_ns &gt; 0 ? co.offset_ns : 0;
+std::vector&lt;ClockTimestamp&gt; clocks = {{source, source_ts}, {ref, ref_ts}};
+ASSIGN_OR_RETURN(uint32_t id, context_-&gt;clock_sync-&gt;AddSnapshot(clocks));</code></pre>
+
+<figure>
+<figcaption><b>Figure 15. Without machine names, both ends of the pin are the same clock node, so the load fails.</b>
+With a machine name per file, the pin joins two different nodes and is accepted.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 190" role="img" aria-label="BOOTTIME pin on one machine versus two named machines">
+  <text x="10" y="20" class="th">no machine names</text>
+  <text x="450" y="20" class="th">one machine name per file</text>
+  <rect x="10" y="32" width="400" height="148" rx="3" class="panel"/>
+  <text x="24" y="58" class="ts">system.pftrace → machine 0</text>
+  <text x="24" y="76" class="ts">sampling.pftrace → machine 0</text>
+  <rect x="120" y="92" width="180" height="40" rx="2" class="br"/>
+  <text x="132" y="117" class="tb">BOOTTIME, machine 0</text>
+  <path d="M300,104 C350,80 350,140 304,122" class="lnr" marker-end="url(#ahr)"/>
+  <text x="24" y="160" class="ts tr">the pin joins a clock to itself:</text>
+  <text x="24" y="174" class="ts tr">“duplicate clock domain”, import fails</text>
+  <rect x="450" y="32" width="400" height="148" rx="3" class="panel"/>
+  <text x="464" y="58" class="ts">system.pftrace → phone-system</text>
+  <text x="464" y="76" class="ts">sampling.pftrace → phone-sampling</text>
+  <rect x="464" y="92" width="160" height="40" rx="2" class="ba"/>
+  <text x="476" y="111" class="tb">BOOTTIME</text><text x="476" y="125" class="ts">phone-system</text>
+  <rect x="676" y="92" width="160" height="40" rx="2" class="bg"/>
+  <text x="688" y="111" class="tb">BOOTTIME</text><text x="688" y="125" class="ts">phone-sampling</text>
+  <line x1="624" y1="112" x2="676" y2="112" class="lng"/>
+  <text x="464" y="160" class="ts tg">two nodes, one edge: accepted</text>
+</svg>
+</figure>
+
+<p>Both files resolve to raw machine 0 and the same row. With BOOTTIME on both sides, the two ends are the same clock id. Adding a
+snapshot with the same clock twice returns “Clock sync error: duplicate clock domain with id=6 at snapshot N.”, and the import fails.
+The device1/device2 example in the manifest reference has this shape, so it needs distinct machine names on the two files.</p>
+<p>A pin between different clocks on one machine is accepted, but it may not reach the file it was meant for. Take this file’s
+MONOTONIC pinned to the other’s BOOTTIME. The edge lands on the canonical nodes, which belong to the primary file. A secondary file
+with its own snapshots converts through its private nodes and the identity edge of Section 9, so the offset does not apply to it.
+The pin also adds a second MONOTONIC ↔ BOOTTIME relation next to the primary’s own snapshots. The primary file’s conversions can
+then go through either one.</p>
+
+<h3>Overrides are rejected on compressed members</h3>
+<p>A manifest cannot assign a machine or clocks to a compressed member, so decompress members first. The manifest matches entries by
+exact member path. A <code>.pftrace.gz</code> or <code>.zst</code> member is only a container, and Trace Processor refuses a
+<code>machine</code> or <code>clocks</code> override on it. The error is “perfetto_manifest: overrides are not supported for trace
+files which are themselves archives or perfetto_manifest files”. The decompressed inner file has an empty name, so it cannot be
+targeted either.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+To relate two proto traces from one device by hand, give each its own <code>machine</code> name, store them uncompressed, and pin one
+to the other. Each is then primary on its machine, so the edge lands on the clocks it actually uses. The cost is that the two files no
+longer share a process tracker. The same thread gets two utids, and cross-file joins must go through tid and machine instead.
+</blockquote>
+
+<h2 id="reboot"><span class="n">14</span>A reboot between two files puts the second one at the wrong time</h2>
+<p>Two traces from one phone with a reboot between them still land on the same machine by default, and the second one lands at the
+wrong time. A <b>reboot</b> restarts BOOTTIME and MONOTONIC from zero and starts every process again with fresh pids.</p>
+<p>The second trace is a secondary file on the trace-time machine. So it is placed by the BOOTTIME identity edge, never by REALTIME.
+Its BOOTTIME values count from the new boot, so it lands in the wrong place (Figure 16). It lands before the first trace if it was
+recorded soon after boot. It lands on top of it if both were taken at similar <b>uptimes</b>, the time since boot.</p>
+
+<figure>
+<figcaption><b>Figure 16. After a reboot, BOOTTIME starts again from zero, so a trace taken soon after it is placed before the earlier one.</b>
+Placement uses BOOTTIME, not the wall clock. Times are illustrative.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 180" role="img" aria-label="Two traces across a reboot, by wall clock and by BOOTTIME">
+  <text x="10" y="20" class="th">what happened · wall clock</text>
+  <line x1="10" y1="56" x2="850" y2="56" class="ln"/>
+  <rect x="250" y="40" width="130" height="32" rx="2" class="ba"/><text x="262" y="61" class="ts">trace A · uptime 5 h</text>
+  <line x1="470" y1="34" x2="470" y2="78" class="lnr dash"/><text x="478" y="44" class="ts tr">reboot</text>
+  <rect x="540" y="40" width="150" height="32" rx="2" class="bv"/><text x="552" y="61" class="ts">trace B · uptime 10 min</text>
+  <text x="10" y="106" class="th">where the merge puts them · BOOTTIME</text>
+  <line x1="10" y1="142" x2="850" y2="142" class="ln"/>
+  <text x="10" y="168" class="tms">0</text><text x="250" y="168" class="tms">5 h</text>
+  <rect x="20" y="126" width="150" height="32" rx="2" class="br"/><text x="32" y="147" class="ts">trace B · 10 min</text>
+  <rect x="250" y="126" width="130" height="32" rx="2" class="ba"/><text x="262" y="147" class="ts">trace A · 5 h</text>
+  <text x="420" y="122" class="ts tr">B is placed hours before A</text>
+</svg>
+</figure>
+
+<p>Both files also share one process tracker. So a pid reused after the reboot can resolve to a thread or process from before the
+reboot, unless the trace records the new process starting.</p>
+<p>In the trace model, two boots are two machines. Give each boot its own manifest machine name. Each file is then primary on its
+machine, and each gets its own process tracker. The second file reaches trace time through the REALTIME rendezvous (Section 4, Step 2).</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Before merging two traces from one phone, compute REALTIME − BOOTTIME from each trace’s first clock snapshot. Within one boot it stays
+the same, apart from NTP steps. If the two values differ by more than a few seconds, a reboot happened in between, so use separate machine names.
+</blockquote>
+
+<h2 id="ringbuf"><span class="n">15</span>Ring-buffer trace pairs are useful only inside the scheduler window and without suspend</h2>
+<p>When you pair a long ring-buffer trace with another trace from the same phone, the overlap that matters is where scheduler data
+survives, and suspend can shift MONOTONIC events. A useful same-device merge pairs two kinds of trace:</p>
+<ul>
+  <li>A <b>long ring-buffer system trace</b> comes from a long-running session that keeps recent system activity, including scheduler data, in
+  ring buffers and saves it when a trigger fires.</li>
+  <li>A <b>stack-sampling trace</b> comes from a separate session that records periodic and event-triggered call-stack samples.</li>
+</ul>
+<h3>The scheduler window is much shorter than the trace</h3>
+<p>A ring-buffer trace keeps the most recent data per buffer. High-rate ftrace wraps quickly, so scheduler data covers only the tail
+of a trace whose other buffers span much longer. Overlap computed on the full start-to-end range mostly finds pairs that overlap
+where scheduler data was already overwritten (Figure 17).</p>
+<p>So compute overlap against a <b>sched window</b> instead: the last stretch of the trace, as long as the time its scheduler data
+covers. Section 18 gives the formula.</p>
+<figure>
+<figcaption><b>Figure 17. Both stack-sampling traces overlap the ring-buffer trace, but only the second overlaps data you can join against.</b>
+The sched window is the tail of the trace where scheduler data survives.</figcaption>
+<svg viewBox="0 0 1000 170" role="img" aria-label="Full trace window versus sched window">
+  <text x="10" y="44" class="ts">ring buffer</text>
+  <rect x="120" y="28" width="780" height="26" rx="2" class="b0"/>
+  <text x="132" y="45" class="tms">trace start … trace end</text>
+  <rect x="760" y="28" width="140" height="26" rx="2" class="ba"/>
+  <text x="768" y="45" class="tms">sched window</text>
+  <text x="10" y="88" class="ts">sampling 1</text>
+  <rect x="300" y="72" width="260" height="26" rx="2" class="br"/>
+  <text x="312" y="89" class="tms">overlaps the trace, not sched</text>
+  <text x="10" y="132" class="ts">sampling 2</text>
+  <rect x="700" y="116" width="170" height="26" rx="2" class="bg"/>
+  <text x="772" y="133" class="tms">overlaps sched</text>
+  <line x1="760" y1="20" x2="760" y2="150" class="lna dash"/>
+  <text x="590" y="162" class="ts">trace end − scheduler span</text>
+</svg>
+</figure>
+<h3>MONOTONIC events after a suspend are shifted earlier</h3>
+<p>A MONOTONIC timestamp after a suspend is placed too early, by the length of the suspend. Conversion uses the latest snapshot at or
+before the timestamp (Section 2). MONOTONIC does not advance during suspend, so a timestamp after resume still falls in the
+pre-suspend snapshot’s range. The error lasts until the next snapshot that <code>traced</code> keeps. BOOTTIME events are not
+affected.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+When pairing ring-buffer traces, compute overlap against the ring-buffer trace’s sched window, not its full range. Skip ring-buffer
+traces that recorded a suspend if any of your data uses MONOTONIC timestamps.
+</blockquote>
+
+<!-- ═════════════════════════ PART IV ═════════════════════════ -->
+<div class="part">Part IV · Practice</div>
+
+<h2 id="recipes"><span class="n">16</span>A short checklist and one recipe per kind of merge cover the rules above</h2>
+<p>Parts I to III reduce to a few checks for building a set of traces from one device, and one recipe for each kind of merge.
+Before putting several files from one phone onto one machine:</p>
+<ul>
+  <li>Compute overlap against the sched window, not the full trace range (Section 15).</li>
+  <li>Skip traces that recorded a suspend if any of your data uses MONOTONIC timestamps (Section 15).</li>
+  <li>Skip traces that report data loss or import errors.</li>
+  <li>Choose the anchor file: give every member the same compression and prefix the names (<code>00_</code>, <code>01_</code>) (Section 6).</li>
+  <li>Make sure all files come from one boot (Section 14). A shared device, build and overlapping wall-clock windows make one boot
+  likely, but do not prove it.</li>
+  <li>Make sure only one file records scheduler data (Section 12). For a stack-sampling trace this depends on its config.</li>
+</ul>
+
+<p>For each kind of merge, the table gives the recipe:</p>
+<table>
+  <thead><tr><th>What you are merging</th><th>Do this</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Host + VM, recorded live</td><td><code>traced_relay</code> on the guest, one trace</td><td>Offsets are measured (Section 3). Machine ids are stamped on packets.</td></tr>
+    <tr><td>Two devices, recorded separately</td><td>Archive. Manifest with one <code>machine</code> name per file.</td><td>Separate process/CPU namespaces. Placement by REALTIME rendezvous.</td></tr>
+    <tr><td>One device, one boot, disjoint data sources</td><td>Archive, no manifest. Prefix names so the anchor is first. Same compression for all.</td><td>Shared <code>utid</code>/<code>ucpu</code> makes cross-file joins work.</td></tr>
+    <tr><td>One device, both files with ftrace, or across a reboot</td><td>Decompress. Manifest with separate machine names.</td><td>Avoids duplicate <code>sched</code>/<code>thread_state</code> rows and the BOOTTIME identity edge. Cost: no shared <code>utid</code>. Join on tid.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="checking"><span class="n">17</span>Six queries catch the failures that load without an error</h2>
+<p>Most of Part III produces no error: the trace loads and the numbers are wrong. Run these queries after loading to check each failure mode.</p>
+<pre><code><span class="c">-- Files in processing order, with their parent container.</span>
+<span class="k">SELECT</span> id, parent_id, name, trace_type, processing_order, size
+<span class="k">FROM</span> __intrinsic_trace_file <span class="k">ORDER BY</span> processing_order;
+
+<span class="c">-- Machines and how much each owns.</span>
+<span class="k">SELECT</span> m.id, m.raw_id, m.name,
+  (<span class="k">SELECT</span> COUNT(*) <span class="k">FROM</span> thread t <span class="k">WHERE</span> t.machine_id = m.id) <span class="k">AS</span> threads
+<span class="k">FROM</span> machine m;
+
+<span class="c">-- Clock problems, per file.</span>
+<span class="k">SELECT</span> name, value, machine_id, trace_id <span class="k">FROM</span> stats
+<span class="k">WHERE</span> value &gt; 0 <span class="k">AND</span> (name GLOB <span class="k">'clock_sync*'</span> <span class="k">OR</span> name = <span class="k">'invalid_clock_snapshots'</span>
+  <span class="k">OR</span> name = <span class="k">'trace_sorter_negative_timestamp_dropped'</span>);
+
+<span class="c">-- Every edge in the clock graph, including bridges and manifest edges.</span>
+<span class="k">SELECT</span> snapshot_id, machine_id, clock_name, clock_value, ts <span class="k">FROM</span> clock_snapshot
+<span class="k">ORDER BY</span> snapshot_id;
+
+<span class="c">-- Duplicate main-thread tracks (Section 11).</span>
+<span class="k">SELECT</span> utid, COUNT(*) <span class="k">AS</span> n, GROUP_CONCAT(id) <span class="k">AS</span> track_ids
+<span class="k">FROM</span> thread_track <span class="k">WHERE</span> type = <span class="k">'thread_execution'</span>
+<span class="k">GROUP BY</span> utid <span class="k">HAVING</span> n &gt; 1;
+
+<span class="c">-- Duplicate sched rows (Section 12): two slices starting at the same instant on one CPU.</span>
+<span class="k">SELECT</span> ucpu, ts, COUNT(*) <span class="k">AS</span> n <span class="k">FROM</span> sched
+<span class="k">GROUP BY</span> ucpu, ts <span class="k">HAVING</span> n &gt; 1 <span class="k">LIMIT</span> 20;</code></pre>
+<p>Every edge added to the clock graph is written to the <code>clock_snapshot</code> table, including fallback links and manifest
+pins (<code>ClockTracker::AddSnapshotToTable</code>). So a fallback link you did not expect shows up there as a snapshot with zero-offset values.</p>
+
+<h2 id="method"><span class="n">18</span>Numbers and method</h2>
+<p>This page describes code, so it has no measurements. The prose rounds or omits the exact constants and the
+code symbols behind each rule. They are collected here, section by section, as found in the upstream Perfetto repository at
+commit <code>9843f023eb</code>.</p>
+<table>
+  <thead><tr><th>Section</th><th>Rule in the prose</th><th>Exact value and code</th></tr></thead>
+  <tbody>
+    <tr><td>2</td><td><code>traced</code> writes a snapshot first in every trace</td><td><code>TracingServiceImpl::ReadBuffers</code> emits <code>initial_clock_snapshot</code> before the trace config.</td></tr>
+    <tr><td>2</td><td>Periodic snapshots go into a small ring, kept only after real drift</td><td>Ring of 16 entries. A new snapshot is kept only if some clock drifted by at least 10 ms against BOOTTIME since the last (<code>SnapshotClocks</code>, <code>kSignificantDriftNs</code>).</td></tr>
+    <tr><td>2</td><td>Nodes keep a time series, and snapshots of the same clocks share one</td><td><code>ClockSynchronizer::AddSnapshot</code> appends a (snapshot id, timestamp) pair per clock. The snapshot hash covers the clock ids in order. Edges are labelled with the hash.</td></tr>
+    <tr><td>2</td><td>Paths have at most four edges</td><td>Breadth-first search with <code>kMaxLen = 4</code> hops. Each hop takes the latest snapshot whose source value is ≤ the timestamp.</td></tr>
+    <tr><td>2</td><td>Offsets and their ranges are cached</td><td>8 cache entries (Figure 4).</td></tr>
+    <tr><td>2</td><td>A clock going backwards loses outgoing edges</td><td>The clock is marked non-monotonic. If it is the trace-time clock, <code>AddSnapshot</code> fails with “the trace clock … is not monotonic”.</td></tr>
+    <tr><td>3</td><td>Four timestamps per round, a round every 30 seconds</td><td><code>RelayClient::SendSyncClockRequest</code>. The next round starts 30 s after the UPDATE response (<code>kSyncClockIntervalMs = 30000</code>).</td></tr>
+    <tr><td>3</td><td>The host keeps about two rounds</td><td>The five most recent exchanges per relay client, two per round (<code>RelayEndpointImpl::SyncClocks</code>, <code>kNumSyncClocks = 5</code>). Written once per session by <code>MaybeEmitRemoteClockSync</code>.</td></tr>
+    <tr><td>3</td><td>Entries of one round are paired and averaged</td><td>Adjacent entries whose client BOOTTIME readings are less than 30 s apart. All offsets in the packet, at most two full rounds, are averaged per clock.</td></tr>
+    <tr><td>3</td><td>One edge per clock between host and client</td><td><code>ParseRemoteClockSync</code> calls <code>AddQualifiedSnapshot</code>: host clock at <code>host_anchor</code>, the last host reading of that clock, and client clock at <code>host_anchor + offset</code>.</td></tr>
+    <tr><td>4</td><td>The fallback is planned at open and runs at the first conversion</td><td><code>ForwardingTraceParser::Init</code> registers the deferred sync. <code>ClockTracker::FlushDeferredClockSync</code> runs at the first conversion and calls <code>BridgeToTraceTime</code>.</td></tr>
+    <tr><td>5</td><td>The merge command warns about clock drops</td><td>A tokenize-only pass warns if <code>clock_sync_unrelatable_clock_domains</code>, <code>clock_sync_failure_no_path</code> or <code>trace_sorter_negative_timestamp_dropped</code> is non-zero.</td></tr>
+    <tr><td>6</td><td>Hidden members are skipped, and members are sorted and parsed one at a time</td><td><code>IsHiddenArchivePath</code>. Each member gets a <code>trace_file</code> row and goes into a <code>std::map</code> keyed by <code>ArchiveEntry</code>. Each is parsed completely (<code>Parse</code> then <code>OnPushDataToSorter</code>) before the next. Default priority is 2.</td></tr>
+    <tr><td>6</td><td>A compressed member is read as a nested file with an empty name</td><td><code>DecompressingTraceReader</code> opens a nested <code>ForwardingTraceParser</code> with a new row from <code>trace_file_tracker-&gt;AddFile("")</code>.</td></tr>
+    <tr><td>7</td><td>Sequence clocks include the trace id, and builtin clocks get a file tag</td><td><code>ClockId::Sequence(trace_id, seq_id, clock)</code>. The file tag comes from the <code>ClockTracker</code> that qualifies the clock: 0 for canonical nodes, else the file’s own id.</td></tr>
+    <tr><td>7</td><td>Adopting an embedded machine id, or forking a reader for it</td><td><code>ResolveAdoptedMachine</code> adopts when the host machine has produced no data, its row is unclaimed, the file is not remapped by a manifest, and no context exists yet for that id. Otherwise <code>CreateRemoteMachineReader</code> forks a reader and registers a deferred BOOTTIME sync.</td></tr>
+    <tr><td>7</td><td>Machine rows are created in order</td><td><code>MachineTracker</code> assigns row ids. Manifest names get raw ids from <code>kFirstManifestMachineId</code> = 2<sup>32</sup> upwards in <code>ApplyManifest</code>.</td></tr>
+    <tr><td>7</td><td>Who claims trace time, and when</td><td>Trace time starts as <code>ClockId::TraceFile(0)</code>. Non-proto formats claim in <code>Init</code>. Proto has <code>claims_global_clock = false</code>. The claimed node is <code>Qualify(clock, machine_id_, 0)</code>.</td></tr>
+    <tr><td>7</td><td>The primary file always uses canonical nodes</td><td>Its <code>ClockTracker</code> is built with <code>is_primary = true</code> and always tags builtins with 0.</td></tr>
+    <tr><td>8</td><td>Each file gets its own context</td><td><code>TraceProcessorContext</code>, created by <code>ForkContextForTrace(trace_id, raw_machine_id)</code>. The primary flag is <code>machine_inserted</code>, passed as <code>is_primary_trace_for_machine</code>.</td></tr>
+    <tr><td>9</td><td>An early conversion leaves no edge</td><td>The flush sees <code>qualified == canonical</code> while the tag is still 0.</td></tr>
+    <tr><td>9</td><td>Which proto packets convert</td><td><code>ProtoTraceReader::TimestampTokenizeAndPushToSorter</code> converts a packet only if it has <code>timestamp_clock_id</code>, a clock in its sequence’s <code>TracePacketDefaults</code>, or a trace default clock.</td></tr>
+    <tr><td>9</td><td>Newer ftrace bundles carry a per-CPU start timestamp</td><td>Perfetto v44+ writes <code>previous_bundle_end_timestamp</code> or <code>last_read_event_timestamp</code>. Failed proto conversions are retried at end of file.</td></tr>
+    <tr><td>10</td><td>One reader and one sequence-state table after <code>cat</code></td><td>Packets are length-prefixed <code>TracePacket</code>s. One <code>ProtoTraceReader</code>, with state keyed by <code>trusted_packet_sequence_id</code>.</td></tr>
+    <tr><td>10</td><td>Sequence numbering</td><td>1 for the service (<code>kServicePacketSequenceID</code>), then 2, 3, … for writers in order of appearance (<code>TracingSession::GetPacketSequenceID</code>).</td></tr>
+    <tr><td>10</td><td>Interned-data flag, rejected snapshots, overwritten metadata</td><td><code>SEQ_INCREMENTAL_STATE_CLEARED</code>. <code>AddSnapshot</code> rejects backwards snapshots. <code>GlobalMetadataTracker::SetMetadata</code> overwrites single-value rows.</td></tr>
+    <tr><td>11</td><td>Per-file track maps</td><td><code>TrackTracker</code> keeps a <code>tracks_</code> member map. A thread’s main track comes from <code>InternThreadTrack</code>: blueprint <code>thread_execution</code>, dimension <code>utid</code>. Each <code>SliceTracker</code> keeps its own stacks. Counters become two <code>counter_track</code> rows.</td></tr>
+    <tr><td>12</td><td>Per-file scheduler state</td><td><code>FtraceSchedEventTracker</code> keeps per-CPU <code>SchedEventState</code>: the open slice index and the pid switched in. It resolves cpu and pid through the shared <code>CpuTracker</code> and <code>ProcessTracker</code>. Thread states come from per-file <code>ThreadStateTracker</code>s.</td></tr>
+    <tr><td>13</td><td>Manifest pins and the duplicate-clock error</td><td><code>PerfettoManifestReader::ApplyManifest</code> builds the edge from machine-canonical ids. <code>ClockSynchronizer::AddSnapshot</code> returns the error, and <code>ASSIGN_OR_RETURN</code> propagates it.</td></tr>
+    <tr><td>13</td><td>Overrides on compressed members are refused</td><td>Containers have <code>forks_context = false</code>. <code>ForwardingTraceParser::Init</code> refuses the override.</td></tr>
+    <tr><td>15</td><td>The sched window</td><td><code>[trace end − scheduler span, trace end]</code>, where the scheduler span is the time the trace’s <code>sched</code> rows cover. The full range is trace start to trace end.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="sources">Sources</h2>
+<p>All paths are in the Perfetto source tree (<code>external/perfetto</code> in AOSP).</p>
+<ul>
+  <li><code>src/trace_processor/util/clock_synchronizer.{h,cc}</code>: <code>ClockId</code>, <code>Qualify</code>, snapshot hashing, BFS conversion, cache, non-monotonic handling, the duplicate-clock error</li>
+  <li><code>src/trace_processor/importers/common/clock_tracker.{h,cc}</code>: file tags, primary/secondary flip, <code>FlushDeferredClockSync</code>, <code>BridgeToTraceTime</code>, <code>SetGlobalClock</code></li>
+  <li><code>src/trace_processor/importers/common/clock_tracker_unittest.cc</code>: expected primary/non-primary behaviour</li>
+  <li><code>src/trace_processor/forwarding_trace_parser.cc</code>: per-file fork, default machine 0, clock policy, deferred sync, manifest override checks</li>
+  <li><code>src/trace_processor/util/trace_type.h</code>: <code>TraceTypeDescriptor</code> defaults (archive priority 2, clock claims)</li>
+  <li><code>src/trace_processor/importers/archive/archive_entry.{h,cc}</code>, <code>tar_trace_reader.cc</code>, <code>zip_trace_reader.cc</code>, <code>decompressing_trace_reader.cc</code>: ordering, hidden files, container priorities, nested unnamed file rows</li>
+  <li><code>src/trace_processor/importers/proto/proto_trace_reader.cc</code>: machine dispatch and adoption, <code>ParseClockSnapshot</code>, <code>ParseRemoteClockSync</code>, <code>CalculateClockOffsets</code>, EOF deferral, proto/symbols priorities</li>
+  <li><code>src/trace_processor/importers/ftrace/ftrace_tokenizer.cc</code>: BOOTTIME conversion of ftrace events, first-bundle error path</li>
+  <li><code>src/trace_processor/plugins/perfetto_manifest/perfetto_manifest_reader.cc</code>, <code>types/trace_manifest_state.h</code>: priority -1, machine naming, <code>kFirstManifestMachineId</code>, clock edges</li>
+  <li><code>src/trace_processor/trace_processor_context.cc</code>, <code>types/trace_processor_context.h</code>: <code>ForkContextForTrace</code> and the four pointer scopes</li>
+  <li><code>src/trace_processor/importers/common/machine_tracker.cc</code>: machine row creation and reuse</li>
+  <li><code>src/trace_processor/importers/common/track_tracker.h</code>: <code>InternTrackInner</code>, <code>InternThreadTrack</code></li>
+  <li><code>src/trace_processor/importers/ftrace/ftrace_sched_event_tracker.{h,cc}</code>, <code>importers/common/sched_event_tracker.h</code>, <code>thread_state_tracker.h</code>: per-file pending sched state, <code>dur = -1</code> open slices</li>
+  <li><code>src/trace_processor/shell/util_subcommand.cc</code>: <code>util merge</code> and its validation query</li>
+  <li><code>src/tracing/service/tracing_service_impl.cc</code>, <code>tracing_service_session.cc</code>, <code>tracing_service_endpoints_impl.cc</code>: snapshot emission order, drift threshold, <code>RemoteClockSync</code> emission and its five-exchange window, sequence id allocation</li>
+  <li><code>src/traced_relay/relay_service.cc</code>, <code>src/tracing/ipc/service/relay_ipc_service.cc</code>: PING/UPDATE rounds every 30 s, host snapshot on arrival</li>
+  <li><code>protos/perfetto/common/builtin_clock.proto</code>: builtin clock ids</li>
+  <li><code>protos/perfetto/trace/remote_clock_sync.proto</code>, <code>clock_snapshot.proto</code>, <code>trace_packet.proto</code>: client/host snapshot pairs, <code>primary_trace_clock</code>, <code>SEQ_INCREMENTAL_STATE_CLEARED</code></li>
+  <li><code>docs/concepts/merging-traces.md</code>, <code>docs/analysis/merging-traces.md</code>, <code>docs/reference/perfetto-manifest.md</code>, <code>docs/learning-more/multi-machine-tracing.md</code>: upstream description of the model and manifest</li>
+</ul>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>

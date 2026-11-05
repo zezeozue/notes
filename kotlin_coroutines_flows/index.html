@@ -1,0 +1,1112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kotlin coroutines, flows, Views and Compose</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="suspend · Job · cold/hot · StateFlow · combine · Compose · leak patterns">Coroutines, flows, Views &amp; Compose</span>
+  <span class="tb-spacer"></span>
+  <a class="tb-x" href="../art_costs/index.html">Where the costs are in ART</a>
+  <a class="tb-x" href="../input_display_pipeline/index.html">Input &amp; display pipeline</a>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#overview">At a glance</a>
+  <div class="ph">I · The View-era problem</div>
+  <a href="#views">1 · Views end lifetimes by hand</a>
+  <a href="#recycler">2 · Recycled Views outlive data</a>
+  <div class="ph">II · Coroutines</div>
+  <a href="#suspend">3 · What suspend compiles to</a>
+  <a href="#dispatch">4 · Dispatchers and withContext</a>
+  <a href="#dispatch-walk" style="padding-left:18px">One call, end to end</a>
+  <a href="#jobs">5 · Jobs cancel as a tree</a>
+  <a href="#jobs-attach" style="padding-left:18px">repeatWhenAttached</a>
+  <div class="ph">III · Flows</div>
+  <a href="#cold">6 · Cold flows</a>
+  <a href="#hot">7 · StateFlow and SharedFlow</a>
+  <a href="#combine">8 · combine</a>
+  <a href="#latest">9 · flatMapLatest, collectLatest</a>
+  <div class="ph">IV · Compose</div>
+  <a href="#compose">10 · remember and the slot table</a>
+  <div class="ph">V · Leak patterns</div>
+  <a href="#leaks">11 · Common leak patterns</a>
+  <a href="#cheatsheet">12 · Cheat sheet</a>
+  <a href="#method">13 · Versions and method</a>
+  <a href="#sources">Sources</a>
+</nav>
+
+<main id="top">
+<h1>Kotlin coroutines and flows: how async work outlives the UI</h1>
+<p class="lead">This note is for an engineer who knows Android Views but finds the coroutine vocabulary opaque. It starts with
+the problems of View callbacks and Handlers. It then shows what suspend functions, jobs, cold and hot flows,
+<code>combine</code>, <code>flatMapLatest</code> and Compose’s <code>remember</code> keep alive on the heap. Last, it
+lists the common leak patterns, each as a rule with a small code shape.</p>
+
+<h2 id="overview">At a glance</h2>
+<ul>
+  <li>Every leak pattern in Part V has one shape: some work, or some value, outlives the piece of UI that needed it.</li>
+  <li>In View code, each callback, posted message and background task is a lifetime you must end by hand.</li>
+  <li>Coroutines make that lifetime an object, a job, which is cancelled together with its parent.</li>
+  <li>The mistake moves rather than disappears: a flow collected in a scope that lives too long keeps its inputs alive.</li>
+  <li>The main fixes are: collect in a scope that ends with the UI, share lazily, switch inputs with <code>flatMapLatest</code>, remove timers, and key what you remember.</li>
+</ul>
+<p>Some examples of the shape. A View is detached, but a queued message still points at it. A dialog is closed, but a
+callback is still registered. A View is hidden, but a collector still sets a large picture on it.</p>
+<p>To spot these patterns in coroutine and flow code, you need to know what the operators actually keep alive. That is what Parts II
+and III are about. Exact sources and versions are listed in <a href="#method">Versions and method</a>.</p>
+
+<!-- ═════════════════════════ PART I ═════════════════════════ -->
+<div class="part">Part I · The View-era problem</div>
+
+<h2 id="views"><span class="n">1</span>View code ends every async lifetime by hand</h2>
+<p>All View work happens on one thread, so slow work must leave it and its result must come back as a message. Views
+are not thread-safe. Measuring, layout, drawing and mutation all happen on the main thread. That thread runs a
+<code>Looper</code>: a loop that takes the next message from a queue and runs it. Slow work happens elsewhere: Binder
+calls (Android’s cross-process calls into system_server or another app), disk, decoding.</p>
+<p>The classic shape is a callback that hops to an executor (a background thread pool), then back through a
+<code>Handler</code>. A Handler is an object that posts a <code>Runnable</code> into one specific Looper’s queue:</p>
+<pre><code><span class="c">// The View-era pattern (shape)</span>
+userManager.registerCallback(callback)                <span class="c">// 1. must be unregistered later</span>
+bgExecutor.execute {
+    val bmp = decodeAvatar(user)                       <span class="c">// 2. no way to cancel this</span>
+    mainHandler.post { imageView.setImageBitmap(bmp) } <span class="c">// 3. the view may be gone by now</span>
+}
+mainHandler.postDelayed(expireRunnable, 30_000)        <span class="c">// 4. must be removed on teardown</span></code></pre>
+<p>Each numbered line is a lifetime that the code has to end by hand. Nothing in the types connects them to the View’s
+attach and detach. A <code>Handler.postDelayed</code> is the clearest case. The queued message holds the Runnable, and
+a lambda that touches the View holds the View.</p>
+<p>Why that matters for memory: the garbage collector frees an object only when nothing reachable points at it. It starts
+from <b>GC roots</b>, objects that are live by definition (thread stacks, static fields, and JNI global references,
+which native code holds on Java objects), and
+follows references. Anything on a path from a root stays, whether or not the app will use it again.</p>
+
+<figure>
+<figcaption><b>Figure 1. A forgotten delayed message keeps a detached View alive until the message runs.</b> Every link
+is an ordinary strong reference. The GC sees a live thread holding a queue holding a message holding the View, so it
+cannot tell that the View is useless. Pattern 4 in Section 11 is this chain.</figcaption>
+<svg viewBox="0 0 1000 200" role="img" aria-label="Retention chain of a delayed Runnable">
+  <text x="10" y="18" class="th">retention chain while the delayed message is queued</text>
+  <rect x="10"  y="30" width="150" height="52" rx="2" class="b2"/><text x="22"  y="52" class="tb">Main thread</text><text x="22"  y="70" class="ts">GC root while alive</text>
+  <rect x="178" y="30" width="150" height="52" rx="2" class="b0"/><text x="190" y="52" class="tb">MessageQueue</text><text x="190" y="70" class="tms">mMessages list</text>
+  <rect x="346" y="30" width="150" height="52" rx="2" class="bw"/><text x="358" y="52" class="tb">Message</text><text x="358" y="70" class="tms">when = now + 30 s</text>
+  <rect x="514" y="30" width="150" height="52" rx="2" class="bw"/><text x="526" y="52" class="tb">Runnable</text><text x="526" y="70" class="ts">lambda; captures this</text>
+  <rect x="682" y="30" width="150" height="52" rx="2" class="br"/><text x="694" y="52" class="tb">Detached View</text><text x="694" y="70" class="ts">no longer on screen</text>
+  <rect x="850" y="30" width="140" height="52" rx="2" class="br"/><text x="862" y="52" class="tb">Its subtree</text><text x="862" y="70" class="ts">children, drawables</text>
+  <path d="M160,56 L176,56" class="ln" marker-end="url(#ah)"/><path d="M328,56 L344,56" class="ln" marker-end="url(#ah)"/>
+  <path d="M496,56 L512,56" class="ln" marker-end="url(#ah)"/><path d="M664,56 L680,56" class="lnr" marker-end="url(#ahr)"/>
+  <path d="M832,56 L848,56" class="lnr" marker-end="url(#ahr)"/>
+  <text x="10" y="122" class="th">time</text>
+  <line x1="60" y1="150" x2="990" y2="150" class="ln"/>
+  <rect x="330" y="138" width="570" height="10" fill="url(#hatchr)" class="hatch-r"/>
+  <text x="340" y="130" class="ts tr">retained, never drawn again</text>
+  <circle cx="100" cy="150" r="5" class="fw"/><text x="70" y="172" class="tms">postDelayed(r, 30 s)</text>
+  <circle cx="330" cy="150" r="5" class="fr"/><text x="300" y="172" class="tms">view detached</text>
+  <circle cx="900" cy="150" r="5" class="fg"/><text x="840" y="172" class="tms">r runs; chain breaks</text>
+  <text x="10" y="194" class="ts">The fix is a removeCallbacks(r) in the teardown path. Forgetting it does not crash; it keeps memory until the message runs.</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+In View code, every register, post and executor task is a lifetime you must end yourself.
+In a heap dump, look for a <code>Message</code>, a listener list or a singleton between a GC root and a detached View.
+</blockquote>
+
+<h2 id="recycler"><span class="n">2</span>Recycled Views outlive the data they were bound to</h2>
+<p>Lists and pagers reuse a few Views for many items, so a View is not tied to one item. <code>RecyclerView</code> keeps
+a small set of row Views and rebinds them as you scroll. A row that scrolls off goes into a small cache or a shared pool
+(Table 1). The adapter later calls <code>onBindViewHolder(holder, position)</code> to point the same View objects at
+different data. A <code>ViewHolder</code> wraps one row View and its child references. So a ViewHolder is not “row 0”.
+It is “whatever position was bound last”.</p>
+<p>Pagers go further: they build pages the user cannot see yet. A swipe has to reveal the next page without a pause to
+inflate it. The older <code>ViewPager</code> asks its <code>PagerAdapter</code> to <code>instantiateItem</code> every
+page within <code>offscreenPageLimit</code> of the current one. It adds those pages to the view hierarchy, then measures
+and lays them out beside the visible page, past the edge of the screen. Pages further away get
+<code>destroyItem</code>. <code>ViewPager2</code> is built on a RecyclerView, <code>mRecyclerView</code>, in which each
+page is a ViewHolder. A positive limit makes it lay out that many extra pages on each side.</p>
+<p class="m">Table 1. What each container keeps beyond the visible screen, and the default that controls it.</p>
+<table>
+  <thead><tr><th>Container</th><th>Keeps</th><th>Default</th></tr></thead>
+  <tbody>
+    <tr><td>RecyclerView cache</td><td>Rows that just scrolled off</td><td><code>DEFAULT_CACHE_SIZE = 2</code></td></tr>
+    <tr><td><code>RecycledViewPool</code></td><td>Spare rows, shared</td><td><code>DEFAULT_MAX_SCRAP = 5</code> per view type (each kind of row layout)</td></tr>
+    <tr><td>ViewPager</td><td>Pages within the limit, attached and laid out</td><td><code>DEFAULT_OFFSCREEN_PAGES = 1</code>; <code>setOffscreenPageLimit</code> refuses anything lower</td></tr>
+    <tr><td>ViewPager2</td><td>Leaves offscreen pages to RecyclerView’s caching</td><td><code>OFFSCREEN_PAGE_LIMIT_DEFAULT = -1</code></td></tr>
+  </tbody>
+</table>
+<p>So an offscreen page is attached to the window and laid out, but not visible. Its <code>onAttachedToWindow</code> has
+run and its window is visible. Any work tied to “attached”, including the lifecycle in Section 5, runs for a page the
+user cannot see.</p>
+<p>Asynchronous work started from a bind has no idea the holder was rebound:</p>
+
+<figure>
+<figcaption><b>Figure 2. A slow result from an old binding overwrites the row’s new content.</b> The fix in View code is
+a token or a cancel on every rebind and on <code>onViewRecycled</code>. With coroutines, the bind launches a job and the
+next bind cancels it. That is what <code>collectLatest</code> does for you (Section 9).</figcaption>
+<svg viewBox="0 0 1000 210" role="img" aria-label="Stale async result after ViewHolder rebind">
+  <text x="10" y="58" class="ts">main thread</text>
+  <text x="10" y="128" class="ts">background</text>
+  <line x1="100" y1="54" x2="990" y2="54" class="ln dash"/>
+  <line x1="100" y1="124" x2="990" y2="124" class="ln dash"/>
+  <rect x="110" y="36" width="170" height="36" rx="2" class="b0"/><text x="120" y="58" class="tms">bind(VH_A, pos 0)</text>
+  <rect x="410" y="36" width="200" height="36" rx="2" class="bw"/><text x="420" y="50" class="tms">bind(VH_A, pos 8)</text><text x="420" y="66" class="ts">row 0 scrolled off; reused</text>
+  <rect x="625" y="36" width="125" height="36" rx="2" class="b0"/><text x="633" y="50" class="tms">post: icon8</text><text x="633" y="66" class="ts">correct, briefly</text>
+  <rect x="765" y="36" width="225" height="36" rx="2" class="br"/><text x="775" y="50" class="tms">post: VH_A.icon = icon0</text><text x="775" y="66" class="ts">stale result overwrites</text>
+  <rect x="190" y="106" width="560" height="28" rx="2" class="bw"/><text x="200" y="124" class="tms">load icon for pos 0 (slow)</text>
+  <rect x="450" y="140" width="165" height="28" rx="2" class="bw"/><text x="460" y="158" class="tms">load icon pos 8</text>
+  <path d="M195,72 L195,104" class="ln" marker-end="url(#ah)"/>
+  <path d="M455,72 L455,138" class="ln" marker-end="url(#ah)"/>
+  <path d="M615,150 L650,76" class="ln" marker-end="url(#ah)"/>
+  <path d="M750,118 L788,76" class="lnr" marker-end="url(#ahr)"/>
+  <text x="10" y="196" class="ts">Nothing ties the background task to the binding that started it: the last writer wins, and the task keeps VH_A’s views reachable until it finishes.</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Any result that arrives after a rebind, a page change or a detach must be dropped or cancelled. Inside a pager,
+“attached” does not mean “visible”. Coroutines make the cancel cheap to write. They do not make it automatic unless the
+work runs in a scope that ends at the right moment.
+</blockquote>
+
+<!-- ═════════════════════════ PART II ═════════════════════════ -->
+<div class="part">Part II · Coroutines</div>
+
+<h2 id="suspend"><span class="n">3</span>A suspend function becomes a state machine whose frame lives on the heap</h2>
+<p>Coroutines let you write async code as one function and have the compiler split it into resumable pieces. The code in
+Part I needs three things. It must wait for slow work without blocking the main thread. It must come back to the main
+thread afterwards. And it must cancel the whole thing when the UI goes away. Callbacks provide the first two by
+splitting one function into pieces by hand.</p>
+<p>A <b>coroutine</b> is a computation that can stop partway through without holding a thread, and continue later,
+possibly on another thread. A <b><code>suspend</code> function</b> is a function marked with the suspend keyword. It
+may pause (<em>suspend</em>) at a call to another suspend function. It can only be called from a coroutine or from
+another suspend function. The compiler makes pausing possible by turning every suspend function into a <b>state
+machine</b>: a function that can be re-entered at any of its suspension points.</p>
+<p>A small example, compiled with the Kotlin 2.2.0 compiler and read back with <code>javap</code>, the JDK tool that
+prints what a compiled class contains:</p>
+<div class="two">
+<div>
+<pre><code><span class="c">// Demo.kt</span>
+<span class="k">class</span> Cache {
+    <span class="k">val</span> map = HashMap&lt;Int, String&gt;()
+
+    <span class="k">suspend fun</span> load(id: Int): String {
+        <span class="k">val</span> cached = map[id]
+        <span class="k">if</span> (cached != <span class="k">null</span>) <span class="k">return</span> cached
+        <span class="k">val</span> v = fetch(id)      <span class="c">// suspension point</span>
+        map[id] = v
+        <span class="k">return</span> v
+    }
+    <span class="k">suspend fun</span> fetch(id: Int): String = ...
+}</code></pre>
+<p>The compiler adds a hidden last parameter, a <b><code>Continuation</code></b>. It is an object with one method,
+<code>resumeWith(result)</code>, meaning “here is the value you were waiting for, carry on”. The return type becomes
+<code>Object</code>. The function now returns either its real result or the marker <code>COROUTINE_SUSPENDED</code>.</p>
+</div>
+<div>
+<pre><code><span class="c">// javap of Cache.load, written back as Java (shape)</span>
+Object load(<span class="k">int</span> id, Continuation cont) {
+  Cache$load$1 sm;
+  <span class="k">if</span> (cont <span class="k">instanceof</span> Cache$load$1
+      &amp;&amp; (((Cache$load$1) cont).label &amp; 0x80000000) != 0) {
+    sm = (Cache$load$1) cont;     <span class="c">// resuming: reuse my frame</span>
+    sm.label -= 0x80000000;
+  } <span class="k">else</span> {
+    sm = <span class="k">new</span> Cache$load$1(<span class="k">this</span>, cont); <span class="c">// fresh call</span>
+  }
+  Object result = sm.result;
+  <span class="k">switch</span> (sm.label) {
+    <span class="k">case</span> 0:
+      String cached = map.get(id);
+      <span class="k">if</span> (cached != <span class="k">null</span>) <span class="k">return</span> cached;
+<span class="hw">      sm.L$0 = cached; sm.I$0 = id;  // spill</span>
+      sm.label = 1;
+      result = fetch(id, sm);     <span class="c">// sm is fetch's continuation</span>
+      <span class="k">if</span> (result == COROUTINE_SUSPENDED) <span class="k">return</span> result;
+      <span class="k">break</span>;
+    <span class="k">case</span> 1:
+<span class="hw">      id = sm.I$0;                   // restore</span>
+      throwOnFailure(result);
+      <span class="k">break</span>;
+    <span class="k">default</span>: <span class="k">throw new</span> IllegalStateException(...);
+  }
+  String v = (String) result;
+  map.put(id, v);
+  <span class="k">return</span> v;
+}</code></pre>
+</div>
+</div>
+<p>The compiler turns the function’s local frame into a heap object, <code>Cache$load$1</code>. A <code>label</code>
+field records where to resume. Locals still needed later are copied into fields (<b>spilled</b>): <code>L$n</code> for
+references, <code>I$n</code> for ints, and <code>this$0</code> captured once for <code>this</code>.</p>
+<p>To resume, the frame’s <code>invokeSuspend(result)</code> stores the result, sets the top bit of <code>label</code> and
+calls <code>load(0, this)</code> again. That bit is how <code>load</code> tells “I am being resumed” apart from “a new
+call whose caller happens to be another <code>load</code> frame”.</p>
+
+<figure>
+<figcaption><b>Figure 3. A suspended call is a small heap object holding its caller, its label and its live
+locals.</b> A frame is a few dozen bytes plus whatever its saved locals keep reachable. On ART, the Android runtime,
+this one is 40 bytes: an 8-byte object header, then eight 4-byte fields.</figcaption>
+<svg viewBox="0 0 1000 170" role="img" aria-label="Layout of a continuation object">
+  <text x="150" y="18" class="tms">0</text><text x="234" y="18" class="tms">4</text><text x="318" y="18" class="tms">8</text>
+  <text x="402" y="18" class="tms">12</text><text x="486" y="18" class="tms">16</text><text x="570" y="18" class="tms">20</text>
+  <text x="654" y="18" class="tms">24</text><text x="738" y="18" class="tms">28</text><text x="822" y="18" class="tms">32</text>
+  <text x="906" y="18" class="tms">36</text><text x="972" y="18" class="tms">40</text>
+  <line x1="150" y1="24" x2="990" y2="24" class="ln"/>
+  <text x="10" y="46" class="tb">Cache$load$1</text><text x="10" y="62" class="tms">40 bytes on ART</text>
+  <rect x="150" y="30" width="84" height="36" class="b2"/><text x="158" y="52" class="tms">klass_</text>
+  <rect x="234" y="30" width="84" height="36" class="bw"/><text x="242" y="52" class="tms">monitor_</text>
+  <rect x="318" y="30" width="84" height="36" class="ba"/><text x="326" y="52" class="tms">completion</text>
+  <rect x="402" y="30" width="84" height="36" class="ba"/><text x="410" y="52" class="tms">_context</text>
+  <rect x="486" y="30" width="84" height="36" class="ba"/><text x="492" y="52" class="tms">intercepted</text>
+  <rect x="570" y="30" width="84" height="36" class="bv"/><text x="578" y="52" class="tms">L$0</text>
+  <rect x="654" y="30" width="84" height="36" class="bv"/><text x="662" y="52" class="tms">result</text>
+  <rect x="738" y="30" width="84" height="36" class="bv"/><text x="746" y="52" class="tms">this$0</text>
+  <rect x="822" y="30" width="84" height="36" class="bg"/><text x="830" y="52" class="tms">I$0</text>
+  <rect x="906" y="30" width="84" height="36" class="bg"/><text x="914" y="52" class="tms">label</text>
+  <path d="M152,72 L152,78 L316,78 L316,72" class="ln"/>
+  <path d="M320,72 L320,78 L400,78 L400,72" class="ln"/>
+  <path d="M404,72 L404,78 L568,78 L568,72" class="ln"/>
+  <path d="M572,72 L572,78 L988,78 L988,72" class="ln"/>
+  <text x="152" y="94" class="ts">object header</text>
+  <text x="404" y="94" class="ts">ContinuationImpl</text>
+  <text x="572" y="94" class="ts">Cache$load$1 (generated): spilled refs, then ints</text>
+  <text x="320" y="110" class="ts">BaseContinuationImpl</text>
+  <text x="10" y="138" class="ts">completion = the caller’s frame, resumed when this function returns · result = what the callee resumed with · label = which case runs next</text>
+  <text x="10" y="156" class="ts">L$n / I$n = locals live across a suspension point. A suspended call chain is a linked list of these frames on the Java heap.</text>
+</svg>
+</figure>
+
+<p>Resuming is a loop, not recursion. <code>BaseContinuationImpl.resumeWith</code> calls <code>invokeSuspend</code>. If
+that returns <code>COROUTINE_SUSPENDED</code>, it stops. Otherwise it feeds the value to <code>completion</code>, the
+caller’s frame, and continues up the chain:</p>
+<pre><code><span class="src">kotlin/coroutines/jvm/internal/ContinuationImpl.kt · BaseContinuationImpl.resumeWith (excerpt)</span><span class="k">while</span> (<span class="k">true</span>) {
+    <span class="k">with</span>(current) {
+        <span class="k">val</span> completion = completion!!
+        <span class="k">val</span> outcome: Result&lt;Any?&gt; =
+            <span class="k">try</span> {
+                <span class="k">val</span> outcome = invokeSuspend(param)
+<span class="hw">                if (outcome === COROUTINE_SUSPENDED) return</span>
+                Result.success(outcome)
+            } <span class="k">catch</span> (exception: Throwable) { Result.failure(exception) }
+        releaseIntercepted()
+        <span class="k">if</span> (completion <span class="k">is</span> BaseContinuationImpl) { current = completion; param = outcome }
+        <span class="k">else</span> { completion.resumeWith(outcome); <span class="k">return</span> }
+    }
+}</code></pre>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+In a heap dump, a class named like <code>Outer$method$1</code> or <code>…Kt$fn$2</code>, with fields <code>label</code>,
+<code>L$0</code> and <code>L$1</code>, is a suspended frame. Whatever its <code>L$n</code> fields point to is retained
+while that coroutine stays suspended. For a <code>collect</code> loop, that can be the life of the process.
+</blockquote>
+
+<h2 id="dispatch"><span class="n">4</span>Dispatchers move a coroutine between threads, through the main Handler on Android</h2>
+<p>A suspend function runs on whatever thread called it, and moves only when it asks to. The object that decides which
+thread a coroutine runs on is its <b>dispatcher</b>. It is stored in the coroutine’s <code>CoroutineContext</code>, a
+small map of per-coroutine settings: dispatcher, job, name.</p>
+<p>On Android, <code>Dispatchers.Main</code> is a <code>HandlerContext</code> wrapping a Handler on the main Looper.
+Dispatching a resumption is a <code>handler.post</code>. A <code>delay</code> is a <code>postDelayed</code>. If the
+coroutine is cancelled while waiting, the Runnable is removed:</p>
+<pre><code><span class="src">ui/kotlinx-coroutines-android/src/HandlerDispatcher.kt · HandlerContext</span><span class="k">override fun</span> dispatch(context: CoroutineContext, block: Runnable) {
+    <span class="k">if</span> (!handler.post(block)) { cancelOnRejection(context, block) }
+}
+<span class="k">override fun</span> scheduleResumeAfterDelay(timeMillis: Long, continuation: CancellableContinuation&lt;Unit&gt;) {
+    <span class="k">val</span> block = Runnable { with(continuation) { resumeUndispatched(Unit) } }
+    <span class="k">if</span> (handler.postDelayed(block, timeMillis.coerceAtMost(MAX_DELAY))) {
+<span class="hg">        continuation.invokeOnCancellation { handler.removeCallbacks(block) }</span>
+    } <span class="k">else</span> { cancelOnRejection(continuation.context, block) }
+}</code></pre>
+<p>That highlighted line is the <code>removeCallbacks</code> that View code has to remember (Section 1), done once in the library.
+A <code>CancellableContinuation</code> is a continuation that is also told when its coroutine is cancelled, and
+<code>invokeOnCancellation</code> registers what to do then.</p>
+<p><code>withContext(dispatcher) { … }</code> runs a block on another dispatcher and suspends the caller until it
+finishes. Then it posts the caller back to its own dispatcher. For a main-thread caller, that is another
+<code>handler.post</code>.</p>
+
+<figure>
+<figcaption><b>Figure 4. While a coroutine waits, no thread is blocked, and other main-thread work can run in the
+gap.</b> That gap is where a cache race hides: two callers both miss, both load, and both copies stay alive. A
+check-then-act on the main thread is not atomic if a suspension point sits between the check and the act.</figcaption>
+<svg viewBox="0 0 1000 232" role="img" aria-label="Suspend and resume across threads">
+  <text x="10" y="64" class="ts">main thread</text>
+  <text x="10" y="150" class="ts">background</text>
+  <line x1="100" y1="60" x2="990" y2="60" class="ln dash"/>
+  <line x1="100" y1="146" x2="990" y2="146" class="ln dash"/>
+  <rect x="110" y="36" width="200" height="48" rx="2" class="ba"/><text x="120" y="55" class="tms">load(7) · label 0</text><text x="120" y="72" class="tms">miss, spill, label = 1</text>
+  <text x="120" y="102" class="tms tg">returns COROUTINE_SUSPENDED</text>
+  <rect x="340" y="44" width="80" height="32" rx="2" class="b0"/><text x="352" y="64" class="tms">draw</text>
+  <rect x="432" y="44" width="80" height="32" rx="2" class="b0"/><text x="444" y="64" class="tms">input</text>
+  <rect x="524" y="44" width="80" height="32" rx="2" class="b0"/><text x="536" y="64" class="tms">draw</text>
+  <text x="340" y="96" class="ts">looper keeps running other messages</text>
+  <rect x="660" y="36" width="330" height="48" rx="2" class="bg"/><text x="670" y="55" class="tms">invokeSuspend → load(0, sm) · label 1</text><text x="670" y="72" class="tms">restore I$0 · map[id] = v · return v</text>
+  <rect x="330" y="128" width="290" height="40" rx="2" class="bw"/><text x="340" y="146" class="tms">withContext(bg) block</text><text x="340" y="161" class="ts">Binder call, disk, decode</text>
+  <path d="M300,86 L330,126" class="lna" marker-end="url(#aha)"/>
+  <path d="M620,138 L668,88" class="lng" marker-end="url(#ahg)"/>
+  <text x="640" y="128" class="tms tg">handler.post(resume)</text>
+  <text x="10" y="200" class="ts">While suspended, no thread waits: the frame object holds the state, and the main Handler will hold the Runnable that resumes it.</text>
+  <text x="10" y="218" class="ts">Between the two main-thread slices, any other coroutine on the main thread can run, including one that reads the same cache.</text>
+</svg>
+</figure>
+
+<h3 id="dispatch-walk">One call, end to end</h3>
+<p>Putting Sections 3 and 4 together, here is every step of one call. It starts a coroutine on the main thread and ends
+when the result lands back there. Assume <code>scope.launch(Dispatchers.Main) { text.text = cache.load(7) }</code>.
+<code>launch</code> starts a new coroutine and returns its job (Section 5). The body of <code>fetch</code> is
+<code>withContext(Dispatchers.IO) { … }</code>, where <code>Dispatchers.IO</code> is the library’s shared thread pool for
+blocking work such as disk and Binder calls.</p>
+<ol>
+  <li><b>Start.</b> <code>launch</code> creates a <code>StandaloneCoroutine</code>. It is both the new coroutine’s job and
+  the last continuation in the chain. It creates a frame for the lambda and calls
+  <code>intercepted().resumeCancellableWith(…)</code> on it. <code>intercepted()</code> wraps the frame in a
+  <code>DispatchedContinuation</code>, which is a Runnable. The main dispatcher says a dispatch is needed, so this is a
+  <code>handler.post</code>. <code>launch</code> returns before any of the body runs.</li>
+  <li><b>First slice on main.</b> The Looper runs that Runnable. It resumes the lambda’s frame, which calls
+  <code>load(7, frame)</code>. On a cache miss, load spills its locals, sets <code>label = 1</code> and calls fetch.</li>
+  <li><b>Suspend.</b> <code>withContext</code> sees a different dispatcher. It creates a
+  <code>DispatchedCoroutine</code>, dispatches the block to the IO pool, and returns <code>COROUTINE_SUSPENDED</code>.
+  Every frame above it returns the same marker. The Runnable returns, and the Looper moves on to the next message.
+  Nothing on the main thread’s stack refers to this call any more. Only heap objects do.</li>
+  <li><b>Background.</b> An IO thread runs the block. When it returns, <code>DispatchedCoroutine.afterResume</code>
+  calls <code>uCont.intercepted().resumeCancellableWith(value)</code>. That is the waiting frame, wrapped by <em>its</em>
+  dispatcher, so <code>HandlerContext.dispatch</code> does another <code>handler.post</code>.</li>
+  <li><b>Resume on main.</b> The Looper runs that Runnable. <code>DispatchedTask.run</code> first checks the job. If the
+  coroutine was cancelled meanwhile, the frame is resumed with a <code>CancellationException</code> instead of the
+  value. Otherwise <code>BaseContinuationImpl.resumeWith</code> runs the loop from Section 3. load re-enters at
+  <code>label 1</code>, writes the map and returns <code>v</code>. The lambda sets the text and returns. Its completion
+  is the StandaloneCoroutine, which marks the job complete.</li>
+</ol>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+“Single-threaded” does not mean “no races” once there is a suspension point in the middle. Guard check-then-act across
+<code>withContext</code> with a <code>kotlinx.coroutines.sync.Mutex</code>, which suspends waiters instead of blocking the thread.
+</blockquote>
+
+<h2 id="jobs"><span class="n">5</span>Jobs make lifetimes objects, and cancelling a parent cancels the whole tree</h2>
+<p>Coroutines turn each lifetime into an object and arrange those objects in a tree, so ending one ends everything under
+it. In Section 1, every piece of async work was a lifetime the code had to end by hand, and nothing grouped them.</p>
+<p>A <b><code>Job</code></b> is the handle for a running coroutine’s lifetime: active, cancelling, or complete. A
+<b><code>CoroutineScope</code></b> is an object that carries a context with a job in it. There are two ways to start a
+coroutine, and both are extension functions on a scope. <code>launch</code> is fire and forget and returns a job.
+<code>async</code> returns a <code>Deferred</code>, which is a job with a result. Each creates a child job of the
+scope’s job.</p>
+<p><code>Job.kt</code> states the rule: “cancellation of a parent leads to immediate cancellation of all its children
+recursively”. A parent also does not complete until its children do. This parent and child discipline is called
+<b>structured concurrency</b>.</p>
+<p><b>Cancellation</b> is cooperative. <code>cancel()</code> only marks the job. The coroutine notices at its next
+suspension point, which throws <code>CancellationException</code> inside it.</p>
+<p>“Suspension point” here means any suspending call built on <code>suspendCancellableCoroutine</code>, the library
+primitive that pauses a coroutine and hands its continuation to whoever will resume it. <code>delay</code>,
+<code>withContext</code>, and channel and flow operations are all built on it. The exception unwinds the state machine
+like any other, so <code>finally</code> blocks run. Code that never suspends never sees the cancel, unless it checks
+itself with <code>ensureActive()</code>, as <code>StateFlowImpl.collect</code> does in Section 7.</p>
+<p><code>coroutineScope { … }</code> creates a child scope and waits for every launch inside it. Calling
+<code>collect</code> on a flow (a stream of values, Section 6) suspends for as long as the stream runs. For UI state,
+that is forever. So to collect three flows at once, you launch three children.</p>
+<p>The UI decides when those children should stop. AndroidX (Android’s Jetpack support libraries) models that with a
+<b>lifecycle</b>: a small state machine
+(<code>INITIALIZED</code>, <code>CREATED</code>, <code>STARTED</code>, <code>RESUMED</code>, <code>DESTROYED</code>).
+It is exposed by a <b><code>LifecycleOwner</code></b> such as an Activity or Fragment. Its <code>lifecycleScope</code>
+is a scope that is cancelled when the state reaches DESTROYED. <code>repeatOnLifecycle(state)</code> runs a block each
+time the state rises to <code>state</code>, and cancels it each time the state falls below.</p>
+<p>Take a view binder for a small status indicator that shows a label and an icon. It uses both. <code>viewModel</code>
+is its <b>view-model</b>: the object that holds the indicator’s state as flows, so the View code only has to display
+them:</p>
+<pre><code><span class="src">A view binder for a status indicator (shape)</span>view.repeatWhenAttached {
+    repeatOnLifecycle(Lifecycle.State.STARTED) {
+        launch { viewModel.isShown.collect { shown -&gt; view.isVisible = shown } }
+        launch { viewModel.label.collect { label -&gt; view.text.text = label } }
+<span class="hl">        launch { viewModel.icon.collect { icon -&gt; view.icon.setImageDrawable(icon) } }</span>
+        bindClicks(view, viewModel)
+    }
+}</code></pre>
+
+<figure>
+<figcaption><b>Figure 5. Cancelling the root job tears down the whole tree, but nothing here watches the indicator’s
+visibility.</b> The red child is pattern 1 in Section 11. It is cancelled on detach. Nothing cancels it when the
+indicator becomes <code>View.GONE</code>, because none of its ancestors depends on the indicator’s visibility.</figcaption>
+<svg viewBox="0 0 1000 220" role="img" aria-label="Job tree for a status indicator binder">
+  <rect x="10" y="92" width="200" height="48" rx="2" class="ba"/><text x="22" y="112" class="tb">lifecycleScope Job</text><text x="22" y="128" class="ts">one per attachment</text>
+  <rect x="270" y="92" width="230" height="48" rx="2" class="ba"/><text x="282" y="112" class="tb">repeatOnLifecycle(STARTED)</text><text x="282" y="128" class="ts">body runs while STARTED</text>
+  <rect x="560" y="24" width="270" height="44" rx="2" class="b0"/><text x="570" y="50" class="tms">launch { isShown.collect }</text>
+  <rect x="560" y="92" width="270" height="44" rx="2" class="b0"/><text x="570" y="118" class="tms">launch { label.collect }</text>
+  <rect x="560" y="160" width="270" height="44" rx="2" class="br"/><text x="570" y="186" class="tms">launch { icon.collect }</text>
+  <path d="M210,116 L268,116" class="ln" marker-end="url(#ah)"/>
+  <path d="M500,116 C530,116 530,46 558,46" class="ln" marker-end="url(#ah)"/>
+  <path d="M500,116 L558,114" class="ln" marker-end="url(#ah)"/>
+  <path d="M500,116 C530,116 530,182 558,182" class="ln" marker-end="url(#ah)"/>
+  <text x="850" y="86" class="ts tr">detach: owner DESTROYED</text>
+  <text x="850" y="104" class="ts">→ root Job cancelled</text>
+  <text x="850" y="122" class="ts">→ children cancelled</text>
+  <text x="850" y="140" class="ts">→ finally blocks run</text>
+</svg>
+</figure>
+
+<h3 id="jobs-attach">repeatWhenAttached follows the window, not the View</h3>
+<p>Most SystemUI Views (status bar, notification shade, keyguard, which is the lockscreen) live in windows that SystemUI
+adds directly, not in an Activity.
+So there is no Activity lifecycle to borrow. SystemUI gives each View one with <code>View.repeatWhenAttached</code>,
+a helper in SystemUI’s lifecycle library (<code>SystemUI/src/com/android/systemui/lifecycle/RepeatWhenAttached.kt</code>).</p>
+<p>On each attach, it creates a fresh <code>ViewLifecycleOwner</code> and launches the block in its lifecycleScope. On
+detach, it calls <code>onDestroy()</code>, which moves the lifecycle to DESTROYED and cancels that scope. Between those,
+the state follows the <em>window</em>, not the View:</p>
+<pre><code><span class="src">RepeatWhenAttached.kt · ViewLifecycleOwner.updateState</span>registry.currentState =
+    <span class="k">when</span> {
+        view.windowVisibility != View.VISIBLE -&gt; Lifecycle.State.CREATED
+        !view.hasWindowFocus() -&gt; Lifecycle.State.STARTED
+        <span class="k">else</span> -&gt; Lifecycle.State.RESUMED
+    }</code></pre>
+<p>So a <code>repeatOnLifecycle(STARTED)</code> block keeps running for as long as the window is visible. The status bar
+window is visible whenever the status bar is. So a View inside it that is GONE is still STARTED. The same holds for an
+offscreen pager page (Section 2): attached, in a visible window, not on screen.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A scope only ends when something you chose ends: detach, window hidden, a dialog closing. If the UI can be hidden by
+other means, such as <code>View.GONE</code> or an inactive state, gate the collection on that signal yourself. Usually
+that means <code>collectLatest</code> or <code>flatMapLatest</code>.
+</blockquote>
+
+<!-- ═════════════════════════ PART III ═════════════════════════ -->
+<div class="part">Part III · Flows</div>
+
+<h2 id="cold"><span class="n">6</span>A cold flow does its work once per collector, and only while collected</h2>
+<p>A flow is a stream of values over time that is tied to a coroutine’s lifetime. UI state changes over time: the user’s
+avatar, whether a chip is visible, the list of installed apps. A suspend function returns one value. A callback delivers
+many values but has no lifetime of its own. A <b><code>Flow&lt;T&gt;</code></b> gives you both.</p>
+<p>Its interface has one method, <code>suspend fun collect(collector)</code>. The <b>collector</b> is an object with one
+method, <code>suspend fun emit(value)</code>, supplied by whoever wants the values. The flow’s producer code calls
+<b>emit</b> once per value. <b>collect</b> suspends the caller until the producer finishes or the caller is cancelled.
+An <b>operator</b> such as <code>map</code> or <code>filter</code> is a function that takes a flow and returns a new
+flow wrapping it. In a chain <code>a.map { … }.filter { … }</code>, values travel from <b>upstream</b> (the source,
+<code>a</code>) to <b>downstream</b> (towards the final collector).</p>
+<p>A flow is <b>cold</b> when it is only a description, like a function that has not been called. Building it runs
+nothing. Each call to collect runs the producer code from the start, for that collector alone, until that collection
+ends. Most operators (<code>map</code>, <code>filter</code>, <code>combine</code>, <code>flatMapLatest</code>) return
+cold flows that wrap their inputs.</p>
+<p>SystemUI wraps Android callback APIs this way. The library’s <code>callbackFlow</code> turns a callback into a cold
+flow. It runs a producer block in a <code>ProducerScope</code>, a scope that owns a <b><code>Channel</code></b>.</p>
+<p>A channel is a queue between coroutines: send suspends when the queue is full, and receive suspends when it is
+empty. The callback pushes values into the channel with <code>trySend</code>, which does not suspend and is safe from
+any thread. The collector receives them. The channel’s queue is a <b>buffer</b>: room for values the producer has sent
+but the collector has not taken yet. SystemUI’s <code>conflatedCallbackFlow</code> is a one-liner over callbackFlow:</p>
+<div class="two">
+<div>
+<pre><code><span class="src">SystemUI/utils/…/coroutines/flow/FlowConflated.kt</span><span class="k">fun</span> &lt;T&gt; conflatedCallbackFlow(
+    <span class="k">@BuilderInference</span> block: <span class="k">suspend</span> ProducerScope&lt;T&gt;.() -&gt; Unit
+): Flow&lt;T&gt; = callbackFlow(block).conflate()</code></pre>
+<pre><code><span class="src">kotlinx-coroutines-core/common/src/channels/Produce.kt</span><span class="k">public suspend fun</span> ProducerScope&lt;*&gt;.awaitClose(block: () -&gt; Unit = {}) {
+    check(coroutineContext[Job] === <span class="k">this</span>) { ... }
+    <span class="k">try</span> {
+        suspendCancellableCoroutine&lt;Unit&gt; { cont -&gt;
+            invokeOnClose { cont.resume(Unit) }
+        }
+    } <span class="k">finally</span> {
+<span class="hg">        block()</span>
+    }
+}</code></pre>
+</div>
+<div>
+<pre><code><span class="src">An installed-apps repository (illustrative shape)</span><span class="k">override val</span> installedApps: Flow&lt;List&lt;AppModel&gt;&gt;
+    <span class="k">get</span>() = conflatedCallbackFlow {
+        <span class="k">val</span> packageChangeCallback =
+            <span class="k">object</span> : LauncherApps.Callback() {
+                <span class="c">// onPackage…(): trySend(…)</span>
+            }
+        launcherApps.registerCallback(
+            packageChangeCallback, bgHandler)
+        trySend(<span class="c">/* current app list */</span>)
+        awaitClose {
+            launcherApps.unregisterCallback(packageChangeCallback)
+        }
+    }</code></pre>
+<p><code>LauncherApps</code> is the framework service that lists launchable apps; its callback fires when an app is
+installed, updated or removed. The callback exists only while someone is collecting. When the collecting coroutine is
+cancelled, the producer’s suspension in <code>awaitClose</code> throws <code>CancellationException</code>, and the
+<code>finally</code> runs the unregister.</p>
+<p><code>conflate()</code> applies <b>conflation</b>. When the collector is slower than the producer, values it
+has not taken yet are replaced by newer ones. So it sees only the latest list, not every intermediate one.</p>
+</div>
+</div>
+
+<figure>
+<figcaption><b>Figure 6. A cold flow runs its producer once per collector. A hot flow holds one value that every
+collector shares.</b> Left, cold: each collector gets its own run of the producer. Right, hot (Section 7): one value
+that exists on its own. Two collectors of a cold callback flow register two callbacks. That is usually a cost, not a
+leak. The leak happens when one collection never ends, as in the overlay example of Section 8.</figcaption>
+<svg viewBox="0 0 1000 262" role="img" aria-label="Cold flow versus hot StateFlow">
+  <text x="10" y="18" class="th">cold: conflatedCallbackFlow { … }</text>
+  <text x="520" y="18" class="th">hot: MutableStateFlow</text>
+  <rect x="10" y="32" width="230" height="48" rx="2" class="b2"/><text x="22" y="52" class="tb">Flow object</text><text x="22" y="68" class="ts">holds the block lambda, runs nothing</text>
+  <rect x="10" y="120" width="140" height="40" rx="2" class="b0"/><text x="22" y="144" class="tms">collector 1</text>
+  <rect x="10" y="180" width="140" height="40" rx="2" class="b0"/><text x="22" y="204" class="tms">collector 2</text>
+  <rect x="190" y="112" width="300" height="56" rx="2" class="ba"/><text x="200" y="134" class="tms">run #1: registerCallback(cb1)</text><text x="200" y="152" class="tms">suspend in awaitClose { … }</text>
+  <rect x="190" y="174" width="300" height="56" rx="2" class="ba"/><text x="200" y="196" class="tms">run #2: registerCallback(cb2)</text><text x="200" y="214" class="tms">suspend in awaitClose { … }</text>
+  <path d="M150,140 L188,140" class="lna" marker-end="url(#aha)"/>
+  <path d="M150,200 L188,200" class="lna" marker-end="url(#aha)"/>
+  <rect x="520" y="32" width="230" height="48" rx="2" class="bv"/><text x="532" y="52" class="tb">StateFlowImpl</text><text x="532" y="68" class="tms">_state = latest value</text>
+  <rect x="520" y="120" width="140" height="40" rx="2" class="b0"/><text x="532" y="144" class="tms">collector 1</text>
+  <rect x="520" y="180" width="140" height="40" rx="2" class="b0"/><text x="532" y="204" class="tms">collector 2</text>
+  <path d="M580,80 L580,118" class="lnv" marker-end="url(#ahv)"/>
+  <path d="M700,80 C710,130 690,170 662,196" class="lnv" marker-end="url(#ahv)"/>
+  <text x="770" y="128" class="ts">value is held with zero collectors</text>
+  <text x="770" y="146" class="ts">each collector takes a slot, reads _state</text>
+  <text x="770" y="164" class="ts">no upstream work per collector</text>
+  <text x="10" y="254" class="ts">Cold: the work and its resources exist per collection and end with it. Hot: one shared value exists as long as the StateFlow object is reachable.</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A cold flow costs nothing until collected and costs its full price for as long as the collection lasts.
+To find who keeps it alive, find the collector and the scope it was launched in.
+</blockquote>
+
+<h2 id="hot"><span class="n">7</span>A hot flow holds one shared value, whether or not anyone collects it</h2>
+<p>A hot flow shares one producer among all collectors. A cold flow runs its producer once per collector, which is wrong
+for two common needs. Several pieces of UI want the same value without each registering its own callback. And some
+values, such as the current user or whether the shade is open, should exist before anyone looks.</p>
+<p>A flow is <b>hot</b> when it exists independently of its collectors. Values are produced whether or not anyone
+listens, and collectors attach to an ongoing stream. Cold is a function call that each caller makes for itself. Hot is a
+broadcast already on air. The two hot types in kotlinx.coroutines are <code>SharedFlow</code>, a broadcast with an
+optional replay buffer, and its special case <code>StateFlow</code>, which always has exactly one current value.</p>
+
+<h3>StateFlow</h3>
+<p><code>MutableStateFlow(initial)</code> returns a <code>StateFlowImpl</code>. Its state is one atomic reference
+<code>_state</code>, an <code>int sequence</code>, and an array of collector slots inherited from
+<code>AbstractSharedFlow</code>:</p>
+
+<figure>
+<figcaption><b>Figure 7. Setting a StateFlow value stores it and wakes collectors. It never runs collector code
+itself.</b> Setting a value marks each collector’s slot (its entry in the flow’s array of collectors) and resumes
+suspended collectors through their dispatchers. So collector code runs on the setter’s thread only for a collector on
+<code>Dispatchers.Unconfined</code>, the dispatcher that resumes a coroutine on whatever thread wakes it.</figcaption>
+<svg viewBox="0 0 1000 244" role="img" aria-label="StateFlowImpl internals">
+  <rect x="10" y="30" width="260" height="110" rx="2" class="bv"/><text x="22" y="50" class="tb">StateFlowImpl</text>
+  <text x="22" y="74" class="tms">_state   → value</text>
+  <text x="22" y="94" class="tms">sequence = 0 (even: idle)</text>
+  <text x="22" y="114" class="tms">slots    → Array&lt;Slot?&gt;</text>
+  <rect x="320" y="40" width="180" height="36" rx="2" class="bw"/><text x="330" y="62" class="tms">value (e.g. Bitmap)</text>
+  <path d="M150,70 L318,58" class="ln" marker-end="url(#ah)"/>
+  <text x="320" y="110" class="th">slots</text>
+  <rect x="320" y="118" width="110" height="36" class="ba"/><text x="330" y="140" class="tms">slot 0</text>
+  <rect x="430" y="118" width="110" height="36" class="ba"/><text x="440" y="140" class="tms">slot 1</text>
+  <rect x="540" y="118" width="110" height="36" class="b0"/><text x="550" y="140" class="tms">null</text>
+  <rect x="650" y="118" width="110" height="36" class="b0"/><text x="660" y="140" class="tms">null</text>
+  <path d="M170,110 L318,134" class="ln" marker-end="url(#ah)"/>
+  <text x="330" y="174" class="tms">NONE</text><text x="440" y="174" class="tms">continuation</text>
+  <text x="790" y="126" class="ts">slot._state:</text>
+  <text x="790" y="142" class="ts">null: free</text>
+  <text x="790" y="158" class="ts">NONE: idle collector</text>
+  <text x="790" y="174" class="ts">PENDING: new value to read</text>
+  <text x="790" y="190" class="ts">continuation: suspended</text>
+  <text x="10" y="216" class="ts">value = x: under synchronized(this), return if old == new; else store _state and make sequence odd. Outside the lock, makePending() every slot.</text>
+  <text x="10" y="234" class="ts">Each collector loops: read _state, emit only if it differs from what it last emitted, then takePending() or suspend in awaitPending().</text>
+</svg>
+</figure>
+
+<pre><code><span class="src">kotlinx-coroutines-core/common/src/flow/StateFlow.kt · StateFlowImpl.collect (excerpt)</span><span class="k">val</span> slot = allocateSlot()
+<span class="k">try</span> {
+    <span class="k">var</span> oldState: Any? = <span class="k">null</span>
+    <span class="k">while</span> (<span class="k">true</span>) {
+        <span class="k">val</span> newState = _state.value
+        collectorJob?.ensureActive()
+<span class="hw">        if (oldState == null || oldState != newState) {     // conflation by equals()</span>
+            collector.emit(NULL.unbox(newState))
+            oldState = newState
+        }
+        <span class="k">if</span> (!slot.takePending()) { slot.awaitPending() }
+    }
+} <span class="k">finally</span> { freeSlot(slot) }</code></pre>
+<p>Each pass of the loop reads only the current <code>_state</code>, so a slow collector skips intermediate values. A
+StateFlow is always conflated. Three further consequences follow.</p>
+<ul>
+  <li>A StateFlow never completes, so collecting it only ends by cancellation.</li>
+  <li>Equal consecutive values are dropped. <code>updateState</code> returns early on <code>oldState == newState</code>,
+  and the loop compares again. So <code>distinctUntilChanged()</code> on a StateFlow does nothing.</li>
+  <li>Whatever is in <code>_state</code> stays reachable as long as the <code>StateFlowImpl</code> is, whether or not
+  anyone collects.</li>
+</ul>
+
+<h3>SharedFlow, stateIn and shareIn</h3>
+<p><code>MutableSharedFlow(replay = 0, extraBufferCapacity = 0, onBufferOverflow = SUSPEND)</code> keeps a circular
+<code>buffer</code>. It holds the last <code>replay</code> values plus any values slow collectors have not consumed yet.
+<b>Replay</b> is how many past values a new collector receives first, before live ones. A StateFlow behaves like
+replay 1. With the defaults, emit suspends until every current collector has taken the value.</p>
+<p><code>stateIn(scope, started, initial)</code> and <code>shareIn</code> turn a cold flow into a hot one. They launch
+one collection of it in <code>scope</code> and publish what it emits. The <code>started</code> argument is a
+<code>SharingStarted</code> policy that decides when that collection runs:</p>
+<ul>
+  <li><code>Eagerly</code>: now, until the scope ends.</li>
+  <li><code>Lazily</code>: on the first subscriber, then until the scope ends.</li>
+  <li><code>WhileSubscribed(stopTimeoutMillis = 0, …)</code>: stops the upstream once the last subscriber is gone.</li>
+</ul>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Put large objects in a <code>StateFlow</code> only if they should live as long as its owner. A
+<code>stateIn(applicationScope, Eagerly, …)</code> keeps its upstream running and its value alive for the life of the process.
+</blockquote>
+
+<h2 id="combine"><span class="n">8</span>combine keeps every input collected, all the time</h2>
+<p><code>combine</code> must know every input’s latest value at all times, so it collects all of them for as long as it
+is collected. UI often depends on several flows at once. Take an overlay that shows a list of apps only while it is
+open: its app category needs both the overlay’s state and the list of installed apps from Section 6.
+<code>combine(a, b) { x, y -&gt; … }</code> produces a value whenever any input changes, computed from the latest value of
+each.</p>
+<pre><code><span class="src">kotlinx-coroutines-core/common/src/flow/operators/Zip.kt</span><span class="k">public fun</span> &lt;T1, T2, R&gt; Flow&lt;T1&gt;.combine(flow: Flow&lt;T2&gt;, transform: <span class="k">suspend</span> (a: T1, b: T2) -&gt; R): Flow&lt;R&gt; = flow {
+    combineInternal(arrayOf(<span class="k">this</span>@combine, flow), nullArrayFactory(), { emit(transform(it[0] <span class="k">as</span> T1, it[1] <span class="k">as</span> T2)) })
+}</code></pre>
+<pre><code><span class="src">kotlinx-coroutines-core/common/src/flow/internal/Combine.kt · combineInternal (excerpt)</span>= flowScope {
+    <span class="k">val</span> size = flows.size
+<span class="hw">    val latestValues = arrayOfNulls&lt;Any?&gt;(size)</span>
+    latestValues.fill(UNINITIALIZED)
+    <span class="k">val</span> resultChannel = Channel&lt;Update&gt;(size)
+    ...
+    <span class="k">for</span> (i <span class="k">in</span> 0 until size) {
+<span class="hw">        launch {                                  // one child per input, started immediately</span>
+            <span class="k">try</span> {
+                flows[i].collect { value -&gt;
+                    resultChannel.send(Update(i, value))
+                    yield()
+                }
+            } <span class="k">finally</span> { <span class="k">if</span> (nonClosed.decrementAndGet() == 0) resultChannel.close() }
+        }
+    }
+    <span class="k">while</span> (<span class="k">true</span>) {
+        <span class="k">var</span> element = resultChannel.receiveCatching().getOrNull() ?: <span class="k">break</span>
+        ... latestValues[element.index] = element.value ...
+        <span class="k">if</span> (remainingAbsentValues == 0) transform(latestValues <span class="k">as</span> Array&lt;T&gt;)
+    }
+}</code></pre>
+<p>Step by step, when someone collects a combined flow:</p>
+<ol>
+  <li><code>flowScope</code> opens a scope for this one collection. It is a coroutineScope that is also cancelled if any
+  child is.</li>
+  <li>It fills <code>latestValues</code> with the marker <code>UNINITIALIZED</code>. It creates a channel with room for
+  one update per input.</li>
+  <li>It launches one child coroutine per input. Each child collects its input. For every value, it sends
+  <code>(index, value)</code> into the channel, then yields so the other children get a turn.</li>
+  <li>The parent loops on the channel. Each update overwrites <code>latestValues[index]</code>. Nothing is emitted until
+  every input has produced at least one value. After that, every update, or small batch of updates, calls
+  <code>transform</code> on the whole array, which emits downstream.</li>
+  <li>The loop ends on its own only when every input has completed. Otherwise it runs until the collector is cancelled.
+  That cancels the scope and with it every child.</li>
+</ol>
+<p>Now apply that to the overlay. A first version combines the two inputs and returns <code>null</code> while the overlay
+is closed:</p>
+<pre><code><span class="src">Overlay app category, first version (illustrative shape)</span><span class="k">val</span> categories: Flow&lt;List&lt;Category&gt;?&gt; =
+<span class="hl">    overlayState.combine(installedApps) { state, apps -&gt;</span>
+        <span class="k">if</span> (state <span class="k">is</span> OverlayState.Closed) { <span class="k">null</span> }
+        <span class="k">else</span> { listOf(Category(apps)) }
+    }</code></pre>
+<p>If something collects <code>categories</code> in a long-lived scope, for example a <code>launchIn(scope)</code>
+(shorthand for <code>scope.launch { collect() }</code>) that
+decides when to show the overlay, combine starts both children at once. Child 1 collects the cold
+<code>installedApps</code> flow. That registers a <code>LauncherApps.Callback</code> and sends the full app list, which
+lands in <code>latestValues[1]</code>. The transform returns <code>null</code> because the overlay is closed. But the
+child keeps collecting and the array keeps the list, for as long as that collection lives. The callback also re-queries
+on every package install or update.</p>
+
+<figure>
+<figcaption><b>Figure 8. combine runs one coroutine per input and keeps every input’s last value in one array.</b>
+The example values are from the overlay above. The transform returns <code>null</code> while the overlay is
+closed. But the array, and the child collecting <code>installedApps</code>, do not look at what the
+transform returns.</figcaption>
+<svg viewBox="0 0 1000 262" role="img" aria-label="combineInternal structure">
+  <text x="10" y="18" class="th">combineInternal: one coroutine per input, one array of latest values</text>
+  <rect x="10" y="40" width="200" height="44" rx="2" class="b0"/><text x="22" y="60" class="tb">flows[0]</text><text x="22" y="76" class="tms">overlayState</text>
+  <rect x="10" y="150" width="200" height="44" rx="2" class="b0"/><text x="22" y="170" class="tb">flows[1]</text><text x="22" y="186" class="tms">installedApps</text>
+  <rect x="250" y="40" width="190" height="44" rx="2" class="ba"/><text x="262" y="60" class="tb">launch #0</text><text x="262" y="76" class="tms">collect → send(0, v)</text>
+  <rect x="250" y="150" width="190" height="44" rx="2" class="ba"/><text x="262" y="170" class="tb">launch #1</text><text x="262" y="186" class="tms">collect → send(1, v)</text>
+  <rect x="480" y="95" width="150" height="44" rx="2" class="b2"/><text x="492" y="115" class="tb">Channel(size)</text><text x="492" y="131" class="tms">Update(i, v)</text>
+  <text x="670" y="70" class="th">latestValues</text>
+  <rect x="670" y="78" width="150" height="40" class="bw"/><text x="680" y="102" class="tms">[0] Closed</text>
+  <rect x="820" y="78" width="170" height="40" class="br"/><text x="830" y="102" class="tms">[1] ArrayList(apps)</text>
+  <rect x="670" y="150" width="320" height="44" rx="2" class="b0"/><text x="682" y="170" class="tb">transform(latestValues)</text><text x="682" y="186" class="ts">only once no slot is UNINITIALIZED</text>
+  <path d="M210,62 L248,62" class="ln" marker-end="url(#ah)"/><path d="M210,172 L248,172" class="ln" marker-end="url(#ah)"/>
+  <path d="M440,62 C460,62 460,110 478,112" class="ln" marker-end="url(#ah)"/>
+  <path d="M440,172 C460,172 460,125 478,123" class="ln" marker-end="url(#ah)"/>
+  <path d="M630,112 L668,100" class="ln" marker-end="url(#ah)"/>
+  <path d="M830,118 L830,148" class="ln" marker-end="url(#ah)"/>
+  <text x="10" y="230" class="ts">Both children start when the combined flow is collected and run until that collection is cancelled.</text>
+  <text x="10" y="248" class="ts">latestValues is a local of the flowScope lambda, so a heap dump shows it as a spilled L$n field of CombineKt$combineInternal$2.</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Use <code>combine</code> when you need every input live at once. When one input decides whether another is needed at
+all, use <code>flatMapLatest</code>. combine will keep the unneeded input collected and its last value in memory: a
+transform that returns <code>null</code> still pays for every input.
+</blockquote>
+
+<h2 id="latest"><span class="n">9</span>flatMapLatest and collectLatest stop the old work when a new value arrives</h2>
+<p>The rebind problem from Section 2 comes back in flow form. When a new value arrives (a new position, “now hidden”,
+“now inactive”), the work started for the old value should stop. The <code>…Latest</code> operators run a block per
+upstream value and cancel the previous block when a new value arrives. They are all one implementation:</p>
+<div class="two">
+<div>
+<pre><code><span class="src">flow/operators/Merge.kt, flow/terminal/Collect.kt (signatures shortened)</span><span class="k">fun</span> &lt;T, R&gt; Flow&lt;T&gt;.flatMapLatest(transform) =
+    transformLatest { emitAll(transform(it)) }
+<span class="k">fun</span> &lt;T, R&gt; Flow&lt;T&gt;.mapLatest(transform) =
+    transformLatest { emit(transform(it)) }
+<span class="k">suspend fun</span> &lt;T&gt; Flow&lt;T&gt;.collectLatest(action) {
+    mapLatest(action).buffer(0).collect()
+}</code></pre>
+</div>
+<div>
+<pre><code><span class="src">flow/internal/Merge.kt · ChannelFlowTransformLatest.flowCollect</span>coroutineScope {
+    <span class="k">var</span> previousFlow: Job? = <span class="k">null</span>
+    flow.collect { value -&gt;
+        previousFlow?.apply {
+<span class="hw">            cancel(ChildCancelledException())</span>
+<span class="hw">            join()</span>
+        }
+        previousFlow = launch(start = CoroutineStart.UNDISPATCHED) {
+            collector.transform(value)
+        }
+    }
+}</code></pre>
+</div>
+</div>
+<p>The previous block is cancelled <em>and joined</em> before the next one starts. <code>join()</code> suspends until
+that job has fully finished. So any <code>finally</code> or <code>awaitClose</code> in the old inner flow has run, and
+its callback is unregistered, before the new one begins. <code>CoroutineStart.UNDISPATCHED</code> starts the new block
+immediately on the current thread instead of posting it.</p>
+<p><code>flatMapLatest</code>’s transform returns a flow, the <b>inner flow</b>. The values of the current inner flow
+are emitted downstream. It is “flat” because a flow of flows becomes one flow. The inner flow for “closed” can be
+<code>flowOf(null)</code>, which emits one <code>null</code> and collects nothing. For the overlay of Section 8, the
+state now decides whether the app list is collected at all:</p>
+<pre><code><span class="src">Overlay app category, fixed (illustrative shape)</span><span class="k">val</span> categories: Flow&lt;List&lt;Category&gt;?&gt; =
+    overlayState
+<span class="hg">        .map { it is OverlayState.Open }</span>
+<span class="hg">        .distinctUntilChanged()</span>
+<span class="hg">        .flatMapLatest { isOpen -&gt;</span>
+            <span class="k">if</span> (!isOpen) flowOf(<span class="k">null</span>)
+            <span class="k">else</span> installedApps.map { apps -&gt; listOf(Category(apps)) }
+        }</code></pre>
+<ul>
+  <li><code>map { it is Open }</code> reduces the state to a boolean.</li>
+  <li><code>distinctUntilChanged()</code> stops an <code>Open → Open</code> update from cancelling and
+  re-registering.</li>
+  <li><code>flatMapLatest</code> collects <code>installedApps</code> only while open. When the overlay closes, it
+  cancels and joins that collection. So <code>awaitClose</code> unregisters the callback, and the list becomes
+  garbage.</li>
+</ul>
+
+<figure>
+<figcaption><b>Figure 9. With flatMapLatest, the app list is collected only while the overlay is open.</b>
+Each state change cancels the old inner flow, which unregisters its callback, before the new one starts.</figcaption>
+<svg viewBox="0 0 1000 236" role="img" aria-label="flatMapLatest timeline">
+  <text x="10" y="54" class="ts">state (upstream)</text>
+  <text x="10" y="118" class="ts">inner flow</text>
+  <text x="10" y="174" class="ts">downstream</text>
+  <line x1="120" y1="50" x2="990" y2="50" class="ln"/>
+  <circle cx="150" cy="50" r="5" class="fa"/><text x="140" y="38" class="tms">Closed</text>
+  <circle cx="430" cy="50" r="5" class="fa"/><text x="420" y="38" class="tms">Open</text>
+  <circle cx="730" cy="50" r="5" class="fa"/><text x="720" y="38" class="tms">Closed</text>
+  <rect x="150" y="100" width="280" height="28" rx="2" class="b0"/><text x="160" y="118" class="tms">flowOf(null)</text>
+  <rect x="430" y="100" width="300" height="28" rx="2" class="ba"/><text x="440" y="118" class="tms">installedApps: callback registered</text>
+  <rect x="730" y="100" width="260" height="28" rx="2" class="b0"/><text x="740" y="118" class="tms">flowOf(null)</text>
+  <text x="436" y="146" class="ts tg">launch new inner</text>
+  <text x="736" y="146" class="ts tr">cancel+join → awaitClose → unregister</text>
+  <line x1="120" y1="170" x2="990" y2="170" class="ln"/>
+  <circle cx="150" cy="170" r="4" class="fv"/><text x="160" y="188" class="tms">emit null</text>
+  <circle cx="440" cy="170" r="4" class="fv"/><text x="450" y="188" class="tms">emit categories</text>
+  <circle cx="740" cy="170" r="4" class="fv"/><text x="750" y="188" class="tms">emit null</text>
+  <text x="10" y="222" class="ts">With combine, the app-list flow would be collected across the whole timeline; with flatMapLatest it exists only between the two state changes.</text>
+</svg>
+</figure>
+
+<p><code>collectLatest</code> is the terminal version: <code>isVisible.collectLatest { if (it) collectStuff() }</code>
+stops <code>collectStuff</code> each time visibility changes. This is how a View that is hidden but still attached
+stops its work (Section 5, and pattern 1 in Section 11).</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+<code>flatMapLatest</code> and <code>collectLatest</code> turn a boolean (“shown”, “active”, “visible”) into a scope.
+When the upstream is not a StateFlow, put <code>distinctUntilChanged()</code> before them. Then equal values do not tear
+down and rebuild the inner collection.
+</blockquote>
+
+<!-- ═════════════════════════ PART IV ═════════════════════════ -->
+<div class="part">Part IV · Compose</div>
+
+<h2 id="compose"><span class="n">10</span>In Compose, remember and LaunchedEffect tie values and work to the composition</h2>
+<p>A Compose UI is a function that runs again and again, so anything that must last has to be stored outside the call.
+A View is a long-lived object: its fields are its state, and you change the screen by calling setters on it. A Compose
+UI is a function, <code>@Composable fun Screen(…)</code>, that the runtime calls again (<b>recomposes</b>) whenever
+state it read has changed. A local variable inside that function is recreated on every call. An animation object, a
+view-model or a running job must survive across calls, so it has to live somewhere else.</p>
+<p>The runtime keeps a <b>composition</b> for each piece of Compose UI. It records which composables were called, in what
+order, with what remembered values. That storage is the <b>slot table</b>. Per composition, it is an array of groups
+(<code>groups: IntArray</code>) and an array of values (<code>slots: Array&lt;Any?&gt;</code>), laid out in call order.
+It is kept as a <b>gap buffer</b>: an array with an empty stretch kept at the current editing position, so inserting
+there does not shift the rest. <code>remember</code> reads and writes the
+next slot:</p>
+<div class="two">
+<div>
+<pre><code><span class="src">compose/runtime/Composables.kt, Composer.kt (annotations dropped)</span><span class="k">inline fun</span> &lt;T&gt; remember(<span class="k">crossinline</span> calculation: () -&gt; T): T =
+    currentComposer.cache(<span class="k">false</span>, calculation)
+
+<span class="k">inline fun</span> &lt;T&gt; Composer.cache(invalid: Boolean, block: () -&gt; T): T {
+    <span class="k">return</span> rememberedValue().let {
+        <span class="k">if</span> (invalid || it === Composer.Empty) {
+            <span class="k">val</span> value = block()
+            updateRememberedValue(value)
+            value
+        } <span class="k">else</span> it
+    } <span class="k">as</span> T
+}</code></pre>
+</div>
+<div>
+<pre><code><span class="src">SystemUI/src/…/lifecycle/Activatable.kt</span><span class="k">@Composable</span>
+<span class="k">fun</span> &lt;T : Activatable&gt; rememberActivated(
+    traceName: String, key: Any = Unit, factory: () -&gt; T,
+): T {
+    <span class="k">val</span> instance = remember(key) { factory() }
+    LaunchedEffect(instance) {
+        traceCoroutine(traceName) { instance.activate() }
+    }
+    <span class="k">return</span> instance
+}</code></pre>
+<p><code>LaunchedEffect(key) { … }</code> runs a coroutine while it stays in the composition, and restarts it when
+<code>key</code> changes. It stores a <code>LaunchedEffectImpl</code> in a slot. That class is a
+<code>RememberObserver</code>: an interface for remembered values that want to know their own lifetime. The runtime
+calls <code>onRemembered()</code> when the value enters the composition and <code>onForgotten()</code> when it leaves.
+It calls <code>onAbandoned()</code> if the composition was discarded before it was applied. LaunchedEffectImpl
+launches the block in onRemembered(). The other two cancel it with
+<code>ExitedCompositionCancellationException</code>.</p>
+</div>
+</div>
+
+<figure>
+<figcaption><b>Figure 10. A remembered value lives in a slot, matched by call position, until its group leaves the
+composition.</b> The runtime skips creating the object on recomposition and cancels any remembered job when the group
+leaves.</figcaption>
+<svg viewBox="0 0 1000 216" role="img" aria-label="Slot table and remember">
+  <text x="10" y="18" class="th">SlotTable.slots for one composable call (gap buffer)</text>
+  <rect x="10" y="30" width="160" height="40" class="b2"/><text x="20" y="55" class="tms">group data</text>
+  <rect x="170" y="30" width="180" height="40" class="ba"/><text x="180" y="55" class="tms">remember: viewModel</text>
+  <rect x="350" y="30" width="200" height="40" class="bv"/><text x="360" y="55" class="tms">LaunchedEffectImpl</text>
+  <rect x="550" y="30" width="160" height="40" class="b0"/><text x="560" y="55" class="tms">remember: anim</text>
+  <rect x="710" y="30" width="120" height="40" fill="url(#hatch)" class="hatch-l"/><text x="740" y="86" class="tms">gap</text>
+  <rect x="830" y="30" width="160" height="40" class="b0"/><text x="840" y="55" class="tms">next group …</text>
+  <text x="10" y="112" class="tb">first composition</text>
+  <text x="10" y="130" class="ts">rememberedValue() == Composer.Empty</text>
+  <text x="10" y="146" class="ts">→ run block, updateRememberedValue(v)</text>
+  <text x="10" y="162" class="ts">→ RememberObserver.onRemembered()</text>
+  <text x="340" y="112" class="tb">recomposition</text>
+  <text x="340" y="130" class="ts">rememberedValue() returns v</text>
+  <text x="340" y="146" class="ts">block is not run</text>
+  <text x="340" y="162" class="ts">same object as last time</text>
+  <text x="670" y="112" class="tb">leaves the composition</text>
+  <text x="670" y="130" class="ts">the group’s slots are removed</text>
+  <text x="670" y="146" class="ts">→ RememberObserver.onForgotten()</text>
+  <text x="670" y="162" class="ts">→ LaunchedEffect: job.cancel(…)</text>
+  <text x="10" y="202" class="ts">Slots are matched by call position, so where a remember call sits in the code is its identity. Branch away from it and the value is forgotten.</text>
+</svg>
+</figure>
+
+<p>SystemUI uses this to scope view-models to the UI. An <code>Activatable</code> is an object with a
+<code>suspend fun activate()</code> that does its work until cancelled. <code>rememberActivated</code>, above, remembers
+one and activates it in a LaunchedEffect. View-models built on <code>HydratedActivatable</code> do their work in
+<code>onActivated()</code>. <code>activate()</code> runs it inside a coroutineScope, then
+<code>awaitCancellation()</code>, which suspends until the coroutine is cancelled, with <code>onDeactivated()</code> in a
+<code>finally</code>.</p>
+<p>So everything launched in onActivated() lives as long as the composable that remembered the view-model.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+In Compose, “scoped to the UI” is the default when work runs in a <code>LaunchedEffect</code> or an activated view-model.
+What it keeps alive is whatever those coroutines write into longer-lived objects, such as a <code>MutableStateFlow</code> field.
+</blockquote>
+
+<!-- ═════════════════════════ PART V ═════════════════════════ -->
+<div class="part">Part V · Leak patterns</div>
+
+<h2 id="leaks"><span class="n">11</span>Common leak patterns: each is a lifetime that runs too long</h2>
+<p>Every pattern below is one mistake in a different place: some work, or some value, outlives the piece of UI that
+needed it. To find one in a heap dump, start from the object that should be gone and follow the references back to a
+GC root (Section 1). Object X <b>dominates</b> object Y if every path from a GC root to Y passes through X. X’s
+<b>retained size</b> is the total size of everything it dominates: what the GC would free if X alone became
+unreachable. The first object on the path that has no reason to be alive is usually the bug.</p>
+<p class="m">Table 2. Common leak patterns, what each keeps alive, and the rule that prevents it.</p>
+<table>
+  <thead><tr><th>#</th><th>Pattern</th><th>Kept alive</th><th>Rule</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>A collector runs in a scope that outlives its View, or keeps running while the View is hidden</td><td>The View, its drawables, every value it captured</td><td>Collect in a scope that ends with the UI; gate hidden-but-attached Views on visibility with <code>collectLatest</code> (Sections 5, 9)</td></tr>
+    <tr><td>2</td><td><code>stateIn</code>/<code>shareIn</code> with <code>Eagerly</code> in a long-lived scope</td><td>The upstream, its callbacks and the last value, for the life of the process</td><td><code>WhileSubscribed</code>, or a scope that ends with the UI (Section 7)</td></tr>
+    <tr><td>3</td><td><code>combine</code> over an input that only matters in some state</td><td>That input’s callback and last value</td><td><code>flatMapLatest</code> on the state (Sections 8, 9)</td></tr>
+    <tr><td>4</td><td>A delayed <code>Runnable</code> that captures a View and is never removed</td><td>The View until the message runs</td><td><code>removeCallbacks</code> on teardown, or a <code>delay</code> in a scope (Sections 1, 4)</td></tr>
+    <tr><td>5</td><td>A singleton reuses an injected builder that keeps its last arguments</td><td>The last object built</td><td>Inject a <code>Provider</code> (a handle whose <code>get()</code> returns a new instance of an unscoped type on each call), or a factory whose <code>create(…)</code> takes the arguments</td></tr>
+    <tr><td>6</td><td>A background step revives an object the main thread already destroyed</td><td>A registered Binder callback. The remote process holds it, so the native Binder layer keeps a JNI global reference: a GC root</td><td>A <code>@Volatile destroyed</code> flag (so the background thread sees the main thread’s write) checked before any side effect, or a scope cancelled in <code>destroy()</code></td></tr>
+    <tr><td>7</td><td>Check-then-act on a cache across a suspension point</td><td>Two copies of one value</td><td>A <code>Mutex</code> and a re-check inside it (Section 4)</td></tr>
+    <tr><td>8</td><td><code>remember</code> without the key its value depends on</td><td>A stale object, for as long as the composable stays</td><td><code>remember(key)</code> (Section 10)</td></tr>
+  </tbody>
+</table>
+<p>Each pattern as a small, made-up code shape:</p>
+<div class="two">
+<div>
+<pre><code><span class="src">1 · collector outlives its View (shape)</span><span class="c">// leaks: runs as long as appScope, keeps imageView</span>
+appScope.launch { model.icon.collect { imageView.setImageDrawable(it) } }
+
+<span class="c">// fixed: ends with the lifecycle, and stops while hidden</span>
+lifecycleScope.launch {
+    repeatOnLifecycle(Lifecycle.State.STARTED) {
+        model.isShown.collectLatest { shown -&gt;
+            <span class="k">if</span> (shown) model.icon.collect { imageView.setImageDrawable(it) }
+            <span class="k">else</span> imageView.setImageDrawable(<span class="k">null</span>)
+        }
+    }
+}</code></pre>
+</div>
+<div>
+<pre><code><span class="src">2 · eager sharing (shape)</span><span class="c">// upstream runs, and its value lives, until the process dies</span>
+<span class="k">val</span> photos = repo.photos.stateIn(appScope, SharingStarted.Eagerly, emptyList())
+
+<span class="c">// upstream stops 5 s after the last collector leaves</span>
+<span class="k">val</span> photos = repo.photos.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())</code></pre>
+<pre><code><span class="src">3 · combine over a conditional input (shape)</span><span class="c">// pays for apps while closed</span>
+state.combine(apps) { s, a -&gt; <span class="k">if</span> (s.isOpen) a <span class="k">else null</span> }
+
+<span class="c">// collects apps only while open</span>
+state.map { it.isOpen }.distinctUntilChanged()
+    .flatMapLatest { open -&gt; <span class="k">if</span> (open) apps <span class="k">else</span> flowOf(<span class="k">null</span>) }</code></pre>
+</div>
+</div>
+<div class="two">
+<div>
+<pre><code><span class="src">4 · forgotten timer (shape)</span>handler.postDelayed(expire, 30_000)        <span class="c">// expire captures this View</span>
+
+<span class="k">override fun</span> onDetachedFromWindow() {
+<span class="hg">    handler.removeCallbacks(expire)        // else the View lives 30 s more</span>
+    <span class="k">super</span>.onDetachedFromWindow()
+}</code></pre>
+<pre><code><span class="src">5 · stateful builder in a singleton (shape)</span><span class="k">@Singleton class</span> RowBinder <span class="k">@Inject constructor</span>(
+<span class="hg">    private val builder: Provider&lt;RowComponent.Builder&gt;,  // not the Builder itself</span>
+) {
+    <span class="k">fun</span> bind(row: Row) = builder.get().row(row).build()
+}</code></pre>
+</div>
+<div>
+<pre><code><span class="src">6 · background step revives a destroyed object (shape)</span><span class="k">@Volatile var</span> destroyed = <span class="k">false</span>
+
+<span class="k">fun</span> start() = bg.execute {
+<span class="hg">    if (destroyed) return@execute          // never register after destroy</span>
+    controller.registerCallback(callback)
+}
+<span class="k">fun</span> destroy() {                             <span class="c">// main thread</span>
+    destroyed = <span class="k">true</span>
+    bg.execute { controller.unregisterCallback(callback) }
+}</code></pre>
+</div>
+</div>
+<div class="two">
+<div>
+<pre><code><span class="src">7 · cache race across a suspension point (shape)</span><span class="k">private val</span> lock = Mutex()
+
+<span class="k">suspend fun</span> icon(id: Int): Bitmap = lock.withLock {
+<span class="hg">    cache[id] ?: withContext(Dispatchers.IO) { decode(id) }</span>
+<span class="hg">        .also { cache[id] = it }           // second caller finds the first one's result</span>
+}</code></pre>
+</div>
+<div>
+<pre><code><span class="src">8 · remember without the right key (shape)</span><span class="c">// keeps the first user's model after userId changes</span>
+<span class="k">val</span> model = remember { ProfileModel(userId) }
+
+<span class="c">// rebuilt, and the old one forgotten, when userId changes</span>
+<span class="k">val</span> model = remember(userId) { ProfileModel(userId) }</code></pre>
+</div>
+</div>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+For every coroutine, callback, timer and cached value, name the moment it should end, and make that moment cancel or
+release it. In a heap dump, the leak is the first object on the path to a GC root that is still alive after that moment.
+</blockquote>
+
+<h2 id="cheatsheet"><span class="n">12</span>Cheat sheet</h2>
+<table>
+  <thead><tr><th>Term</th><th>What it is</th><th>What it keeps alive</th></tr></thead>
+  <tbody>
+    <tr><td><code>suspend fun</code></td><td>A state machine taking a hidden <code>Continuation</code>; returns <code>COROUTINE_SUSPENDED</code> to pause.</td><td>Its frame object (<code>label</code>, <code>L$n</code>) and everything spilled, while suspended.</td></tr>
+    <tr><td><code>withContext(d)</code></td><td>Runs a block on dispatcher <code>d</code>, resumes the caller on its own dispatcher.</td><td>Other coroutines can run on the caller’s thread in between.</td></tr>
+    <tr><td><code>Job</code>, scope</td><td>A lifetime handle; parent cancel cancels children.</td><td>Children until the scope is cancelled.</td></tr>
+    <tr><td>cold flow</td><td>A description; each <code>collect</code> runs the producer.</td><td>Producer resources per collection, until it ends.</td></tr>
+    <tr><td><code>StateFlow</code></td><td>One current value, slots per collector, equality conflation, never completes.</td><td><code>_state</code>, while the <code>StateFlow</code> is reachable, collected or not.</td></tr>
+    <tr><td><code>stateIn</code>/<code>shareIn</code></td><td>One upstream collection in a scope, shared.</td><td>Upstream per <code>SharingStarted</code>; value while the flow is reachable.</td></tr>
+    <tr><td><code>combine</code></td><td>One child per input plus <code>latestValues</code>.</td><td>All inputs collected, all last values, for the whole collection.</td></tr>
+    <tr><td><code>flatMapLatest</code>, <code>collectLatest</code></td><td>Cancel and join the previous block on each new value.</td><td>Only the current inner collection.</td></tr>
+    <tr><td><code>remember</code></td><td><code>Composer.cache</code> over the slot table.</td><td>The value until its group leaves the composition.</td></tr>
+    <tr><td><code>LaunchedEffect</code></td><td>A <code>RememberObserver</code> that launches on remember, cancels on forget.</td><td>Its job, while composed.</td></tr>
+    <tr><td><code>Channel</code></td><td>A queue between coroutines; <code>send</code>/<code>receive</code> suspend when full/empty.</td><td>Buffered values until received.</td></tr>
+    <tr><td>Retained size</td><td>Total size of the objects a given object dominates in a heap dump.</td><td>What would be freed if that one object became unreachable.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="method"><span class="n">13</span>Versions and method</h2>
+<p>Library excerpts are from kotlinx.coroutines (the copy in AOSP’s <code>external/kotlinx.coroutines</code>), the
+Kotlin 2.2.0 standard library sources and compiler, and the published AndroidX sources jars on Google Maven (Compose
+runtime, RecyclerView, ViewPager, ViewPager2). The <code>Cache.load</code> example in Section 3 was compiled
+with the Kotlin 2.2.0 compiler and read back with <code>javap</code>. In Figure 3, fields come from
+<code>javap -p</code> on the compiled class, and superclass fields come from <code>ContinuationImpl.kt</code> in the
+stdlib sources; order within each group is illustrative. <code>_context</code> is the coroutine’s settings
+(<code>CoroutineContext</code>, Section 4), and <code>intercepted</code> caches the frame wrapped by its dispatcher so
+a resume goes through the right thread. Figure 7 is from <code>StateFlowImpl.updateState</code> and
+<code>StateFlowImpl.collect</code>. Figure 10 is read from the Compose runtime sources and shows the long-standing
+gap-buffer slot table; deeper details (groups encoding,
+recomposition scopes, snapshot state) are outside this note.</p>
+<p>SystemUI excerpts (Sections 5, 6 and 10) are from <code>frameworks/base</code> and match AOSP as of
+<code>android16-qpr2-release</code>. Code marked <em>shape</em> is simplified. The status-indicator binder in Section 5,
+the overlay in Sections 8 and 9 and the code shapes in Section 11 are illustrations, not product code. Object sizes
+assume ART’s layout (8-byte header, 4-byte references; see
+<a href="../art_costs/index.html#layout">ART costs §1</a>).</p>
+
+<h2 id="sources">Sources</h2>
+<ul>
+  <li><code>kotlinx-coroutines-core/common/src/flow/internal/Combine.kt</code>: <code>combineInternal</code>, per-input children, <code>latestValues</code>, <code>UNINITIALIZED</code></li>
+  <li><code>…/flow/operators/Zip.kt</code>: two-argument <code>combine</code></li>
+  <li><code>…/flow/operators/Merge.kt</code> and <code>…/flow/internal/Merge.kt</code>: <code>flatMapLatest</code>, <code>mapLatest</code>, <code>ChannelFlowTransformLatest</code> cancel + join</li>
+  <li><code>…/flow/terminal/Collect.kt</code>: <code>collectLatest</code></li>
+  <li><code>…/flow/StateFlow.kt</code>: <code>StateFlowImpl</code>, <code>updateState</code>, <code>collect</code>, slot states</li>
+  <li><code>…/flow/SharedFlow.kt</code>, <code>SharingStarted.kt</code>, <code>operators/Share.kt</code>: <code>MutableSharedFlow</code> defaults, <code>WhileSubscribed</code>, <code>stateIn</code></li>
+  <li><code>…/flow/Builders.kt</code> and <code>…/channels/Produce.kt</code>: <code>callbackFlow</code>, <code>awaitClose</code></li>
+  <li><code>…/common/src/Builders.common.kt</code>, <code>Job.kt</code>: <code>withContext</code>, <code>DispatchedCoroutine.afterResume</code>, parent/child cancellation</li>
+  <li><code>ui/kotlinx-coroutines-android/src/HandlerDispatcher.kt</code>: <code>HandlerContext.dispatch</code>, <code>scheduleResumeAfterDelay</code></li>
+  <li>Kotlin 2.2.0 compiler: used for the <code>Cache.load</code> example; <code>kotlin-stdlib</code> sources jar for <code>BaseContinuationImpl</code>/<code>ContinuationImpl</code></li>
+  <li><code>androidx.compose.runtime:runtime-android</code> sources jar: <code>remember</code>, <code>Composer.cache</code>, gap-buffer <code>SlotTable</code>, <code>LaunchedEffectImpl</code></li>
+  <li><code>androidx.recyclerview:recyclerview</code>, <code>androidx.viewpager2:viewpager2</code>, <code>androidx.viewpager:viewpager</code> sources jars: cache and pool sizes, <code>mRecyclerView</code>, offscreen pages</li>
+  <li><code>frameworks/base/packages/SystemUI/src/com/android/systemui/lifecycle/</code>: <code>RepeatWhenAttached.kt</code>, <code>Activatable.kt</code>, <code>HydratedActivatable.kt</code> (view lifecycle states, <code>rememberActivated</code>, <code>activate()</code>)</li>
+  <li><code>frameworks/base/packages/SystemUI/utils/src/com/android/systemui/utils/coroutines/flow/FlowConflated.kt</code>: <code>conflatedCallbackFlow</code></li>
+  <li><code>…/common/src/CoroutineStart.kt</code>, <code>intrinsics/Cancellable.kt</code>, <code>internal/DispatchedContinuation.kt</code>, <code>internal/DispatchedTask.kt</code>: the end-to-end walk in §4 (<code>StandaloneCoroutine</code>, <code>startCoroutineCancellable</code>, <code>resumeCancellableWith</code>, cancelled-job check on resume)</li>
+  <li><code>core/jni/android_util_Binder.cpp</code>: <code>JavaBBinder</code> holds a JNI global reference to the Java Binder object, which makes a registered Binder callback a GC root (§11, pattern 6)</li>
+</ul>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>

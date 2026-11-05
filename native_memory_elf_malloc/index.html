@@ -1,0 +1,1361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ELF, linker64, mmap and malloc</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="Pages · ELF · linker64 · RELRO · Scudo">ELF, linker64, mmap &amp; malloc</span>
+  <span class="tb-spacer"></span>
+  <a class="tb-x" href="../art_costs/index.html">Where the costs are in ART</a>
+  <a class="tb-x" href="../java_sdk_zero_copy/index.html">Zero-copy JNI</a>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#glance">At a glance</a>
+  <a href="#overview">Three layers &amp; what costs what</a>
+  <div class="ph">I · Pages</div>
+  <a href="#vm">1 · Reserving is free, touching costs RAM</a>
+  <a href="#mmap">2 · Writes make private copies</a>
+  <a href="#pss">3 · RSS, PSS, USS</a>
+  <div class="ph">II · ELF &amp; linker64</div>
+  <a href="#elf">4 · Segments group by permission</a>
+  <a href="#elf-ptrs" style="padding-left:18px">pointer tables</a>
+  <a href="#pic">5 · PIC, GOT &amp; PLT</a>
+  <a href="#load">6 · How linker64 loads a library</a>
+  <a href="#load-reserve" style="padding-left:18px">reserve &amp; map</a>
+  <a href="#load-hash" style="padding-left:18px">symbol lookup</a>
+  <a href="#load-relr" style="padding-left:18px">relocations &amp; RELR</a>
+  <a href="#load-relro" style="padding-left:18px">RELRO &amp; constructors</a>
+  <a href="#relro-share">7 · Sharing RELRO across processes</a>
+  <a href="#ns">8 · Linker namespaces</a>
+  <div class="ph">III · malloc</div>
+  <a href="#malloc">9 · malloc is a dispatcher</a>
+  <a href="#scudo">10 · Scudo</a>
+  <a href="#scudo-primary" style="padding-left:18px">primary &amp; size classes</a>
+  <a href="#scudo-header" style="padding-left:18px">chunk header</a>
+  <a href="#scudo-secondary" style="padding-left:18px">secondary &amp; guard pages</a>
+  <a href="#scudo-mte" style="padding-left:18px">MTE &amp; pointer tags</a>
+  <a href="#release">11 · Why free() doesn’t lower RSS</a>
+  <a href="#others">12 · dlmalloc, jemalloc, TCMalloc</a>
+  <div class="ph">IV · Practice</div>
+  <a href="#maps">13 · Reading /proc/pid/maps &amp; smaps</a>
+  <a href="#cheatsheet">14 · Cheat sheet</a>
+  <a href="#method">15 · Numbers and method</a>
+  <a href="#sources">Sources</a>
+</nav>
+
+<main id="top">
+<h1>Native memory on Android: where each page in smaps comes from</h1>
+<p class="lead">This note explains native memory on Android from the page up. It covers how the kernel hands out memory and how a
+shared library is laid out. It follows <code>linker64</code>, Android’s dynamic linker, from <code>dlopen()</code> to your first
+call. It then shows how Scudo, the default allocator in bionic (Android’s C library), turns pages into malloc blocks. After
+reading it you should be able to look at a line in <code>/proc/pid/smaps</code> and say where it came from and why it costs what
+it does.</p>
+<p class="m">Code excerpts and constants are from AOSP as of Android 17 (<code>bionic/</code>, <code>external/scudo/</code> and <code>frameworks/base/</code>).
+ELF numbers are illustrative: they come from <code>readelf</code> on the arm64 <code>libhwui.so</code> of one platform build (“this build” below), and exact sizes and counts vary from build to build. Excerpts marked <em>shape</em>
+are simplified. Cost tiers are rough orders of magnitude, not measurements.</p>
+
+<h2 id="glance">At a glance</h2>
+<ul>
+  <li>Reserving address space is free. RAM is used only when a page is first touched.</li>
+  <li>Shared pages stay shared until someone writes to them. Writing one byte costs a whole private page.</li>
+  <li>Loading a library writes addresses into its pointer tables. Those pages become private memory in every process, unless the
+  zygote or WebView shares them.</li>
+  <li>On Android, malloc is Scudo. It groups small blocks by size, checks every free, and fences large blocks with guard pages.</li>
+  <li>Freeing memory lowers RSS only when a whole page is empty, and Scudo waits a moment before giving pages back.</li>
+</ul>
+<p>Terms used throughout, defined once:</p>
+<ul>
+  <li><b>VMA</b> (virtual memory area): one address range in a process, with permissions and a backing, either a file or nothing.</li>
+  <li><b>Page fault</b>: the trap into the kernel when a process touches a page that has no RAM behind it yet.</li>
+  <li><b>Clean</b> pages still match their file and can be dropped. <b>Dirty</b> pages were written and cannot.</li>
+  <li><b>RSS</b>: every page of a process that is currently in RAM, with shared pages counted in full.</li>
+  <li><b>PSS</b>: a process’s memory with each shared page split between the processes that map it.</li>
+  <li><b>Zygote</b>: the pre-initialised process that every app is forked from, so apps start with its memory already set up.</li>
+  <li><b>Relocation</b>: a note telling the dynamic linker to write an address into a library once it knows where the library
+  landed.</li>
+  <li><b>RELRO</b>: the part of a library the linker writes during loading and then makes read-only.</li>
+</ul>
+
+<h2 id="overview">Three layers explain almost every native-memory question</h2>
+<p>Native memory has three layers. Each layer builds on the one below.</p>
+<ol>
+  <li><b>Virtual address space.</b> Each process has a list of VMAs. Creating one is cheap and uses no RAM.</li>
+  <li><b>Pages.</b> The kernel hands out RAM one page at a time, on first touch. Pages backed by the same file are shared
+  between processes until someone writes to them.</li>
+  <li><b>User-space sub-allocators.</b> The kernel only deals in whole pages. <code>linker64</code> maps page-aligned slices of
+  library files. malloc carves anonymous pages, which have no file behind them, into small blocks. It gives empty pages back
+  with <code>madvise</code>, a syscall that tells the kernel it may take them away.</li>
+</ol>
+<p>Staying in user space is cheap. Entering the kernel or touching a new page is far slower. Figure 1 puts the operations
+this note covers side by side.</p>
+<figure>
+<figcaption><b>Figure 1. Anything that enters the kernel or touches a new page costs far more than staying in user space.</b>
+A PLT call or a cached malloc is cheap. Entering the kernel or touching a page for the first time is two to three orders of
+magnitude more, and waiting for storage is more again. <code>dlopen</code> does all of these at once. Page faults are in
+Section 1, PLT calls in Section 5, and malloc’s per-thread (TSD) caches in Section 10.</figcaption>
+<svg viewBox="0 0 1000 272" role="img" aria-label="Native cost ladder">
+  <text x="10" y="18" class="th">operation</text>
+  <text x="330" y="18" class="th">relative cost (rough, log scale)</text>
+  <line x1="330" y1="28" x2="330" y2="240" class="ln"/>
+  <line x1="480" y1="28" x2="480" y2="240" class="ln dash" opacity="0.5"/>
+  <line x1="630" y1="28" x2="630" y2="240" class="ln dash" opacity="0.5"/>
+  <line x1="780" y1="28" x2="780" y2="240" class="ln dash" opacity="0.5"/>
+  <text x="380" y="258" class="tms">~1 ns</text><text x="520" y="258" class="tms">tens of ns</text><text x="690" y="258" class="tms">~1 µs</text><text x="800" y="258" class="tms">100 µs – ms</text>
+  <text x="10" y="46" class="t">load that hits L1 cache</text>                 <rect x="331" y="35" width="25" height="14" class="bg"/>
+  <text x="10" y="72" class="t">call through the PLT (+1 load, +1 branch)</text><rect x="331" y="61" width="50" height="14" class="bg"/>
+  <text x="10" y="98" class="t">malloc / free, TSD cache hit</text>          <rect x="331" y="87" width="170" height="14" class="ba"/>
+  <text x="10" y="124" class="t">minor page fault (first touch)</text>          <rect x="331" y="113" width="330" height="14" class="bw"/>
+  <text x="10" y="150" class="t">mmap / mprotect / munmap syscall</text>        <rect x="331" y="139" width="310" height="14" class="bw"/>
+  <text x="10" y="176" class="t">madvise(MADV_DONTNEED) on a range</text>       <rect x="331" y="165" width="340" height="14" class="bw"/>
+  <text x="10" y="202" class="t">major page fault (read from flash)</text>      <rect x="331" y="191" width="530" height="14" class="br"/>
+  <text x="10" y="228" class="t">dlopen of a large library</text>               <rect x="331" y="217" width="600" height="14" class="br"/>
+</svg>
+</figure>
+
+<!-- ═════════════════════════ PART I ═════════════════════════ -->
+<div class="part">Part I · Pages</div>
+
+<h2 id="vm"><span class="n">1</span>Reserving address space is free, touching it costs RAM</h2>
+<p>Virtual memory lets the kernel do three things at once. It keeps processes out of each other’s memory. It lets them ask
+for far more memory than they will touch. And it shares one copy of common code between all of them.</p>
+<p>Every load and store uses a <b>virtual address</b>. The CPU’s MMU (memory management unit, the hardware that does the
+translation) maps it to a physical address through per-process <b>page tables</b>. The user address space runs to hundreds of
+gigabytes or more, depending on how the kernel is configured (Figure 3). The hardware also ignores the top byte of a pointer
+(TBI, top-byte ignore). That is what lets Android store tags there (Section 10).</p>
+<p>Translation works one page at a time. A page is 4 KiB, or 16 KiB on devices built for larger pages. The low bits of an address pass
+through unchanged. The rest select a <b>page-table entry (PTE)</b>, which either points at a physical page or is not present.</p>
+<p>Asking for memory only creates a VMA. <code>mmap(NULL, 1 GiB, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)</code>
+does not allocate a gigabyte. It records one VMA saying “this range is valid, read-write, anonymous” and returns. The PTEs
+stay empty.</p>
+<p>The first store to a page traps into the kernel. This trap is a <b>page fault</b>. The kernel finds the VMA, takes one
+zeroed physical page, fills in the PTE and resumes the store.</p>
+<p>That is a <b>minor page fault</b>: no I/O, only kernel work. A <b>major fault</b> has to read the page from storage first.
+A <em>read</em> of untouched anonymous memory is cheaper still. The kernel can map its single shared, read-only zero page, and
+allocates a real page only on the first write.</p>
+<p>Pages come in two kinds. File-backed pages hold file contents and live in the <b>page cache</b>, the kernel’s in-RAM cache
+of file data. Every process that maps the same file shares those pages, and a clean one can be dropped and read back later.</p>
+<p><b>Anonymous memory</b> has no file behind it: heap, stacks, and globals once written. Android has no swap partition. So
+the only way to reclaim it without killing the process is zram, a compressed swap device that lives in RAM.</p>
+
+<figure>
+<figcaption><b>Figure 2. A process’s memory cost is the green and red rows, not the size of its VMAs.</b> Allocators live in
+the bottom row: they keep the address range and give the pages back. <code>MAP_PRIVATE</code> and copy-on-write are explained
+in Section 2.</figcaption>
+<svg viewBox="0 0 1000 262" role="img" aria-label="Four states of a virtual page">
+  <text x="10" y="18" class="th">virtual page</text><text x="300" y="18" class="th">page-table entry</text><text x="590" y="18" class="th">physical memory</text>
+
+  <rect x="10" y="30" width="250" height="46" rx="2" class="b0" stroke-dasharray="4 3"/>
+  <text x="22" y="50" class="tb">anonymous, never touched</text><text x="22" y="66" class="ts">mmap returned it; only the VMA exists</text>
+  <path d="M260,53 L296,53" class="ln" marker-end="url(#ah)"/>
+  <rect x="300" y="30" width="250" height="46" rx="2" class="b0" stroke-dasharray="4 3"/>
+  <text x="312" y="50" class="tm">not present</text><text x="312" y="66" class="ts">first access faults into the kernel</text>
+  <path d="M550,53 L586,53" class="ln dash" marker-end="url(#ah)"/>
+  <rect x="590" y="30" width="400" height="46" rx="2" class="b0" stroke-dasharray="4 3"/>
+  <text x="602" y="50" class="tb">nothing yet</text><text x="602" y="66" class="ts">a read fault may map the kernel’s shared zero page; a write allocates</text>
+
+  <rect x="10" y="88" width="250" height="46" rx="2" class="bg"/>
+  <text x="22" y="108" class="tb">.text of libhwui.so</text><text x="22" y="124" class="ts">file-backed, MAP_PRIVATE, r-x</text>
+  <path d="M260,111 L296,111" class="lng" marker-end="url(#ahg)"/>
+  <rect x="300" y="88" width="250" height="46" rx="2" class="bg"/>
+  <text x="312" y="108" class="tm">present, read-only</text><text x="312" y="124" class="ts">points into the page cache</text>
+  <path d="M550,111 L586,111" class="lng" marker-end="url(#ahg)"/>
+  <rect x="590" y="88" width="400" height="46" rx="2" class="bg"/>
+  <text x="602" y="108" class="tb">page-cache page, shared clean</text><text x="602" y="124" class="ts">one copy for every process mapping the file; can be dropped and re-read</text>
+
+  <rect x="10" y="146" width="250" height="46" rx="2" class="br"/>
+  <text x="22" y="166" class="tb">written page</text><text x="22" y="182" class="ts">heap, stack, .data, a copy-on-write copy</text>
+  <path d="M260,169 L296,169" class="lnr" marker-end="url(#ahr)"/>
+  <rect x="300" y="146" width="250" height="46" rx="2" class="br"/>
+  <text x="312" y="166" class="tm">present, writable</text><text x="312" y="182" class="ts">points at a page only this process owns</text>
+  <path d="M550,169 L586,169" class="lnr" marker-end="url(#ahr)"/>
+  <rect x="590" y="146" width="400" height="46" rx="2" class="br"/>
+  <text x="602" y="166" class="tb">private anonymous page, private dirty</text><text x="602" y="182" class="ts">no file to re-read it from: reclaimed only by zram swap or by killing the process</text>
+
+  <rect x="10" y="204" width="250" height="46" rx="2" class="b"/>
+  <text x="22" y="224" class="tb">after madvise(MADV_DONTNEED)</text><text x="22" y="240" class="ts">the VMA is still there</text>
+  <path d="M260,227 L296,227" class="ln" marker-end="url(#ah)"/>
+  <rect x="300" y="204" width="250" height="46" rx="2" class="b"/>
+  <text x="312" y="224" class="tm">cleared</text><text x="312" y="240" class="ts">next touch is a fresh minor fault</text>
+  <path d="M550,227 L586,227" class="ln" marker-end="url(#ah)"/>
+  <rect x="590" y="204" width="400" height="46" rx="2" class="b"/>
+  <text x="602" y="224" class="tb">page returned to the kernel</text><text x="602" y="240" class="ts">anonymous memory reads back as zeros the next time it is touched</text>
+</svg>
+</figure>
+
+<p>This is why <code>VSZ</code> (virtual size) in <code>top</code> is huge on 64-bit Android and means nothing. Scudo reserves one
+range per size class (Section 10). The zygote, the pre-initialised process that every app is forked from, reserves a range for
+WebView (Section 7). <code>linker64</code> can leave <code>PROT_NONE</code> (no-access) gaps inside and between libraries
+(Section 6). None of that is RAM until it is touched.</p>
+
+<figure>
+<figcaption><b>Figure 3. Reservations run to gigabytes, but RAM is handed out one page at a time.</b> Sizes of the arm64 Android user address space and of the reservations this note covers, on a log scale where each axis step is a factor of 1,024. None of the
+reserved ranges uses RAM until a page in it is touched.</figcaption>
+<svg viewBox="0 0 860 268" style="max-width:860px" role="img" aria-label="Address space reservations compared with one page">
+  <text x="10" y="18" class="th">range</text><text x="300" y="18" class="th">size (log scale)</text>
+  <line x1="300" y1="28" x2="300" y2="226" class="ln"/>
+  <line x1="300" y1="226" x2="780" y2="226" class="ln"/>
+  <line x1="420" y1="226" x2="420" y2="231" class="ln"/>
+  <line x1="540" y1="226" x2="540" y2="231" class="ln"/>
+  <line x1="660" y1="226" x2="660" y2="231" class="ln"/>
+  <line x1="780" y1="226" x2="780" y2="231" class="ln"/>
+  <text x="300" y="244" class="ts" text-anchor="middle">1 KiB</text><text x="420" y="244" class="ts" text-anchor="middle">1 MiB</text>
+  <text x="540" y="244" class="ts" text-anchor="middle">1 GiB</text><text x="660" y="244" class="ts" text-anchor="middle">1 TiB</text>
+  <text x="780" y="244" class="ts" text-anchor="middle">1 PiB</text>
+
+  <text x="10" y="46" class="t">user address space, 48-bit kernel</text>
+  <rect x="301" y="34" width="456" height="16" class="b2"/><text x="763" y="47" class="ts">256 TiB</text>
+  <text x="10" y="74" class="t">user address space, 39-bit kernel</text>
+  <rect x="301" y="62" width="348" height="16" class="b2"/><text x="655" y="75" class="ts">512 GiB</text>
+  <text x="10" y="102" class="t">Scudo primary reservation</text>
+  <rect x="301" y="90" width="276" height="16" class="ba"/><text x="583" y="103" class="ts">33 × 256 MiB, a little over 8 GiB</text>
+  <text x="10" y="130" class="t">zygote’s WebView reservation</text>
+  <rect x="301" y="118" width="240" height="16" class="ba"/><text x="547" y="131" class="ts">1 GiB</text>
+  <text x="10" y="158" class="t">one Scudo size-class region</text>
+  <rect x="301" y="146" width="216" height="16" class="ba"/><text x="523" y="159" class="ts">256 MiB</text>
+  <text x="10" y="186" class="t">library alignment, Scudo commit step</text>
+  <rect x="301" y="174" width="96" height="16" class="ba"/><text x="403" y="187" class="ts">256 KiB</text>
+  <text x="10" y="214" class="t">one page: the unit of RAM</text>
+  <rect x="301" y="202" width="24" height="16" class="bg"/><text x="331" y="215" class="ts">4 KiB, or 16 KiB on 16 KiB-page devices</text>
+  <text x="10" y="262" class="ts">Grey: limits set by the kernel. Blue: ranges that cost no RAM until touched. Green: what RAM is counted in.</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Reserving address space is free. Touching pages is not. Measure memory in resident pages (RSS and PSS, Section 3), never in
+virtual size.
+</blockquote>
+
+<h2 id="mmap"><span class="n">2</span>A write to a shared page makes a private copy</h2>
+<p><code>mmap</code> is how a process gets any memory from the kernel, whether it wants a file’s contents or fresh scratch
+space. Every mapping has a backing, a file or nothing (anonymous). It also has a sharing mode, <code>MAP_PRIVATE</code> or
+<code>MAP_SHARED</code>. The combination decides what a write does.</p>
+<table>
+  <thead><tr><th>Mapping</th><th>Before any write</th><th>On write</th><th>Android examples</th></tr></thead>
+  <tbody>
+    <tr><td><code>MAP_PRIVATE | MAP_ANONYMOUS</code></td><td>Nothing (zero page on read)</td><td>New zeroed page owned by this process</td><td><code>[anon:scudo:primary]</code>, thread stacks, <code>[anon:.bss]</code></td></tr>
+    <tr><td><code>MAP_PRIVATE</code> + file</td><td>Page-cache page, shared clean</td><td><b>Copy-on-write</b>: the kernel copies the page and maps the copy privately. The file never changes.</td><td>The ELF segments <code>linker64</code> maps from a file</td></tr>
+    <tr><td><code>MAP_SHARED</code> + file or memfd</td><td>Page-cache / shmem page</td><td>Modifies the shared page in place, and all mappers see it</td><td>Shared-memory buffers between processes (a memfd is an anonymous in-memory file from <code>memfd_create</code> whose pages live in shmem, the kernel’s RAM-backed shared memory)</td></tr>
+    <tr><td>Anything with <code>PROT_NONE</code></td><td>Nothing</td><td><code>SIGSEGV</code></td><td>Address-space reservations, guard pages</td></tr>
+  </tbody>
+</table>
+<p><code>fork()</code> adds a second kind of copy-on-write. Parent and child share every private page after the fork, and the
+first write by either side copies it. The zygote relies on this: framework code, preloaded classes and native libraries
+relocated in the zygote are shared by every app forked from it until an app writes to one of those pages.</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A write to a file-backed or inherited page costs a full private page, even if you changed one byte. Data that every process
+only reads should stay read-only, and anything you want shared across apps is best set up in the zygote, before the fork.
+</blockquote>
+
+<h2 id="pss"><span class="n">3</span>PSS splits shared pages fairly, so it is the number to sum</h2>
+<p>Once pages are shared, “how much memory does this process use” has three answers.</p>
+<ul>
+  <li><b>RSS</b> (resident set size): every page mapped into the process, shared pages counted in full.</li>
+  <li><b>PSS</b> (proportional set size): private pages in full, plus each shared page divided by the number of processes
+  that map it. Summing PSS over all processes gives the RAM actually used, which is why Android’s tools report it.</li>
+  <li><b>USS</b> (unique set size): private pages only. Roughly what killing the process gives back.</li>
+</ul>
+<figure>
+<figcaption><b>Figure 4. Writing one byte to a shared page costs a whole private page.</b> App B’s USS went from 0 to
+4 KiB. Summed RSS counts the shared pages several times, while summed PSS matches the three physical pages.</figcaption>
+<svg viewBox="0 0 1000 262" role="img" aria-label="Three processes sharing pages">
+  <text x="10" y="18" class="th">processes</text>
+  <rect x="10" y="28" width="320" height="52" rx="2" class="b"/>
+  <text x="22" y="49" class="tb">zygote</text><text x="22" y="67" class="ts">maps P1 and P2</text>
+  <rect x="340" y="28" width="320" height="52" rx="2" class="b"/>
+  <text x="352" y="49" class="tb">app A (only reads)</text><text x="352" y="67" class="ts">maps P1 and P2</text>
+  <rect x="670" y="28" width="320" height="52" rx="2" class="b"/>
+  <text x="682" y="49" class="tb">app B (wrote one byte of P2)</text><text x="682" y="67" class="ts">maps P1 and its own copy P3</text>
+
+  <path d="M210,80 L210,166" class="lng" marker-end="url(#ahg)"/>
+  <path d="M260,80 L450,166" class="lna" marker-end="url(#aha)"/>
+  <path d="M450,80 L250,166" class="lng" marker-end="url(#ahg)"/>
+  <path d="M560,80 L560,166" class="lna" marker-end="url(#aha)"/>
+  <path d="M780,80 L290,166" class="lng" marker-end="url(#ahg)"/>
+  <path d="M880,80 L880,166" class="lnr" marker-end="url(#ahr)"/>
+
+  <text x="10" y="160" class="th">physical pages (4 KiB each)</text>
+  <rect x="10" y="170" width="320" height="52" rx="2" class="bg"/>
+  <text x="22" y="191" class="tb tg">P1 · libc.so .text</text><text x="22" y="209" class="ts">clean, mapped by 3 processes</text>
+  <rect x="340" y="170" width="320" height="52" rx="2" class="ba"/>
+  <text x="352" y="191" class="tb ta">P2 · zygote heap page</text><text x="352" y="209" class="ts">mapped by zygote and app A</text>
+  <rect x="670" y="170" width="320" height="52" rx="2" class="br"/>
+  <text x="682" y="191" class="tb tr">P3 · app B’s private copy</text><text x="682" y="209" class="ts">made by the copy-on-write fault, mapped by 1</text>
+  <text x="10" y="248" class="ts">Three physical pages. Summed RSS says 24 KiB; summed PSS says 12 KiB, which is the truth.</text>
+</svg>
+</figure>
+<table>
+  <thead><tr><th>Process</th><th>RSS</th><th>PSS</th><th>USS</th></tr></thead>
+  <tbody>
+    <tr><td>zygote</td><td>8 KiB</td><td>4/3 + 4/2 = 3.33 KiB</td><td>0</td></tr>
+    <tr><td>app A</td><td>8 KiB</td><td>4/3 + 4/2 = 3.33 KiB</td><td>0</td></tr>
+    <tr><td>app B</td><td>8 KiB</td><td>4/3 + 4 = 5.33 KiB</td><td>4 KiB</td></tr>
+    <tr><td><b>sum</b></td><td class="bad">24 KiB</td><td class="good">12 KiB</td><td>4 KiB</td></tr>
+  </tbody>
+</table>
+<p><code>/proc/pid/smaps</code> breaks each VMA into <code>Shared_Clean</code>, <code>Shared_Dirty</code>, <code>Private_Clean</code>,
+<code>Private_Dirty</code>, plus <code>Rss</code> and <code>Pss</code>. <b>Clean</b> pages match their file and can be dropped and
+re-read. <b>Dirty</b> pages cannot: they are anonymous or copy-on-write copies.</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Private dirty memory is the expensive kind. Clean file pages are cheap to reclaim, and shared pages are split between
+everyone who maps them.
+</blockquote>
+
+<!-- ═════════════════════════ PART II ═════════════════════════ -->
+<div class="part">Part II · ELF &amp; linker64</div>
+
+<h2 id="elf"><span class="n">4</span>A library is mapped by permission, so its sections are grouped into segments</h2>
+<p>An ELF file describes the same bytes twice, because it has two readers. The static linker combines object files and wants
+fine-grained named pieces. The loader only wants to know what to map where, and with which permissions.</p>
+<p>The <b>section header table</b> (<code>readelf -S</code>) lists named pieces such as <code>.text</code>, <code>.rodata</code>,
+<code>.data</code> and <code>.bss</code>. It exists for the static linker and for debuggers. The <b>program header table</b>
+(<code>readelf -l</code>) lists <b>segments</b>: page-aligned ranges with one set of permissions each. The loader only reads
+program headers.</p>
+<p>The split exists because the MMU enforces permissions per page. Page-aligning thirty sections would waste a page of padding
+for each. So the static linker, <code>lld</code>, groups sections with the same runtime permissions into one loadable
+(<code>PT_LOAD</code>) segment. The one exception is read-write data: the RELRO part gets a segment of its own.</p>
+<p>A <b>relocation</b> is needed wherever the library holds an address that is only known once the library’s load address is.
+<code>GNU_RELRO</code> (“relocation read-only”) marks the range that holds those written addresses. The linker writes it during
+loading and then makes it read-only (Section 6). Here is what <code>lld</code> produced for <code>libhwui.so</code> in this
+build:</p>
+
+<pre><code><span class="c">$ readelf -lW libhwui.so   (arm64, excerpt)</span>
+  Type      Offset   VirtAddr           FileSiz  MemSiz   Flg Align
+  LOAD      0x000000 0x0000000000000000 0x21a138 0x21a138 R   0x200000
+  LOAD      0x400000 0x0000000000400000 0x7c1ea0 0x7c1ea0 R E 0x200000
+<span class="hw">  LOAD      0xc00000 0x0000000000c00000 0x0415d0 0x042000 RW  0x200000</span>
+  LOAD      0xe00000 0x0000000000e00000 0x002460 0x009ab8 RW  0x200000
+<span class="hw">  GNU_RELRO 0xc00000 0x0000000000c00000 0x0415d0 0x042000 R   0x1</span></code></pre>
+
+<figure>
+<figcaption><b>Figure 5. libhwui.so has four segments, and only the two read-write ones get dirty.</b> Current
+<code>lld</code> puts RELRO data in its own read-write segment, separate from <code>.data</code> and <code>.bss</code>. Aligning
+segments to 2 MiB lets the linker map <code>.text</code> so it can use transparent huge pages, which need far fewer
+address-translation cache entries. In the last segment, <code>MemSiz &gt; FileSiz</code> is the <code>.bss</code>.</figcaption>
+<svg viewBox="0 0 1000 342" role="img" aria-label="libhwui.so segments and sections">
+  <text x="10" y="18" class="th">segment (vaddr · size)</text><text x="250" y="18" class="th">sections lld put in it</text><text x="690" y="18" class="th">mapped as · page state</text>
+
+  <rect x="10" y="28" width="230" height="56" rx="2" class="bg"/>
+  <text x="22" y="50" class="tb">LOAD 0 · R</text><text x="22" y="70" class="tms">0x000000 · 2.1 MiB</text>
+  <rect x="250" y="28" width="430" height="56" rx="2" class="b0"/>
+  <text x="262" y="50" class="tms">.dynsym .gnu.hash .dynstr .rela.dyn .relr.dyn</text><text x="262" y="70" class="tms">.rela.plt .rodata .eh_frame_hdr .eh_frame</text>
+  <rect x="690" y="28" width="300" height="56" rx="2" class="bg"/>
+  <text x="702" y="50" class="tb tg">r--p · shared clean</text><text x="702" y="70" class="ts">page cache; never written</text>
+
+  <rect x="10" y="90" width="980" height="16" fill="url(#hatch)" class="hatch-l"/>
+  <text x="262" y="102" class="tms">PROT_NONE gap left in the reservation (2 MiB alignment)</text>
+
+  <rect x="10" y="112" width="230" height="56" rx="2" class="ba"/>
+  <text x="22" y="134" class="tb">LOAD 1 · R E</text><text x="22" y="154" class="tms">0x400000 · 7.8 MiB</text>
+  <rect x="250" y="112" width="430" height="56" rx="2" class="b0"/>
+  <text x="262" y="134" class="tms">.text .plt</text><text x="262" y="154" class="ts">position-independent code: nothing in here is patched at load</text>
+  <rect x="690" y="112" width="300" height="56" rx="2" class="ba"/>
+  <text x="702" y="134" class="tb ta">r-xp · shared clean</text><text x="702" y="154" class="ts">one copy for all processes</text>
+
+  <rect x="10" y="174" width="980" height="16" fill="url(#hatch)" class="hatch-l"/>
+
+  <rect x="10" y="196" width="230" height="56" rx="2" class="bw"/>
+  <text x="22" y="218" class="tb">LOAD 2 · RW = GNU_RELRO</text><text x="22" y="238" class="tms">0xc00000 · 264 KiB</text>
+  <rect x="250" y="196" width="430" height="56" rx="2" class="b0"/>
+  <text x="262" y="218" class="tms">.tdata .data.rel.ro (246 KiB) .fini_array .init_array</text><text x="262" y="238" class="tms">.dynamic .got .got.plt .relro_padding</text>
+  <rect x="690" y="196" width="300" height="56" rx="2" class="bw"/>
+  <text x="702" y="218" class="tb tw">rw-p, then r--p · dirty</text><text x="702" y="238" class="ts">written by the linker, then sealed</text>
+
+  <rect x="10" y="258" width="980" height="16" fill="url(#hatch)" class="hatch-l"/>
+
+  <rect x="10" y="280" width="230" height="56" rx="2" class="br"/>
+  <text x="22" y="302" class="tb">LOAD 3 · RW</text><text x="22" y="322" class="tms">0xe00000 · 9 / 39 KiB</text>
+  <rect x="250" y="280" width="430" height="56" rx="2" class="b0"/>
+  <text x="262" y="302" class="tms">.data (9 KiB of file bytes)</text><text x="262" y="322" class="tms">.bss  (30 KiB, SHT_NOBITS: no file bytes)</text>
+  <rect x="690" y="280" width="300" height="56" rx="2" class="br"/>
+  <text x="702" y="302" class="tb tr">rw-p + [anon:.bss]</text><text x="702" y="322" class="ts">private dirty only where written</text>
+</svg>
+</figure>
+
+<p>What lands where follows from one question: does the data contain an absolute address?</p>
+<table>
+  <thead><tr><th>Section</th><th>What goes there</th><th>Page state per process</th></tr></thead>
+  <tbody>
+    <tr><td><code>.text</code>, <code>.plt</code></td><td>Machine code and PLT stubs</td><td class="good">Shared clean</td></tr>
+    <tr><td><code>.rodata</code></td><td>String literals, <code>const</code> data with no pointers (<code>const int kLut[256]</code>)</td><td class="good">Shared clean</td></tr>
+    <tr><td><code>.dynsym</code>, <code>.dynstr</code>, <code>.gnu.hash</code></td><td>Dynamic symbol table: one 24-byte <code>Elf64_Sym</code> per <b>symbol</b> (a named function or variable the library
+    exports or imports), their names, and a hash table to find them</td><td class="good">Shared clean, read during lookups</td></tr>
+    <tr><td><code>.rela.dyn</code>, <code>.relr.dyn</code>, <code>.rela.plt</code></td><td>Relocation records: where the linker must write addresses</td><td class="good">Shared clean, read once at load</td></tr>
+    <tr><td><code>.data.rel.ro</code></td><td><code>const</code> data that holds pointers: C++ vtables, typeinfo, <code>const char* const kNames[]</code></td><td class="warn">Dirty (written by the linker) unless shared through the zygote or a RELRO file</td></tr>
+    <tr><td><code>.got</code>, <code>.got.plt</code></td><td>Addresses of imported functions and globals</td><td class="warn">Dirty, sealed read-only after load</td></tr>
+    <tr><td><code>.init_array</code></td><td>Pointers to static constructors</td><td class="warn">Dirty, and the constructors then dirty heap and <code>.bss</code></td></tr>
+    <tr><td><code>.data</code></td><td>Mutable globals with a non-zero initial value</td><td>Clean until written, then private dirty</td></tr>
+    <tr><td><code>.bss</code></td><td>Zero-initialised globals, with no bytes in the file</td><td>Nothing until written, then private dirty</td></tr>
+  </tbody>
+</table>
+
+<h3 id="elf-ptrs">A table of pointers is never read-only data</h3>
+<p>A table of string pointers never lands in <code>.rodata</code>, however many <code>const</code>s it has. Each element holds
+an address, and the address depends on where the library is loaded. So the linker must write it at load time. The compiler
+puts the table in <code>.data.rel.ro</code>, and every page of it becomes dirty in every process that relocates it.</p>
+<div class="two">
+<pre><code><span class="c">// 8-byte pointer per entry, one relocation each:</span>
+<span class="c">// lives in .data.rel.ro, dirtied at load</span>
+<span class="hl">const char* const kEventNames[] = {</span>
+  "ACTION_DOWN", "ACTION_UP", "ACTION_MOVE",
+  <span class="c">// ...</span>
+};</code></pre>
+<pre><code><span class="c">// no pointers: lives in .rodata, shared clean</span>
+<span class="hg">constexpr char kEventBlob[] =</span>
+  "ACTION_DOWN\0ACTION_UP\0ACTION_MOVE\0";
+<span class="hg">constexpr uint16_t kEventOffsets[] = {</span>
+  0, 12, 22,
+};</code></pre>
+</div>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Big tables of pointers, and classes with many virtual methods, cost dirty memory per process. An offset table into one
+string blob costs nothing beyond its clean file pages.
+</blockquote>
+
+<h2 id="pic"><span class="n">5</span>Code reaches other libraries through a table, so code pages are never patched</h2>
+<p>A shared library loads at a different address in different processes. One reason is <b>ASLR</b> (address space layout
+randomisation): the kernel and linker pick random base addresses so an attacker cannot predict where code lives. Another is
+that each process loads a different set of libraries.</p>
+<p>If code contained absolute addresses, the linker would have to patch <code>.text</code>. Every patched page would become
+private dirty, and the code segment would have to be writable. Bionic refuses such <b>text relocations</b>: it rejects any
+library with <code>DT_TEXTREL</code> or <code>DF_TEXTREL</code>. Executables must be position-independent too. Support for
+non-PIE executables was dropped in API 21.</p>
+<p><b>Position-independent code (PIC)</b> relies on one invariant. All segments of a library move together by the same
+<b>load bias</b>: the difference between the address the library was linked at and the address it was actually loaded at. So
+the distance between any instruction and any byte of the same library is a link-time constant. Code reaches its own data with
+PC-relative instructions (<code>adrp</code> + <code>add</code>/<code>ldr</code>) and needs no relocation.</p>
+<p>Anything in another library is reached through a table of addresses inside this library. The <b>GOT</b> (global offset
+table) holds addresses of imported globals and functions, and the linker fills it in at load time. A call to an imported
+function goes to a small stub in the <b>PLT</b> (procedure linkage table, the <code>.plt</code> section). The stub loads the
+target from its GOT slot and branches. Figure 6 shows <code>libhwui.so</code> calling malloc.</p>
+<figure>
+<figcaption><b>Figure 6. A call into another library goes through a stub, so the linker writes one table slot instead of
+patching code.</b> The distance from the stub to the GOT page is fixed at link time, so <code>.plt</code> stays clean and
+only the 8-byte slot is written. Its <code>R_AARCH64_JUMP_SLOT</code> relocation says “write the address of this function
+into this slot”.</figcaption>
+<svg viewBox="0 0 1000 232" role="img" aria-label="PLT call to malloc">
+  <text x="10" y="18" class="th">libhwui.so · .text and .plt (r-xp)</text>
+  <rect x="10" y="28" width="320" height="38" rx="2" class="b0"/>
+  <text x="22" y="52" class="tm">40f19c: bl 0xbbd1c0 &lt;malloc@plt&gt;</text>
+  <path d="M170,66 L170,86" class="lna" marker-end="url(#aha)"/>
+  <rect x="10" y="88" width="320" height="104" rx="2" class="ba"/>
+  <text x="22" y="108" class="tb">malloc@plt at 0xbbd1c0</text>
+  <text x="22" y="128" class="tm">adrp x16, 0xc3f000</text>
+  <text x="22" y="145" class="tm">ldr  x17, [x16, #0xc30]</text>
+  <text x="22" y="162" class="tm">add  x16, x16, #0xc30</text>
+  <text x="22" y="179" class="tm">br   x17</text>
+
+  <text x="380" y="18" class="th">libhwui.so · .got.plt (inside RELRO)</text>
+  <rect x="380" y="88" width="290" height="104" rx="2" class="bw"/>
+  <text x="392" y="108" class="tb">slot at 0xc3fc30</text>
+  <text x="392" y="128" class="tms">R_AARCH64_JUMP_SLOT malloc@LIBC</text>
+  <text x="392" y="148" class="ts">written by linker64 during dlopen</text>
+  <text x="392" y="166" class="ts">with libc’s address of malloc,</text>
+  <text x="392" y="182" class="ts">then sealed read-only</text>
+  <path d="M330,145 L378,145" class="lnw" marker-end="url(#ahw)"/>
+  <text x="334" y="138" class="tms">load</text>
+
+  <text x="720" y="18" class="th">libc.so · .text</text>
+  <rect x="720" y="88" width="270" height="104" rx="2" class="bg"/>
+  <text x="732" y="108" class="tb">malloc()</text>
+  <text x="732" y="128" class="ts">bionic’s malloc entry point,</text>
+  <text x="732" y="146" class="ts">which calls Scudo (Section 9)</text>
+  <path d="M670,140 L718,140" class="lng" marker-end="url(#ahg)"/>
+  <text x="674" y="133" class="tms">br</text>
+  <text x="10" y="220" class="ts">Addresses are link-time vaddrs from llvm-objdump and llvm-readelf on this build; at run time all of them shift by the load bias.</text>
+</svg>
+</figure>
+<p>Bionic resolves every slot up front, never lazily. Desktop glibc can instead resolve each PLT slot the first time it is
+called (<b>lazy binding</b>), which means the GOT stays writable for the life of the process. Bionic’s dynamic-section parser ignores <code>DT_PLTGOT</code> with the comment
+“Ignored (because RTLD_LAZY is not supported)”. Every slot is resolved during <code>dlopen</code>, and then the whole RELRO
+range is made read-only. Platform libraries are also linked with <code>-z now</code>, the static-linker flag that marks a
+library for eager binding: <code>libhwui.so</code> carries
+<code>FLAGS BIND_NOW</code> and <code>FLAGS_1 NOW</code>.</p>
+
+<h2 id="load"><span class="n">6</span>linker64 loads a library in five steps</h2>
+<p>Everything so far is a static description in a file. Something has to turn it into a running library. It must pick an
+address, map the segments, fill in the GOT and pointer tables, and run initialisation code. On Android that is
+<code>/system/bin/linker64</code>, the dynamic linker.</p>
+<p>The kernel maps <code>linker64</code> into every dynamically linked process, because the executable’s <code>PT_INTERP</code>
+header names it. The kernel jumps to it before <code>main</code>. It is also what runs when you call <code>dlopen</code>.</p>
+<p>The linker finds its inputs through the <code>.dynamic</code> section, a list of tagged entries (<code>DT_*</code>). They say
+where the symbol and relocation tables are, and which libraries this one needs (<code>DT_NEEDED</code>). Figure 7 shows the
+main steps, with the bionic functions that do them. Many are methods of <code>soinfo</code>, the linker’s record of one
+loaded library.</p>
+<figure>
+<figcaption><b>Figure 7. Loading runs five steps, and a RELRO page goes from no RAM to private dirty on the way.</b> Steps
+1 to 4 run for the library and every <code>DT_NEEDED</code> dependency not loaded yet (<code>find_libraries</code>). The bottom
+row shows the atrace slices the linker emits (named begin/end markers in the system trace), which Perfetto records and shows. Their names come from <code>do_dlopen</code> and
+<code>soinfo::call_constructors</code>, so a slow <code>dlopen</code> splits cleanly into loading and static constructors.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="dlopen pipeline">
+  <text x="10" y="18" class="th">steps (bionic/linker)</text>
+  <rect x="10" y="28" width="182" height="72" rx="2" class="b0" stroke-dasharray="4 3"/>
+  <text x="22" y="49" class="tb">1 · Reserve</text><text x="22" y="67" class="tms">ReserveAddressSpace</text><text x="22" y="86" class="ts">one PROT_NONE mmap</text>
+  <path d="M192,64 L204,64" class="ln" marker-end="url(#ah)"/>
+  <rect x="206" y="28" width="182" height="72" rx="2" class="bg"/>
+  <text x="218" y="49" class="tb">2 · Map segments</text><text x="218" y="67" class="tms">LoadSegments</text><text x="218" y="86" class="ts">MAP_FIXED file maps, .bss</text>
+  <path d="M388,64 L400,64" class="ln" marker-end="url(#ah)"/>
+  <rect x="402" y="28" width="182" height="72" rx="2" class="bw"/>
+  <text x="414" y="49" class="tb">3 · Relocate</text><text x="414" y="67" class="tms">soinfo::relocate</text><text x="414" y="86" class="ts">RELR, RELA, symbol lookup</text>
+  <path d="M584,64 L596,64" class="ln" marker-end="url(#ah)"/>
+  <rect x="598" y="28" width="182" height="72" rx="2" class="ba"/>
+  <text x="610" y="49" class="tb">4 · Seal RELRO</text><text x="610" y="67" class="tms">protect_relro</text><text x="610" y="86" class="ts">mprotect(PROT_READ)</text>
+  <path d="M780,64 L792,64" class="ln" marker-end="url(#ah)"/>
+  <rect x="794" y="28" width="196" height="72" rx="2" class="bv"/>
+  <text x="806" y="49" class="tb">5 · Constructors</text><text x="806" y="67" class="tms">call_constructors</text><text x="806" y="86" class="ts">dependencies first</text>
+
+  <text x="10" y="128" class="th">one RELRO page during these steps</text>
+  <rect x="10" y="136" width="182" height="26" rx="2" class="b0" stroke-dasharray="4 3"/><text x="22" y="153" class="tms">PROT_NONE, no RAM</text>
+  <rect x="206" y="136" width="182" height="26" rx="2" class="bg"/><text x="218" y="153" class="tms">rw-p, clean file page</text>
+  <rect x="402" y="136" width="182" height="26" rx="2" class="br"/><text x="414" y="153" class="tms">rw-p, private dirty</text>
+  <rect x="598" y="136" width="182" height="26" rx="2" class="bw"/><text x="610" y="153" class="tms">r--p, still dirty</text>
+  <rect x="794" y="136" width="196" height="26" rx="2" class="bw"/><text x="806" y="153" class="tms">r--p, still dirty</text>
+
+  <text x="10" y="190" class="th">atrace slices you will see in Perfetto</text>
+  <rect x="10" y="198" width="980" height="18" rx="2" class="b"/><text x="18" y="211" class="tms">dlopen: libfoo.so</text>
+  <rect x="10" y="220" width="770" height="18" rx="2" class="b2"/><text x="18" y="233" class="tms">dlopen: libfoo.so - loading and linking</text>
+  <rect x="794" y="220" width="196" height="18" rx="2" class="bv"/><text x="802" y="233" class="tms">calling constructors: …</text>
+</svg>
+</figure>
+
+<h3 id="load-reserve">Reserve one range, then map each segment into it</h3>
+<p>The linker reserves the whole library’s range first, so that all segments keep their distances. If <code>linker64</code>
+mapped each segment with <code>mmap(nullptr, …)</code>, the kernel could put them anywhere and the PIC invariant would break.
+So <code>ElfReader::ReserveAddressSpace</code> computes the span of all <code>PT_LOAD</code> segments and reserves it with one
+anonymous <code>PROT_NONE</code> mapping. <code>ElfReader::MapSegment</code> then maps each segment over its slice of the
+reservation:</p>
+<pre><code><span class="src">bionic/linker/linker_phdr.cpp · ElfReader::MapSegment</span>void* start = reinterpret_cast&lt;void*&gt;(page_start(phdr-&gt;p_vaddr + load_bias_));
+<span class="c">// The ELF could be being loaded directly from a zipped APK,</span>
+<span class="c">// the zip offset must be added to find the segment offset.</span>
+const ElfW(Addr) offset = file_offset_ + page_start(phdr-&gt;p_offset);
+int prot = PFLAGS_TO_PROT(phdr-&gt;p_flags);
+<span class="hg">void* seg_addr = mmap64(start, len, prot, MAP_FIXED | MAP_PRIVATE, fd_, offset);</span>
+...
+<span class="c">// Mark segments as huge page eligible if they meet the requirements</span>
+if ((phdr-&gt;p_flags &amp; PF_X) &amp;&amp; phdr-&gt;p_align == kPmdSize &amp;&amp;
+    get_transparent_hugepages_supported()) {
+  madvise(seg_addr, len, MADV_HUGEPAGE);
+}</code></pre>
+<p>Details that show up in <code>/proc/pid/maps</code>:</p>
+<ul>
+  <li><b>Gaps between segments stay inaccessible.</b> For a library with large segment alignment, like <code>libhwui.so</code>,
+  the space between segments is never mapped over. It stays <code>PROT_NONE</code> (<code>---p</code>), and a stray pointer
+  into it faults. Libraries with smaller alignment and a segment-padding note can instead have each segment extended to meet
+  the next.</li>
+  <li><b>The reservation lands at a random place.</b> It is aligned for bionic’s Control Flow Integrity (CFI) shadow, a table
+  that maps each code address to its library’s indirect-call checker. It is placed at a random offset inside a larger
+  temporary mapping. On 64-bit, a library that crosses a 2 MiB boundary also gets a random inaccessible gap after it, which
+  makes libraries harder to find by probing.</li>
+  <li><b>The .bss gets its own anonymous line.</b> For a writable segment, the linker zeroes the rest of the last file-backed
+  page. It maps any further <code>.bss</code> pages anonymously and names the range <code>[anon:.bss]</code>.</li>
+  <li><b>Libraries can map straight out of an APK.</b> Segments are <code>MAP_PRIVATE</code> file mappings, so a library stored
+  uncompressed and page-aligned in an APK needs no extraction.</li>
+  <li><b>Page size must match.</b> On 16 KiB-page devices, a library whose segments are aligned only for smaller pages fails
+  with “program alignment … cannot be smaller than system page size”. The exception is 16 KiB app-compat mode, which lets an
+app whose libraries are aligned only for 4 KiB pages still run. There the
+  linker reads the file into an anonymous read-write reservation instead of mapping it.</li>
+</ul>
+
+<h3 id="load-hash">A Bloom filter rejects libraries that do not define a symbol</h3>
+<p>Resolving an import means finding a symbol name in the libraries of the lookup scope: the ordered list of loaded libraries
+the linker is allowed to search for this library. Most of those libraries do not define the name, so the fast path is
+rejecting them. <code>.gnu.hash</code> has a <b>Bloom filter</b> for that. It is a small bit array that can answer “definitely
+not here” with one or two bit tests, at the price of an occasional false “maybe”.</p>
+<p>The name is hashed with the DJB hash (<code>h = h*33 + c</code>), which is NEON-accelerated (arm SIMD) on arm and arm64.
+Two bits derived from the hash are then tested in one 64-bit filter word:</p>
+<pre><code><span class="src">bionic/linker/linker_soinfo.cpp · soinfo::gnu_lookup</span>constexpr uint32_t kBloomMaskBits = sizeof(ElfW(Addr)) * 8;
+const uint32_t word_num = (hash / kBloomMaskBits) &amp; gnu_maskwords_;
+const ElfW(Addr) bloom_word = gnu_bloom_filter_[word_num];
+const uint32_t h1 = hash % kBloomMaskBits;
+const uint32_t h2 = (hash &gt;&gt; gnu_shift2_) % kBloomMaskBits;
+<span class="c">// test against bloom filter</span>
+<span class="hg">if ((1 &amp; (bloom_word &gt;&gt; h1) &amp; (bloom_word &gt;&gt; h2)) == 0) {</span>
+<span class="hg">  return nullptr;</span>
+<span class="hg">}</span>
+<span class="c">// bloom test says "probably yes"...</span>
+uint32_t n = gnu_bucket_[hash % gnu_nbucket_];</code></pre>
+<p>Only on a Bloom hit does it walk the hash chain. It then compares 31 bits of the stored hash, checks the symbol version,
+and finally runs <code>strcmp</code> on the name. A library that does not define the symbol usually costs one load and two
+shifts.</p>
+
+<h3 id="load-relr">RELR shrinks relocation records, but dirties the same pages</h3>
+<p>Section 4 introduced relocations as “write this address here” records. The linker has to apply thousands of them per
+library, so their encoding matters. There are two kinds.</p>
+<ul>
+  <li><b>Relative</b> (<code>R_AARCH64_RELATIVE</code>): add the load bias to a pointer to something inside the same library.
+  Vtables and pointer tables in <code>.data.rel.ro</code> produce thousands of them. No symbol lookup is needed.</li>
+  <li><b>Symbolic</b> (<code>JUMP_SLOT</code>, <code>GLOB_DAT</code>, <code>ABS64</code>): look up a symbol (previous section)
+  and write its address. These fill the GOT and any data pointer to another library’s symbol.</li>
+</ul>
+<figure>
+<figcaption><b>Figure 8. More than nine in ten of libhwui.so’s relocations are relative, so most need no symbol
+lookup.</b> Counts come from this build’s relocation tables.</figcaption>
+<svg viewBox="0 0 860 214" style="max-width:860px" role="img" aria-label="libhwui.so relocations by type">
+  <text x="10" y="18" class="th">relocation type</text><text x="230" y="18" class="th">count in libhwui.so</text>
+  <line x1="230" y1="28" x2="230" y2="176" class="ln"/>
+  <line x1="339" y1="28" x2="339" y2="176" class="ln dash" opacity="0.5"/>
+  <line x1="448" y1="28" x2="448" y2="176" class="ln dash" opacity="0.5"/>
+  <line x1="557" y1="28" x2="557" y2="176" class="ln dash" opacity="0.5"/>
+  <line x1="666" y1="28" x2="666" y2="176" class="ln dash" opacity="0.5"/>
+  <text x="230" y="194" class="ts" text-anchor="middle">0</text><text x="339" y="194" class="ts" text-anchor="middle">5,000</text>
+  <text x="448" y="194" class="ts" text-anchor="middle">10,000</text><text x="557" y="194" class="ts" text-anchor="middle">15,000</text>
+  <text x="666" y="194" class="ts" text-anchor="middle">20,000</text>
+
+  <text x="10" y="46" class="t">RELATIVE (.relr.dyn)</text>
+  <rect x="231" y="34" width="480" height="16" class="bg"/><text x="717" y="47" class="tb">22,042</text>
+  <text x="10" y="74" class="t">JUMP_SLOT (.rela.plt)</text>
+  <rect x="231" y="62" width="21" height="16" class="bw"/><text x="258" y="75" class="tb">942</text>
+  <text x="10" y="102" class="t">ABS64 (.rela.dyn)</text>
+  <rect x="231" y="90" width="14" height="16" class="bw"/><text x="251" y="103" class="tb">659</text>
+  <text x="10" y="130" class="t">GLOB_DAT (.rela.dyn)</text>
+  <rect x="231" y="118" width="4" height="16" class="bw"/><text x="241" y="131" class="tb">182</text>
+  <text x="10" y="158" class="t">TLSDESC (.rela.dyn)</text>
+  <rect x="231" y="146" width="1" height="16" class="bw"/><text x="238" y="159" class="tb">14</text>
+  <text x="10" y="210" class="ts">Green: relative, no lookup. Yellow: symbolic, needs a symbol lookup. The three .rela.dyn rows add up to 855.</text>
+</svg>
+</figure>
+<p>Relative relocations mostly hit consecutive 8-byte words, so a full record for each is wasteful. A standard
+<code>Elf64_Rela</code> record is 24 bytes. <b>RELR</b> encodes the same information as a bitmap, and the saving is large
+(Figure 9).</p>
+<figure>
+<figcaption><b>Figure 9. RELR stores libhwui.so’s relative relocations in about 4 KiB instead of about 517 KiB.</b> The same
+22,042 relocations, encoded two ways. The RELR bar is drawn to scale and is barely visible.</figcaption>
+<svg viewBox="0 0 860 118" style="max-width:860px" role="img" aria-label="RELR versus RELA size">
+  <text x="10" y="18" class="th">encoding</text><text x="230" y="18" class="th">size of 22,042 relative relocations</text>
+  <text x="10" y="46" class="t">Elf64_Rela, 24 bytes each</text>
+  <rect x="231" y="34" width="520" height="16" class="br"/><text x="745" y="47" class="tb" text-anchor="end">about 517 KiB</text>
+  <text x="10" y="74" class="t">RELR bitmap (.relr.dyn)</text>
+  <rect x="231" y="62" width="4" height="16" class="bg"/><text x="241" y="75" class="tb">4,280 bytes</text>
+  <line x1="230" y1="28" x2="230" y2="88" class="ln"/>
+  <text x="10" y="108" class="ts">One 8-byte RELR word can stand for up to 63 pointer slots.</text>
+</svg>
+</figure>
+<p>The format works like this. An even entry is an address to relocate, and <i>base</i> becomes the word after it. The odd
+entries that follow are bitmaps. Each set bit after bit 0 means “also relocate the word at that position after
+<i>base</i>”. Each bitmap then moves <i>base</i> on by 63 words:</p>
+<pre><code><span class="src">bionic/linker/linker.cpp · relocate_relr</span>if ((entry&amp;1) == 0) {
+  <span class="c">// Even entry: encodes the offset for next relocation.</span>
+  offset = static_cast&lt;ElfW(Addr)&gt;(entry);
+  apply_relr_reloc(offset, load_bias, has_memtag_globals);
+  <span class="c">// Set base offset for subsequent bitmap entries.</span>
+  base = offset + wordsize;
+  continue;
+}
+<span class="c">// Odd entry: encodes bitmap for relocations starting at base.</span>
+offset = base;
+while (entry != 0) {
+  entry &gt;&gt;= 1;
+  if ((entry&amp;1) != 0) {
+    apply_relr_reloc(offset, load_bias, has_memtag_globals);
+  }
+  offset += wordsize;
+}
+<span class="c">// Advance base offset by 63 words for 64-bit platforms,</span>
+<span class="c">// or 31 words for 32-bit platforms.</span>
+base += (8*wordsize - 1) * wordsize;</code></pre>
+<figure>
+<figcaption><b>Figure 10. One bitmap word marks up to 63 pointer slots for relocation.</b> Bit 0 marks the word as a
+bitmap, and each set bit <i>k</i> after it relocates the slot at <code>base + 8·(k−1)</code>. <code>llvm-readelf -r</code>
+lists 0xc00038 and 0xc00050 as the second and third relocations, matching the decode.</figcaption>
+<svg viewBox="0 0 1000 208" role="img" aria-label="Decoding the first RELR entries of libhwui.so">
+  <text x="10" y="18" class="th">.relr.dyn of libhwui.so, first two entries</text>
+  <text x="10" y="46" class="tms">[0] even</text>
+  <rect x="90" y="30" width="250" height="26" rx="2" class="ba"/><text x="100" y="47" class="tm">0x0000000000c00030</text>
+  <text x="356" y="47" class="ts">relocate 0xc00030; base = 0xc00038</text>
+
+  <text x="10" y="88" class="tms">[1] odd</text>
+  <rect x="90" y="72" width="250" height="26" rx="2" class="bw"/><text x="100" y="89" class="tm">0xf04924c1e4c12493</text>
+  <text x="356" y="89" class="ts">low byte 0x93 = 1001 0011; bits shown with bit 0 first</text>
+
+  <text x="90" y="138" class="tms">bit</text>
+  <g>
+    <rect x="130" y="124" width="60" height="26" class="b2"/><text x="154" y="141" class="tm">1</text>
+    <rect x="190" y="124" width="60" height="26" class="bg"/><text x="214" y="141" class="tm">1</text>
+    <rect x="250" y="124" width="60" height="26" class="b0"/><text x="274" y="141" class="tm">0</text>
+    <rect x="310" y="124" width="60" height="26" class="b0"/><text x="334" y="141" class="tm">0</text>
+    <rect x="370" y="124" width="60" height="26" class="bg"/><text x="394" y="141" class="tm">1</text>
+    <rect x="430" y="124" width="60" height="26" class="b0"/><text x="454" y="141" class="tm">0</text>
+    <rect x="490" y="124" width="60" height="26" class="b0"/><text x="514" y="141" class="tm">0</text>
+    <rect x="550" y="124" width="60" height="26" class="bg"/><text x="574" y="141" class="tm">1</text>
+    <rect x="610" y="124" width="90" height="26" class="b0"/><text x="622" y="141" class="tms">… bit 63</text>
+  </g>
+  <text x="140" y="118" class="tms">0</text><text x="200" y="118" class="tms">1</text><text x="260" y="118" class="tms">2</text><text x="320" y="118" class="tms">3</text>
+  <text x="380" y="118" class="tms">4</text><text x="440" y="118" class="tms">5</text><text x="500" y="118" class="tms">6</text><text x="560" y="118" class="tms">7</text>
+  <text x="134" y="166" class="tms">marker</text>
+  <text x="194" y="166" class="tms tg">0xc00038</text><text x="374" y="166" class="tms tg">0xc00050</text><text x="554" y="166" class="tms tg">0xc00068</text>
+  <text x="10" y="196" class="ts">One 8-byte word covers 63 pointer slots. libhwui.so: 22,042 relative relocations in 4,280 bytes; as Elf64_Rela they would take about 517 KiB.</text>
+</svg>
+</figure>
+<p>RELR is now a standard format. It was proposed on the generic-ABI (gABI) mailing list, where the ELF standard is
+discussed, and became <code>DT_RELR</code>. Bionic treats <code>DT_RELR</code> and the older
+<code>DT_ANDROID_RELR</code> tag the same way. The platform <code>libhwui.so</code> in this build uses
+<code>DT_ANDROID_RELR</code>. Its symbolic relocations live in other tables (Figure 8).</p>
+<p>Compact encoding shrinks the file and the time spent reading relocation records. It does not change how many pages get
+written: every page of <code>.data.rel.ro</code> that holds a pointer still becomes dirty.</p>
+
+<h3 id="load-relro">RELRO is sealed read-only, but its pages stay dirty</h3>
+<p>The tables the linker writes must not stay writable. The GOT, vtables and constructor arrays must be writable while the
+linker fills them in. But if they stayed writable, a memory-safety bug could overwrite a function pointer and redirect
+execution. <code>PT_GNU_RELRO</code> marks the part of a writable segment that only needs to be writable during relocation.</p>
+<p>After <code>soinfo::relocate</code>, <code>soinfo::protect_relro</code> calls <code>phdr_table_protect_gnu_relro</code>. That
+<code>mprotect</code>s every page the range touches to <code>PROT_READ</code>. From then on those tables can no longer be
+overwritten.</p>
+<p>Sealing does not make the pages clean. They were written, so they are copy-on-write copies. In <code>smaps</code> the RELRO
+line is <code>r--p</code>, but its pages are <code>Private_Dirty</code>, or <code>Shared_Dirty</code> if inherited from the
+zygote. For this build’s <code>libhwui.so</code> that is up to 264 KiB per process that relocates it itself.</p>
+<p>Then <code>call_constructors</code> runs the library’s <b>static constructors</b>: C++ constructors of global objects, and
+functions marked <code>__attribute__((constructor))</code>. It goes children first: <code>DT_INIT</code>, then every function
+in <code>DT_INIT_ARRAY</code>. Static constructors run on the thread that called <code>dlopen</code>, before it returns.</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A library’s load cost is mostly page faults on its segments, relocation writes into RELRO, and its static constructors. Fewer
+pointers in <code>const</code> data and less work in global constructors make both <code>dlopen</code> and memory cheaper. In a
+trace, look for <code>dlopen: …</code> and <code>calling constructors: …</code> slices.
+</blockquote>
+
+<h2 id="relro-share"><span class="n">7</span>Only the zygote and WebView share RELRO between processes</h2>
+<p>Libraries the zygote loads before forking are relocated once, in the zygote. Examples are
+<code>libandroid_runtime.so</code> and its dependency <code>libhwui.so</code>. Children inherit the relocated, sealed pages
+copy-on-write and never write to them, so the pages stay shared. Libraries loaded after the fork are relocated privately in
+each process.</p>
+<p>WebView’s native library is large and is loaded after the fork, in every app that uses WebView. So each app would pay for
+its own relocated RELRO copy. Android shares it with two flags to <code>android_dlopen_ext</code>, bionic’s
+<code>dlopen</code> variant that takes extra options (Figure 11).</p>
+<figure>
+<figcaption><b>Figure 11. WebView apps share RELRO by comparing their pages with a file written once.</b> The file only
+matches where the app’s relocated bytes are identical. That requires the same load address, hence the zygote reservation,
+and the same addresses for every library the RELRO points into.</figcaption>
+<svg viewBox="0 0 1000 268" role="img" aria-label="WebView RELRO sharing">
+  <text x="10" y="18" class="th">who</text><text x="250" y="18" class="th">what it does</text><text x="700" y="18" class="th">result</text>
+
+  <rect x="10" y="28" width="230" height="56" rx="2" class="b"/>
+  <text x="22" y="50" class="tb">Zygote</text><text x="22" y="68" class="tms">reserveAddressSpaceInZygote</text>
+  <rect x="250" y="28" width="440" height="56" rx="2" class="b0"/>
+  <text x="262" y="50" class="ts">mmap 1 GiB PROT_NONE (64-bit), named “libwebview reservation”.</text>
+  <text x="262" y="68" class="ts">Every app forked afterwards has the same free range at the same address.</text>
+  <rect x="700" y="28" width="290" height="56" rx="2" class="b0" stroke-dasharray="4 3"/>
+  <text x="712" y="50" class="ts">no RAM, only a shared address</text>
+
+  <rect x="10" y="96" width="230" height="56" rx="2" class="bw"/>
+  <text x="22" y="118" class="tb">RelroFileCreator</text><text x="22" y="136" class="tms">isolated process, uid 1037</text>
+  <rect x="250" y="96" width="440" height="56" rx="2" class="b0"/>
+  <text x="262" y="118" class="tms">RESERVED_ADDRESS | WRITE_RELRO</text>
+  <text x="262" y="136" class="ts">loads into the reservation, relocates, writes the RELRO pages to a file</text>
+  <rect x="700" y="96" width="290" height="56" rx="2" class="bw"/>
+  <text x="712" y="118" class="tms">/data/misc/shared_relro/</text><text x="712" y="136" class="tms">libwebviewchromium64.relro</text>
+
+  <rect x="10" y="164" width="230" height="56" rx="2" class="ba"/>
+  <text x="22" y="186" class="tb">App using WebView</text><text x="22" y="204" class="tms">DoLoadWithRelroFile</text>
+  <rect x="250" y="164" width="440" height="56" rx="2" class="b0"/>
+  <text x="262" y="186" class="tms">RESERVED_ADDRESS | USE_RELRO</text>
+  <text x="262" y="204" class="ts">relocates privately, then compares each RELRO page with the file</text>
+  <g>
+    <rect x="700" y="164" width="54" height="56" class="bg"/><rect x="754" y="164" width="54" height="56" class="bg"/>
+    <rect x="808" y="164" width="54" height="56" class="br"/><rect x="862" y="164" width="54" height="56" class="bg"/>
+    <rect x="916" y="164" width="74" height="56" class="bg"/>
+    <text x="712" y="196" class="tms">=</text><text x="766" y="196" class="tms">=</text><text x="820" y="196" class="tms tr">≠</text><text x="874" y="196" class="tms">=</text><text x="928" y="196" class="tms">=</text>
+  </g>
+  <text x="700" y="238" class="ts"><tspan class="tg">equal pages:</tspan> file mapped over them, clean, shared</text>
+  <text x="700" y="254" class="ts"><tspan class="tr">different pages:</tspan> stay private dirty</text>
+  <path d="M845,152 L845,162" class="lnw dash" marker-end="url(#ahw)"/>
+</svg>
+</figure>
+<p>The comparison is a page-by-page <code>memcmp</code>. Each run of equal pages is then replaced with
+<code>mmap(…, PROT_READ, MAP_PRIVATE|MAP_FIXED, fd, …)</code>:</p>
+<pre><code><span class="src">bionic/linker/linker_phdr.cpp · phdr_table_map_gnu_relro</span>while (match_offset &lt; size) {
+  <span class="c">// Skip over dissimilar pages.</span>
+  while (match_offset &lt; size &amp;&amp;
+         memcmp(mem_base + match_offset, file_base + match_offset, page_size()) != 0) {
+    match_offset += page_size();
+  }
+  <span class="c">// Count similar pages.</span>
+  size_t mismatch_offset = match_offset;
+  while (mismatch_offset &lt; size &amp;&amp;
+         memcmp(mem_base + mismatch_offset, file_base + mismatch_offset, page_size()) == 0) {
+    mismatch_offset += page_size();
+  }
+  <span class="c">// Map over similar pages.</span>
+  if (mismatch_offset &gt; match_offset) {
+<span class="hg">    void* map = mmap(mem_base + match_offset, mismatch_offset - match_offset,</span>
+<span class="hg">                     PROT_READ, MAP_PRIVATE|MAP_FIXED, fd, *file_offset + match_offset);</span>
+    ...</code></pre>
+<p>The private dirty copies made during relocation are dropped when the file is mapped over them. The order in
+<code>soinfo::link_image</code> is: relocate, seal RELRO, then serialize (<code>WRITE_RELRO</code>) or map
+(<code>USE_RELRO</code>).</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+RELRO is shared only when it is relocated before the fork (zygote-preloaded libraries) or matched against a RELRO file
+(WebView). Any other library you <code>dlopen</code> pays for every RELRO page the linker writes, as private dirty memory in
+every process. For this build’s <code>libhwui.so</code> that would be up to 264 KiB.
+</blockquote>
+
+<h2 id="ns"><span class="n">8</span>Namespaces decide which libraries an app may load</h2>
+<p>A device carries hundreds of platform libraries whose ABI is not stable and may change in any update. If apps could link
+against them, every platform change could break apps, and vendor code could depend on system internals. Namespaces are how the
+linker enforces which libraries a caller may see.</p>
+<p>Bionic does not keep one global list of loaded libraries. Each library belongs to a namespace with its own search paths.
+In code, the linker’s record of one loaded library is a <code>soinfo</code>, and a namespace is an
+<code>android_namespace_t</code> (<code>bionic/linker/linker_namespaces.h</code>).
+Namespaces are connected by links. Each link carries an allow-list of library names (<code>shared_lib_sonames</code>) that may
+be resolved through it.</p>
+<p>The system namespaces are default, vendor, and one for each APEX module, the separately updatable parts of the platform.
+They are described in <code>/linkerconfig/ld.config.txt</code>, which the <code>linkerconfig</code> tool generates at boot. For
+apps, <code>libnativeloader</code> creates one namespace per app class loader, named with the <code>clns</code> prefix. An app
+namespace can see its own APK’s libraries and the public NDK libraries. Private platform libraries live in other
+namespaces.</p>
+<figure>
+<figcaption><b>Figure 12. An app reaches platform libraries only through a link whose allow-list names them.</b> Anything not
+on the list stays invisible to the app, even though the file exists on the device.</figcaption>
+<svg viewBox="0 0 860 196" style="max-width:860px" role="img" aria-label="Linker namespaces and links">
+  <text x="10" y="18" class="th">app namespace</text><text x="300" y="18" class="th">link</text><text x="560" y="18" class="th">system namespaces</text>
+  <rect x="10" y="28" width="250" height="120" rx="2" class="ba"/>
+  <text x="22" y="50" class="tb">clns namespace</text>
+  <text x="22" y="70" class="ts">created by libnativeloader,</text>
+  <text x="22" y="86" class="ts">one per app class loader</text>
+  <text x="22" y="112" class="t">sees: the app’s own APK libraries</text>
+  <path d="M260,72 L556,72" class="lng" marker-end="url(#ahg)"/>
+  <text x="290" y="64" class="ts">allow-list (shared_lib_sonames)</text>
+  <path d="M260,124 L540,124" class="lnr dash"/>
+  <text x="290" y="116" class="ts tr">not on the list: no path</text>
+  <rect x="560" y="28" width="290" height="120" rx="2" class="b0"/>
+  <text x="572" y="50" class="tb">default, vendor, APEX</text>
+  <rect x="572" y="58" width="266" height="28" rx="2" class="bg"/><text x="582" y="77" class="t">public NDK libraries</text>
+  <rect x="572" y="108" width="266" height="28" rx="2" class="br"/><text x="582" y="127" class="t">private platform libraries</text>
+  <text x="10" y="176" class="ts">dlopen of a private library from the app fails with “not accessible for the namespace”.</text>
+</svg>
+</figure>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+An app’s <code>dlopen</code> of a private system library fails with “not accessible for the namespace” even though the file
+exists. Ship the library in your APK or use a public NDK API instead.
+</blockquote>
+
+<!-- ═════════════════════════ PART III ═════════════════════════ -->
+<div class="part">Part III · malloc</div>
+
+<h2 id="malloc"><span class="n">9</span>malloc is a thin dispatcher in front of Scudo</h2>
+<p><code>malloc(48)</code> is not a system call. The kernel hands out whole pages, and each <code>mmap</code> costs a syscall
+and a VMA. So an allocator gets large anonymous ranges from the kernel and carves them into small blocks in user space. A good
+allocator has a lock-free fast path for the common sizes, keeps per-block overhead low, and gives empty pages back.</p>
+<p>In bionic, malloc checks one atomic pointer, the current dispatch table. If it is null, malloc calls the native allocator
+directly. If not, it calls through the table:</p>
+<pre><code><span class="src">bionic/libc/bionic/malloc_common.cpp</span>extern "C" void* malloc(size_t bytes) {
+  auto dispatch_table = GetDispatchTable();
+  void *result;
+  if (__predict_false(dispatch_table != nullptr)) {
+    result = dispatch_table-&gt;malloc(bytes);
+  } else {
+<span class="hg">    result = Malloc(malloc)(bytes);</span>
+  }
+  ...
+  return MaybeTagPointer(result);
+}</code></pre>
+<p>The table exists so tools can intercept every allocation without relinking the program. The tools are malloc debug and
+malloc hooks (<code>libc_malloc_debug.so</code>, <code>libc_malloc_hooks.so</code>), heapprofd (Perfetto’s native heap
+profiler), and GWP-ASan. GWP-ASan sends a small random sample of allocations to guarded pages to catch memory bugs on users’
+devices.</p>
+<figure>
+<figcaption><b>Figure 13. With no tool installed, malloc goes straight to Scudo after one check.</b> The fast path is one
+acquire load and a predictable branch before Scudo. Tools like heapprofd work by installing a table, which is why they can be
+turned on in a running process.</figcaption>
+<svg viewBox="0 0 1000 214" role="img" aria-label="bionic malloc dispatch">
+  <rect x="10" y="30" width="150" height="50" rx="2" class="b0"/>
+  <text x="22" y="52" class="tb">your code</text><text x="22" y="70" class="tms">malloc(48)</text>
+  <path d="M160,55 L196,55" class="ln" marker-end="url(#ah)"/>
+  <rect x="200" y="30" width="230" height="50" rx="2" class="b"/>
+  <text x="212" y="52" class="tb">libc malloc()</text><text x="212" y="70" class="tms">current_dispatch_table?</text>
+
+  <path d="M430,45 L476,45" class="lng" marker-end="url(#ahg)"/><text x="436" y="38" class="tms tg">null</text>
+  <rect x="480" y="22" width="250" height="50" rx="2" class="bg"/>
+  <text x="492" y="44" class="tb">Scudo</text><text x="492" y="62" class="tms">scudo_malloc (USE_SCUDO)</text>
+
+  <path d="M430,70 L476,110" class="ln" marker-end="url(#ah)"/><text x="436" y="102" class="tms">set</text>
+  <rect x="480" y="90" width="250" height="78" rx="2" class="bw"/>
+  <text x="492" y="110" class="tb">dispatch table</text>
+  <text x="492" y="128" class="ts">libc_malloc_debug.so, libc_malloc_hooks.so,</text>
+  <text x="492" y="144" class="ts">heapprofd, GWP-ASan sampling;</text>
+  <text x="492" y="160" class="ts">each ends up calling the native allocator</text>
+  <path d="M605,90 L605,74" class="ln dash" marker-end="url(#ah)"/>
+
+  <path d="M730,47 L766,47" class="ln" marker-end="url(#ah)"/>
+  <rect x="770" y="22" width="220" height="50" rx="2" class="b0"/>
+  <text x="782" y="44" class="tb">kernel</text><text x="782" y="62" class="tms">mmap, madvise</text>
+  <text x="10" y="200" class="ts">Low-memory products (MALLOC_LOW_MEMORY / MALLOC_SVELTE) build libc with jemalloc instead: the malloc_low_memory product variable swaps libscudo for libjemalloc5.</text>
+</svg>
+</figure>
+<p>Two process-wide settings shape the behaviour. Apps started with <code>MALLOC_USE_APP_DEFAULTS</code> get zero-initialisation
+of new blocks turned off. They also get <code>mallopt(M_DECAY_TIME, 1)</code>, which on Android selects the longest
+page-release interval (Section 11).</p>
+
+<h2 id="scudo"><span class="n">10</span>Scudo balances speed, small overhead and safety</h2>
+<p>A phone allocator has three jobs that pull against each other. It must be fast, because malloc is on every hot path. It
+must keep per-process overhead small, because hundreds of processes each have their own heap. And it should make heap bugs
+hard to exploit, because overflows and use-after-free in native code are a common attack route.</p>
+<p>Scudo is the default native allocator in bionic and is built for that balance. It comes from LLVM’s hardened allocator
+project (<code>external/scudo/standalone</code>), tuned with an Android configuration for normal phones. It has three parts:</p>
+<div class="cards">
+  <div class="card"><div class="lbl">TSD caches</div><p>TSD stands for thread-specific data. Each cache holds free blocks per
+  size class. A group of threads shares it under its own lock, which is normally uncontended. Up to 8 shared caches, 2 by
+  default. This is the fast path.</p></div>
+  <div class="card"><div class="lbl">Primary</div><p>One region per size class, for blocks up to 64 KiB of user data.</p></div>
+  <div class="card"><div class="lbl">Secondary</div><p>One mapping per allocation, fenced with guard pages, for anything
+  bigger. A small cache of freed mappings avoids repeated <code>mmap</code>.</p></div>
+</div>
+
+<h3 id="scudo-primary">Small blocks of one size share a region</h3>
+<p>A request is rounded up to a <b>size class</b>, one of a fixed list of block sizes. Each class gets its own region. So blocks
+of one size sit side by side, and a freed block can be reused by any request of the same class. Android uses a fixed table of
+32 classes on 64-bit.</p>
+<p>Every class size includes Scudo’s 16-byte header (<code>SizeDelta = 16</code>). That is why so many of them end in
+<code>0x10</code>: <code>malloc(4096)</code> plus its header is <code>0x1010</code>, with no waste.</p>
+<pre><code><span class="src">external/scudo/config/custom_scudo_config.h · AndroidNormalSizeClassConfig (64-bit)</span>static constexpr uptr Classes[] = {
+    0x00020, 0x00030, 0x00040, 0x00050, 0x00060, 0x00070, 0x00090, 0x000b0,
+    0x000c0, 0x000e0, 0x00120, 0x00160, 0x001c0, 0x00250, 0x00320, 0x00450,
+    0x00670, 0x00830, 0x00a10, 0x00c30, <span class="k">0x01010</span>, 0x01210, 0x01bd0, 0x02210,
+    0x02d90, 0x03790, 0x04010, 0x04810, 0x05a10, 0x07310, 0x08210, <span class="k">0x10010</span>,
+};
+static const uptr SizeDelta = 16;</code></pre>
+<p>The primary reserves all its regions up front, in one <code>PROT_NONE</code> mapping named
+<code>scudo:primary_reserve</code>. Each region is 256 MiB (<code>RegionSizeLog = 28</code>). Add the internal batch class,
+whose blocks hold Scudo’s own free-list bookkeeping, and that is a little over 8 GiB of address space (Figure 3).</p>
+<p>Pages are <em>committed</em>, meaning remapped read-write so they can be used, lazily at the front of each region. Scudo
+commits 256 KiB at a time (<code>MapSizeIncrement</code>) and renames that part <code>scudo:primary</code>.</p>
+<figure>
+<figcaption><b>Figure 14. The primary is mostly reserved address space, and only the committed front of each region can hold
+RAM.</b> RSS is only the committed pages that have been touched, minus pages Scudo has released. The random region order,
+region offset and block shuffle make heap addresses hard to predict.</figcaption>
+<svg viewBox="0 0 1000 236" role="img" aria-label="Scudo primary regions">
+  <text x="10" y="18" class="th">scudo:primary_reserve · 33 regions × 256 MiB, order shuffled at init</text>
+  <g>
+    <rect x="10" y="28" width="110" height="34" class="b2"/><text x="20" y="49" class="tms">batch class</text>
+    <rect x="120" y="28" width="110" height="34" class="b0"/><text x="130" y="49" class="tms">0x0c0</text>
+    <rect x="230" y="28" width="110" height="34" class="ba"/><text x="240" y="49" class="tms">0x030</text>
+    <rect x="340" y="28" width="110" height="34" class="b0"/><text x="350" y="49" class="tms">0x1010</text>
+    <rect x="450" y="28" width="110" height="34" class="b0"/><text x="460" y="49" class="tms">0x020</text>
+    <rect x="560" y="28" width="110" height="34" class="b0"/><text x="570" y="49" class="tms">0x10010</text>
+    <rect x="670" y="28" width="320" height="34" fill="url(#hatch)" class="hatch-l"/><text x="680" y="49" class="tms">… 27 more regions</text>
+  </g>
+  <path d="M230,62 L10,100" class="ln dash"/><path d="M340,62 L990,100" class="ln dash"/>
+  <text x="242" y="90" class="th">zoom: the 48-byte class region</text>
+  <rect x="10" y="100" width="70" height="40" fill="url(#hatch)" class="hatch-l"/>
+  <rect x="80" y="100" width="300" height="40" class="ba"/><text x="92" y="124" class="tms">scudo:primary (committed)</text>
+  <rect x="380" y="100" width="610" height="40" class="b0" stroke-dasharray="4 3"/><text x="392" y="124" class="tms">still reserved, PROT_NONE, no RAM</text>
+  <text x="10" y="158" class="ts">1–16 pages</text><text x="10" y="172" class="ts">random offset</text>
+  <path d="M380,152 L380,142" class="lna" marker-end="url(#aha)"/><text x="300" y="166" class="ts">grows 256 KiB at a time</text>
+  <g>
+    <rect x="80" y="186" width="30" height="24" class="bg"/><rect x="110" y="186" width="30" height="24" class="b0"/>
+    <rect x="140" y="186" width="30" height="24" class="bg"/><rect x="170" y="186" width="30" height="24" class="bg"/>
+    <rect x="200" y="186" width="30" height="24" class="b0"/><rect x="230" y="186" width="30" height="24" class="bg"/>
+    <rect x="260" y="186" width="30" height="24" class="b0"/><rect x="290" y="186" width="30" height="24" class="bg"/>
+    <rect x="320" y="186" width="30" height="24" class="b0"/><rect x="350" y="186" width="30" height="24" class="bg"/>
+  </g>
+  <text x="400" y="203" class="ts">48-byte blocks; new blocks are shuffled within each 1 MiB group before they join the free list</text>
+  <text x="80" y="228" class="tms">green = allocated, white = free</text>
+</svg>
+</figure>
+<p>A malloc that hits a TSD cache pops a block and writes its header. That costs one uncontended lock and no syscall. When the
+cache for a class is empty, it refills a batch from the region’s free list. When the region’s committed space runs out, Scudo
+commits another 256 KiB.</p>
+
+<h3 id="scudo-header">A checksummed header in front of every block catches bad frees</h3>
+<p><code>free(p)</code> gets only a pointer. Scudo needs to know which size class the block belongs to, whether it is really an
+allocated block, and whether anyone has scribbled over its bookkeeping. It keeps that in a header in front of every block.</p>
+<p>Every block starts with a 16-byte header area: the 8-byte header, rounded up to the minimum alignment. The pointer you get
+is immediately after it. The header itself is a packed bitfield:</p>
+<pre><code><span class="src">external/scudo/standalone/chunk.h</span>struct UnpackedHeader {
+  uptr ClassId : 8;
+  u8 State : 2;
+  <span class="c">// Origin if State == Allocated, or WasZeroed otherwise.</span>
+  u8 OriginOrWasZeroed : 2;
+  uptr SizeOrUnusedBytes : 20;
+  uptr Offset : 16;
+  uptr Checksum : 16;
+  ...
+};
+inline AtomicPackedHeader *getAtomicHeader(void *Ptr) {
+<span class="hg">  return reinterpret_cast&lt;AtomicPackedHeader *&gt;(reinterpret_cast&lt;uptr&gt;(Ptr) -</span>
+<span class="hg">                                                getHeaderSize());</span>
+}</code></pre>
+<figure>
+<figcaption><b>Figure 15. The header sits just before your pointer and records the block’s class, state, size and a
+checksum.</b> The checksum covers the header (with the checksum field zeroed), the chunk address and a per-process random
+cookie.</figcaption>
+<svg viewBox="0 0 1000 226" role="img" aria-label="Scudo chunk header layout">
+  <text x="10" y="18" class="th">one primary block</text>
+  <rect x="80" y="28" width="200" height="34" class="bw"/><text x="92" y="49" class="tms">packed header (8 B)</text>
+  <rect x="280" y="28" width="200" height="34" fill="url(#hatch)" class="hatch-l"/><text x="292" y="49" class="tms">unused (8 B)</text>
+  <rect x="480" y="28" width="510" height="34" class="ba"/><text x="492" y="49" class="tms">user data · Ptr is 16-byte aligned</text>
+  <path d="M80,78 L80,64" class="ln" marker-end="url(#ah)"/><text x="62" y="92" class="tms">Ptr − 16</text>
+  <path d="M480,78 L480,64" class="lna" marker-end="url(#aha)"/><text x="466" y="92" class="tms ta">Ptr</text>
+
+  <text x="10" y="114" class="th">the 64-bit header, bit 0 on the left</text>
+  <text x="80" y="132" class="tms">0</text><text x="186" y="132" class="tms">8</text><text x="240" y="132" class="tms">12</text><text x="520" y="132" class="tms">32</text><text x="744" y="132" class="tms">48</text><text x="962" y="132" class="tms">63</text>
+  <rect x="80" y="138" width="112" height="34" class="ba"/><text x="92" y="159" class="tms">ClassId 8</text>
+  <rect x="192" y="138" width="28" height="34" class="bg"/>
+  <rect x="220" y="138" width="28" height="34" class="bv"/>
+  <rect x="248" y="138" width="280" height="34" class="b"/><text x="260" y="159" class="tms">SizeOrUnusedBytes 20</text>
+  <rect x="528" y="138" width="224" height="34" class="b"/><text x="540" y="159" class="tms">Offset 16</text>
+  <rect x="752" y="138" width="224" height="34" class="br"/><text x="764" y="159" class="tms tr">Checksum 16</text>
+  <path d="M206,172 L206,188" class="lng"/><text x="150" y="202" class="tms tg">State 2</text>
+  <path d="M234,172 L234,206" class="lnv"/><text x="214" y="218" class="tms tv">Origin 2</text>
+  <text x="300" y="202" class="ts">ClassId 0 means a secondary (large) allocation. Size is the requested size for primary blocks.</text>
+</svg>
+</figure>
+<p>The header is what lets Scudo catch misuse on <code>free</code>:</p>
+<ul>
+  <li><b>Checksum.</b> <code>computeHeaderChecksum</code> runs CRC32 over the cookie, the address and the header. It uses
+  hardware CRC32 instructions where available, and a BSD checksum otherwise. An overflow that clobbers the next block’s header
+  fails the check, and so does a pointer that malloc never returned. Both abort with “corrupted chunk header”.</li>
+  <li><b>State.</b> <code>Available</code>, <code>Allocated</code> or <code>Quarantined</code>. Freeing a block that is not
+  <code>Allocated</code>, such as a double free, aborts with “invalid chunk state”.</li>
+  <li><b>Origin.</b> <code>Malloc</code>, <code>New</code>, <code>NewArray</code> or <code>Memalign</code>. Scudo can abort on a
+  mismatched <code>free</code>/<code>delete</code>/<code>delete[]</code>, but Android’s config turns that off
+  (<code>AbortOnDeallocTypeMismatch = false</code>).</li>
+</ul>
+<p>The <code>Quarantined</code> state belongs to an optional <b>quarantine</b>. It is a holding area where freed blocks wait for
+a while before reuse, so a use-after-free touches dead memory instead of someone else’s new object. It costs memory, and
+Android’s config compiles it out (<code>QuarantineDisabled = true</code>).</p>
+
+<h3 id="scudo-secondary">Large blocks get their own mapping, fenced by guard pages</h3>
+<p>Big blocks are rare, would waste a lot of space if rounded to a size class, and should go back to the kernel as soon as they
+are freed. So larger requests get their own mapping, fenced by <b>guard pages</b>: <code>PROT_NONE</code> pages next to the
+block that fault on any access.</p>
+<p><code>MapAllocator::allocate</code> reserves the rounded size plus one guard page on each side. It commits the middle, and
+places the block at the <em>end</em> of the committed range:</p>
+<pre><code><span class="src">external/scudo/standalone/secondary.h · MapAllocator::allocate</span>const uptr MapSize = RoundedSize + 2 * getGuardPageSize();
+...
+uptr CommitBase = MapBase + getGuardPageSize();
+...
+const uptr CommitSize = MapEnd - getGuardPageSize() - CommitBase;
+<span class="hg">const uptr AllocPos = roundDown(CommitBase + CommitSize - Size, Alignment);</span></code></pre>
+<figure>
+<figcaption><b>Figure 16. A large block ends right at a guard page, so an overflow faults at once.</b> Guard pages cost
+address space, not RAM. 32-bit Android configs turn them off (<code>EnableGuardPages = false</code>) because address space is
+scarce there.</figcaption>
+<svg viewBox="0 0 1000 120" role="img" aria-label="Scudo secondary block">
+  <rect x="10" y="28" width="90" height="40" class="br"/><text x="22" y="44" class="tms tr">guard</text><text x="22" y="60" class="tms tr">PROT_NONE</text>
+  <rect x="100" y="28" width="170" height="40" fill="url(#hatch)" class="hatch-l"/><text x="112" y="52" class="tms">slack, untouched</text>
+  <rect x="270" y="28" width="110" height="40" class="bw"/><text x="282" y="52" class="tms">headers</text>
+  <rect x="380" y="28" width="520" height="40" class="ba"/><text x="392" y="52" class="tms">user block, ends at the guard (± 16 B alignment)</text>
+  <rect x="900" y="28" width="90" height="40" class="br"/><text x="912" y="44" class="tms tr">guard</text><text x="912" y="60" class="tms tr">PROT_NONE</text>
+  <text x="100" y="18" class="th">scudo:secondary (committed, rw-p)</text>
+  <path d="M880,90 L930,90" class="lnr" marker-end="url(#ahr)"/><text x="600" y="94" class="ts tr">a linear overflow runs straight into the guard and faults</text>
+  <text x="10" y="112" class="ts">Freed mappings may be kept in MapAllocatorCache: up to 32 entries of at most 2 MiB each (AndroidNormalConfig).</text>
+</svg>
+</figure>
+
+<h3 id="scudo-mte">Pointer tags catch a bad access when it happens</h3>
+<p>Header checks catch corruption only when the block is freed, long after the bad write. Catching the bad access itself needs
+help from the pointer. arm64 ignores the top byte of an address (TBI, Section 1), so allocators can store a tag there.</p>
+<p>On hardware with <b>MTE</b> (Memory Tagging Extension, an Armv8.5 feature), memory carries tags too. Every 16-byte
+<em>granule</em> has a 4-bit tag, and the CPU compares it with the pointer’s tag on every load and store (Figure 17).</p>
+<figure>
+<figcaption><b>Figure 17. Without MTE the top byte is a fixed marker checked on free, while with MTE it is a random tag
+checked on every access.</b> Tag letters are placeholders for random 4-bit values.</figcaption>
+<svg viewBox="0 0 860 214" style="max-width:860px" role="img" aria-label="Heap pointer tags with and without MTE">
+  <text x="10" y="18" class="th">a 64-bit heap pointer</text>
+  <text x="130" y="36" class="tms">63</text><text x="212" y="36" class="tms">59</text><text x="268" y="36" class="tms">56</text>
+  <text x="292" y="36" class="tms">55</text><text x="836" y="36" class="tms">0</text>
+  <rect x="130" y="42" width="160" height="30" class="b2"/><text x="142" y="61" class="tms">top byte, ignored (TBI)</text>
+  <rect x="290" y="42" width="560" height="30" class="b0"/><text x="302" y="61" class="tms">virtual address</text>
+
+  <text x="10" y="106" class="tb">without MTE</text>
+  <rect x="130" y="88" width="160" height="30" class="bw"/><text x="142" y="107" class="tms">0xB4, fixed</text>
+  <text x="302" y="102" class="ts">POINTER_TAG on every heap pointer, checked on free.</text>
+  <text x="302" y="116" class="ts">Code that truncates or rewrites the top byte aborts.</text>
+
+  <text x="10" y="152" class="tb">with MTE</text>
+  <rect x="210" y="134" width="80" height="30" class="bg"/><text x="222" y="153" class="tms">tag A</text>
+  <text x="302" y="146" class="ts">memory, 16-byte granules:</text>
+  <rect x="460" y="134" width="64" height="30" class="bg"/><text x="472" y="153" class="tms">A</text>
+  <rect x="524" y="134" width="64" height="30" class="bg"/><text x="536" y="153" class="tms">A</text>
+  <rect x="588" y="134" width="64" height="30" class="bg"/><text x="600" y="153" class="tms">A</text>
+  <rect x="652" y="134" width="64" height="30" class="br"/><text x="664" y="153" class="tms">B</text>
+  <rect x="716" y="134" width="64" height="30" class="br"/><text x="728" y="153" class="tms">B</text>
+  <text x="460" y="180" class="ts">this block</text><text x="652" y="180" class="ts tr">neighbour: a tag-A access faults</text>
+  <text x="10" y="206" class="ts">On free, a primary block is retagged with a different random tag, so a stale tag-A pointer faults on use.</text>
+</svg>
+</figure>
+<ul>
+  <li><b>Without MTE</b>, bionic tags every heap pointer with a fixed top byte, <code>POINTER_TAG = 0xB4</code>
+  (<code>malloc_tagged_pointers.h</code>), and checks it on <code>free</code>. Code that truncates or rewrites the top byte of a
+  heap pointer aborts with “Pointer tag for %p was truncated”.</li>
+  <li><b>With MTE</b>, in a process where heap tagging is enabled, Scudo gives each block a random tag in the low half of the
+  top byte. It stores the same tag on every granule of the block, using the MTE instructions <code>irg</code> (pick a random
+  tag) and <code>stg</code> (store a tag to memory), in <code>memtag.h</code>. A load or store through a pointer with the wrong tag faults. On free, a primary block is
+  retagged with a different random tag (<code>retagBlock</code> excludes the previous one), so a stale pointer faults on use.</li>
+</ul>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A Scudo abort on <code>free</code> is almost always a bug in the caller: overflow into a neighbour’s header, double free, or
+freeing a pointer that did not come from malloc. The abort happens at the <code>free</code>, not where memory was corrupted.
+MTE or HWASan move the report to the bad access. HWASan is hardware-assisted AddressSanitizer, a debug build that checks
+top-byte tags in software.
+</blockquote>
+
+<h2 id="release"><span class="n">11</span>free() lowers RSS only when a whole page is empty</h2>
+<p>A C/C++ allocator can never move a live block, because the program holds raw pointers to it. A page can go back to the
+kernel only when every block on it is free. One long-lived 64-byte object keeps its whole page resident.</p>
+<figure>
+<figcaption><b>Figure 18. One live block pins its whole page, and only a fully free page goes back to the kernel.</b>
+Fragmentation, not leaks, is the usual reason native RSS stays high after a burst of allocations: survivors are spread over
+many pages.</figcaption>
+<svg viewBox="0 0 1000 170" role="img" aria-label="Page pinning">
+  <text x="10" y="18" class="th">page A · one block still live</text>
+  <g>
+    <rect x="10" y="28" width="460" height="36" class="b0"/>
+    <rect x="10" y="28" width="14" height="36" class="b0"/><rect x="24" y="28" width="14" height="36" class="b0"/>
+    <rect x="164" y="28" width="14" height="36" class="br"/>
+  </g>
+  <text x="10" y="84" class="ts">63 free blocks can be reused for new 64-byte allocations,</text>
+  <text x="10" y="100" class="ts tr">but the page cannot be released: RSS unchanged</text>
+
+  <text x="530" y="18" class="th">page B · every block free</text>
+  <rect x="530" y="28" width="460" height="36" class="bg"/>
+  <text x="542" y="51" class="tms tg">all free</text>
+  <text x="530" y="84" class="ts">Scudo counts free blocks per page and calls</text>
+  <text x="530" y="100" class="ts tg">madvise(MADV_DONTNEED): RSS drops by a page</text>
+  <text x="10" y="140" class="ts">Release is attempted on free when a TSD cache drains blocks back to the primary, at most once per release interval</text>
+  <text x="10" y="156" class="ts">(ReleaseToOsInterval: 1000 ms default and maximum for the primary in AndroidNormalConfig). mallopt(M_PURGE) forces it.</text>
+</svg>
+</figure>
+<p>Release is also rate-limited on purpose. Giving a page back and faulting it in again costs a syscall, a TLB flush (the
+TLB is the CPU’s cache of recent address translations) and a page
+fault. Doing that on every <code>free</code> would be slower than keeping a few pages around. <code>M_DECAY_TIME</code> chooses
+the trade-off. On Android, Scudo accepts only three values, and the highest one picks the longest interval its config allows.
+The exact values are in Section 15.</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Allocate long-lived objects separately from short-lived bursts. For example, build a result, then copy it out and free the
+scratch. A spike of small allocations with a few survivors leaves RSS high until those survivors are freed. After a large
+one-off job, <code>mallopt(M_PURGE, 0)</code> (API 28+) returns free pages immediately instead of waiting for the release
+interval. <code>M_PURGE_ALL</code> (API 34+) is slower and more thorough.
+</blockquote>
+
+<h2 id="others"><span class="n">12</span>Scudo replaced dlmalloc and jemalloc for its safety checks</h2>
+<p>Every general-purpose allocator answers the same questions differently. Where does per-block metadata live? How do threads
+avoid contending on one lock? When do empty pages go back to the kernel? Bionic has used three allocators.</p>
+<p>Early releases used <b>dlmalloc</b>: one heap of variable-size chunks under a global lock. Each chunk carries inline
+boundary tags, size fields stored right before and after the chunk. A freed chunk stores its free-list pointers in itself.
+Inline metadata made heap overflows easy to turn into arbitrary writes.</p>
+<p><b>jemalloc</b> replaced it, with per-thread caches, several independent heaps (arenas), and size-segregated runs whose
+metadata sits out of line. It is still in the tree for low-memory builds (<code>external/jemalloc_new</code>, <code>libjemalloc5</code>).
+Scudo replaced jemalloc as the default in Android 11, per the source.android.com Scudo page. It won for its checks and
+randomisation at a similar memory cost.</p>
+<p><b>TCMalloc</b> is Google’s server allocator and is not part of the Android tree. TCMalloc’s design document
+(<code>docs/design.md</code> in the TCMalloc repository) describes a front end of per-CPU caches or per-thread caches.</p>
+<p>Per-CPU caches rely on <code>rseq</code>, Linux restartable sequences: short code sequences that the kernel restarts if the
+thread is preempted or migrated mid-way. That lets a thread update the current CPU’s data without locks or atomics. Behind
+that sit a middle end of transfer caches and central free lists. Then comes a page heap, whose hugepage-aware version
+(Temeraire) packs allocations into huge pages. Size-class information lives in a page map rather than in per-object
+headers.</p>
+<table>
+  <thead><tr><th>Allocator</th><th>Metadata</th><th>Thread fast path</th><th>Hardening</th><th>On Android</th></tr></thead>
+  <tbody>
+    <tr><td>dlmalloc</td><td>Inline boundary tags, free-list pointers in freed chunks</td><td>None, global lock</td><td class="bad">None</td><td>Early releases</td></tr>
+    <tr><td>jemalloc</td><td>Out of line</td><td>Per-thread caches, arenas</td><td class="warn">Metadata out of reach of overflows</td><td>Low-memory builds (<code>libjemalloc5</code>)</td></tr>
+    <tr><td>Scudo</td><td>16-byte checksummed header per block</td><td>Shared TSD caches</td><td class="good">Checksums, randomisation, guard pages, MTE</td><td>Default since Android 11</td></tr>
+    <tr><td>TCMalloc</td><td>Page map, no per-object header</td><td>Per-CPU caches (<code>rseq</code>)</td><td class="warn">Metadata out of reach of overflows</td><td>Not used</td></tr>
+  </tbody>
+</table>
+<p>TCMalloc’s choices favour throughput on many-core machines with very large heaps. Scudo’s favour small per-process overhead
+and safety checks across hundreds of processes.</p>
+
+<!-- ═════════════════════════ PART IV ═════════════════════════ -->
+<div class="part">Part IV · Practice</div>
+
+<h2 id="maps"><span class="n">13</span>Every mechanism above shows up as a line in /proc/pid/maps</h2>
+<p>Everything above is visible in <code>/proc/pid/maps</code>, one line per VMA, and in <code>/proc/pid/smaps</code>, the same
+with page counts. <code>showmap</code> (<code>system/memory/libmeminfo/tools/showmap.cpp</code>) and <code>dumpsys meminfo</code>
+summarise them.</p>
+<p>Below is what this build’s <code>libhwui.so</code> looks like when loaded on a 4 KiB-page device. The offsets and sizes
+follow from the program headers in Section 4, and the base address is made up. Each line reads: address range, permissions
+(<code>p</code> = private, <code>s</code> = shared), file offset, device, inode, and the file path. Anonymous lines show an
+<code>[anon:…]</code> name set with <code>PR_SET_VMA_ANON_NAME</code> instead.</p>
+<pre><code><span class="c"># shape: computed from readelf output, base address invented</span>
+<span class="hg">7a3c000000-7a3c21b000 r--p 00000000 fe:2e 1234  /system/lib64/libhwui.so   <span class="c">LOAD 0: shared clean</span></span>
+7a3c21b000-7a3c400000 ---p 00000000 00:00 0                                   <span class="c">gap inside the reservation</span>
+<span class="hg">7a3c400000-7a3cbc2000 r-xp 00400000 fe:2e 1234  /system/lib64/libhwui.so   <span class="c">LOAD 1: .text, shared clean</span></span>
+7a3cbc2000-7a3cc00000 ---p 00000000 00:00 0
+<span class="hw">7a3cc00000-7a3cc42000 r--p 00c00000 fe:2e 1234  /system/lib64/libhwui.so   <span class="c">LOAD 2 = RELRO: sealed, but dirty</span></span>
+7a3cc42000-7a3ce00000 ---p 00000000 00:00 0
+<span class="hl">7a3ce00000-7a3ce03000 rw-p 00e00000 fe:2e 1234  /system/lib64/libhwui.so   <span class="c">LOAD 3: .data</span></span>
+<span class="hl">7a3ce03000-7a3ce0a000 rw-p 00000000 00:00 0     [anon:.bss]                <span class="c">MapBssSection</span></span></code></pre>
+<p>In <code>smaps</code> each of those lines is followed by page counts. This is the shape of the RELRO entry in an app that
+inherited <code>libhwui.so</code> from the zygote. The values are illustrative and assume five processes share the pages.</p>
+<pre><code><span class="c"># shape: field names from the kernel, values illustrative</span>
+7a3cc00000-7a3cc42000 r--p 00c00000 fe:2e 1234  /system/lib64/libhwui.so
+Size:                264 kB   <span class="c">virtual size of the VMA</span>
+KernelPageSize:        4 kB
+Rss:                 264 kB   <span class="c">every page is resident</span>
+<span class="hg">Pss:                  52 kB   <span class="c">264 / 5 sharers</span></span>
+Shared_Clean:          0 kB
+<span class="hw">Shared_Dirty:        264 kB   <span class="c">relocated once in the zygote, inherited copy-on-write</span></span>
+Private_Clean:         0 kB
+Private_Dirty:         0 kB   <span class="c">would be 264 kB if this app had loaded it itself</span>
+Anonymous:           264 kB   <span class="c">copy-on-write copies count as anonymous</span>
+Swap:                  0 kB   <span class="c">pages compressed into zram</span>
+SwapPss:               0 kB</code></pre>
+<p><code>Anonymous</code> counts pages that no longer match any file, including copy-on-write copies inside a file mapping.
+<code>Swap</code> and <code>SwapPss</code> count pages that were compressed into zram. They no longer count in
+<code>Rss</code>, but they still cost compressed RAM.</p>
+<p>How to read the lines that matter:</p>
+<table>
+  <thead><tr><th>Line</th><th>Where it comes from</th><th>What to look at in smaps</th></tr></thead>
+  <tbody>
+    <tr><td><code>r--p</code> / <code>r-xp</code> file lines at offset 0 and in the code segment</td><td><code>MapSegment</code> of read-only and code segments</td><td><code>Shared_Clean</code>, cheap</td></tr>
+    <tr><td>Second <code>r--p</code> file line, after <code>r-xp</code></td><td>The RELRO segment after <code>protect_relro</code></td><td><code>Private_Dirty</code>, or <code>Shared_Dirty</code> if relocated in the zygote</td></tr>
+    <tr><td><code>---p</code> anonymous lines between a library’s segments</td><td>Unused parts of the <code>ReserveAddressSpace</code> reservation</td><td>Nothing, zero RSS</td></tr>
+    <tr><td><code>[anon:.bss]</code></td><td><code>MapBssSection</code></td><td><code>Private_Dirty</code> for pages written</td></tr>
+    <tr><td><code>[anon:scudo:primary]</code></td><td>Committed primary region space</td><td>The bulk of native heap RSS</td></tr>
+    <tr><td><code>[anon:scudo:primary_reserve]</code></td><td>Primary reservation not yet committed</td><td>Nothing, huge virtual size</td></tr>
+    <tr><td><code>[anon:scudo:secondary]</code></td><td>Large allocations and cached mappings</td><td><code>Private_Dirty</code>, with guard pages as separate <code>---p</code> ranges</td></tr>
+    <tr><td><code>[anon:libwebview reservation]</code></td><td>The zygote’s 1 GiB WebView reservation</td><td>Nothing until WebView loads into it</td></tr>
+  </tbody>
+</table>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+To find where native memory goes, sum <code>Pss</code> and <code>Private_Dirty</code> per mapping name. <code>showmap</code>
+does this. Large <code>[anon:scudo:*]</code> totals point at heap use. Large dirty file-mapping lines point at RELRO and
+<code>.data</code>. Huge virtual sizes with no RSS can be ignored.
+</blockquote>
+
+<h2 id="cheatsheet"><span class="n">14</span>Cheat sheet</h2>
+<table>
+  <thead><tr><th>Question</th><th>Short answer</th></tr></thead>
+  <tbody>
+    <tr><td>Why does <code>mmap</code> of 1 GiB cost nothing?</td><td>It creates a VMA with empty page-table entries. RAM is allocated one page at a time on first touch (minor faults).</td></tr>
+    <tr><td>Sections vs segments?</td><td>Sections are the static linker’s view. Segments are what <code>linker64</code> maps: one per permission set, except that RELRO gets its own. Current <code>lld</code> emits four <code>PT_LOAD</code>s: R, RX, RW (RELRO), RW (data, bss).</td></tr>
+    <tr><td>Why are there two <code>r--p</code> lines per library?</td><td>The first is the read-only segment (clean). The second is RELRO, mapped writable, relocated, and then sealed read-only. It is dirty.</td></tr>
+    <tr><td>Why is my <code>const char* const</code> table dirty?</td><td>Pointers need relocation, so it lives in <code>.data.rel.ro</code>. Use offsets into a string blob.</td></tr>
+    <tr><td>How does a library call <code>malloc</code> without patching code?</td><td>PC-relative branch to a PLT stub, which loads the target from a GOT slot the linker filled at load time.</td></tr>
+    <tr><td>Does Android resolve symbols lazily?</td><td>No. Bionic does not support lazy binding. All slots are resolved during <code>dlopen</code> and RELRO is sealed.</td></tr>
+    <tr><td>What is RELR?</td><td>A bitmap encoding of relative relocations: one 8-byte word covers 63 pointers. Smaller files, same number of dirty pages.</td></tr>
+    <tr><td>Why is <code>dlopen</code> slow?</td><td>Page faults on segments, relocation writes, dependency loading, and static constructors. Split it with the <code>dlopen: …</code> and <code>calling constructors: …</code> slices.</td></tr>
+    <tr><td>Why didn’t <code>free()</code> lower RSS?</td><td>A page is released only when every block on it is free, and Scudo rate-limits release (1 s on Android). <code>M_PURGE</code> forces it.</td></tr>
+    <tr><td>Why do Scudo classes end in <code>0x10</code>?</td><td>Class sizes include the 16-byte header, so <code>malloc(4096)</code> fits <code>0x1010</code> exactly.</td></tr>
+    <tr><td>Where does a large allocation go?</td><td>Above the 64 KiB primary limit: its own <code>scudo:secondary</code> mapping, right-aligned against a guard page.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="method"><span class="n">15</span>Numbers and method</h2>
+<p>The text above rounds or omits exact values. They are collected here. ELF numbers come from <code>readelf -lW</code>,
+<code>llvm-readelf -r -d</code> and <code>llvm-objdump -d</code> on the arm64 <code>libhwui.so</code> from this build.
+Allocator and linker constants are read from the AOSP source files listed under Sources, as of the Android 17 release. The <code>smaps</code> values in Section 13
+are illustrative, and the cost tiers in Figure 1 are rough orders of magnitude, not measurements.</p>
+<p><b>Pages and address space</b></p>
+<table>
+  <thead><tr><th>Value</th><th>Exact figure</th></tr></thead>
+  <tbody>
+    <tr><td>Page size</td><td>4 KiB, or 16 KiB on 16 KiB-page devices</td></tr>
+    <tr><td>Address bits passed through translation</td><td>Low 12 bits, with 4 KiB pages</td></tr>
+    <tr><td>arm64 Android user address space</td><td>39 bits (512 GiB) or 48 bits (256 TiB), depending on kernel configuration</td></tr>
+    <tr><td>Zygote WebView reservation</td><td>1 GiB <code>PROT_NONE</code> (64-bit), named “libwebview reservation”</td></tr>
+    <tr><td>RelroFileCreator</td><td>Isolated process, uid 1037</td></tr>
+  </tbody>
+</table>
+<p><b>libhwui.so on this build (illustrative; exact figures vary by build)</b></p>
+<table>
+  <thead><tr><th>Value</th><th>Exact figure</th></tr></thead>
+  <tbody>
+    <tr><td>Loadable segments</td><td>4: R (2.1 MiB), R E (7.8 MiB), RW = <code>GNU_RELRO</code> (264 KiB), RW (9 KiB in the file, 39 KiB in memory, where <code>MemSiz &gt; FileSiz</code> is <code>.bss</code>)</td></tr>
+    <tr><td>Segment alignment (<code>p_align</code>)</td><td>2 MiB (0x200000)</td></tr>
+    <tr><td>Sections in the RELRO and data segments</td><td><code>.data.rel.ro</code> 246 KiB, <code>.data</code> 9 KiB, <code>.bss</code> 30 KiB</td></tr>
+    <tr><td>Huge pages for <code>.text</code></td><td>On 4 KiB-page devices, one 2 MiB page needs one TLB entry (the CPU’s cache of recent address translations) instead of 512</td></tr>
+    <tr><td>Relative relocations</td><td>22,042 in 4,280 bytes of <code>.relr.dyn</code> (about 517 KiB as 24-byte <code>Elf64_Rela</code> records)</td></tr>
+    <tr><td><code>JUMP_SLOT</code> relocations</td><td>942, in plain <code>.rela.plt</code> (<code>DT_JMPREL</code>)</td></tr>
+    <tr><td>Other symbolic relocations</td><td>855 in <code>DT_ANDROID_RELA</code>, Android’s packed (compressed) relocation format (<code>.rela.dyn</code>): 659 <code>ABS64</code>, 182 <code>GLOB_DAT</code>, 14 <code>TLSDESC</code></td></tr>
+    <tr><td>PLT stub and GOT slot</td><td>Stub padded to 24 bytes with two <code>nop</code>s for BTI (Branch Target Identification), GOT slot 8 bytes</td></tr>
+  </tbody>
+</table>
+<p><b>linker64</b></p>
+<table>
+  <thead><tr><th>Value</th><th>Exact figure</th></tr></thead>
+  <tbody>
+    <tr><td>Reservation alignment (<code>kLibraryAlignment</code>)</td><td>256 KiB, for the CFI shadow</td></tr>
+    <tr><td>Random gap after a library (<code>ReserveWithAlignmentPadding</code>)</td><td>1 to 31 inaccessible 2 MiB units, on 64-bit, when the library crosses a 2 MiB boundary</td></tr>
+    <tr><td>Segment extension (<code>_extend_load_segment_vma</code>)</td><td>Libraries with 16–64 KiB alignment and a segment-padding note</td></tr>
+    <tr><td><code>.bss</code> mapping (<code>ZeroFillSegment</code>, <code>MapBssSection</code>)</td><td>Zeroes the tail of the last file page, maps remaining pages anonymously, and names them with <code>prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, …, ".bss")</code></td></tr>
+    <tr><td>Direct-from-APK mapping</td><td><code>file_offset_</code> holds the zip entry offset for uncompressed, page-aligned libraries</td></tr>
+    <tr><td>16 KiB-page alignment check</td><td>Segments only 4 KiB aligned fail, except in 16 KiB app-compat mode</td></tr>
+    <tr><td>Non-PIE executables</td><td>Support dropped in API 21</td></tr>
+    <tr><td>GNU hash lookup</td><td>Two bits tested in one 64-bit Bloom word. On a hit, 31 bits of the stored hash are compared</td></tr>
+    <tr><td>RELR bitmap</td><td>Bit <i>k</i> (<i>k</i> = 1..63) relocates <i>base</i> + 8·(<i>k</i>−1). Each bitmap moves <i>base</i> on by 63 words on 64-bit, or 31 on 32-bit</td></tr>
+  </tbody>
+</table>
+<p><b>Scudo, AndroidNormalConfig on 64-bit (AOSP, Android 17)</b></p>
+<table>
+  <thead><tr><th>Value</th><th>Exact figure</th></tr></thead>
+  <tbody>
+    <tr><td>Android configuration</td><td><code>AndroidNormalConfig</code> in <code>external/scudo/config/custom_scudo_config.h</code> (<code>-DSCUDO_USE_CUSTOM_CONFIG</code>)</td></tr>
+    <tr><td>Shared TSD caches</td><td>At most 8, 2 by default (<code>TSDRegistrySharedT&lt;A, 8U, 2U&gt;</code>)</td></tr>
+    <tr><td>Size classes</td><td>32, plus the internal batch class: 33 regions</td></tr>
+    <tr><td>Header</td><td>8 bytes, in a 16-byte area (16-byte minimum alignment, <code>SizeDelta = 16</code>)</td></tr>
+    <tr><td>Header fields (bits)</td><td>ClassId 8, State 2, OriginOrWasZeroed 2, SizeOrUnusedBytes 20, Offset 16, Checksum 16</td></tr>
+    <tr><td>Largest primary block (<code>SizeClassAllocator64</code>)</td><td><code>0x10010</code> bytes including the header: 64 KiB of user data</td></tr>
+    <tr><td>Region size</td><td>256 MiB (<code>RegionSizeLog = 28</code>), so 33 regions are a little over 8 GiB</td></tr>
+    <tr><td>Commit step (<code>MapSizeIncrement</code>)</td><td>256 KiB</td></tr>
+    <tr><td>Randomisation</td><td>Region order shuffled at init, region start offset of 1–16 pages, and new blocks shuffled within each 1 MiB group</td></tr>
+    <tr><td>Secondary allocator and cache (<code>MapAllocator</code>, <code>MapAllocatorCache</code>)</td><td>Up to 32 entries of at most 2 MiB each</td></tr>
+    <tr><td>Guard pages</td><td>One on each side of a secondary block, off in 32-bit configs</td></tr>
+    <tr><td>Release interval (<code>ReleaseToOsInterval</code>)</td><td>1000 ms, default and maximum for the primary</td></tr>
+    <tr><td><code>M_DECAY_TIME</code></td><td>Scudo on Android accepts only -1, 0 and 1, and 1 maps to the longest interval the config allows</td></tr>
+    <tr><td><code>M_PURGE</code>, <code>M_PURGE_ALL</code></td><td>API 28+, API 34+</td></tr>
+    <tr><td>MTE tags</td><td>4-bit tag per 16-byte granule, with the pointer tag in bits 56–59</td></tr>
+    <tr><td>Fixed tag without MTE</td><td><code>POINTER_TAG = 0xB4</code></td></tr>
+    <tr><td>Default allocator</td><td>Scudo since Android 11 (source.android.com Scudo page), or jemalloc on low-memory builds</td></tr>
+  </tbody>
+</table>
+
+<h2 id="sources">Sources</h2>
+<ul>
+  <li><code>bionic/linker/linker_phdr.cpp</code>: <code>ReserveAddressSpace</code>, <code>ReserveWithAlignmentPadding</code> (2 MiB gaps), <code>MapSegment</code> (<code>MADV_HUGEPAGE</code>), <code>ZeroFillSegment</code>, <code>MapBssSection</code>, <code>_extend_load_segment_vma</code>, <code>phdr_table_protect_gnu_relro</code>, <code>phdr_table_serialize_gnu_relro</code>, <code>phdr_table_map_gnu_relro</code>, 16 KiB alignment check</li>
+  <li><code>bionic/linker/linker.cpp</code>: <code>find_libraries</code>, <code>relocate_relr</code>, dynamic-section parsing (<code>DT_RELR</code>/<code>DT_ANDROID_RELR</code>, <code>DT_TEXTREL</code> rejection, <code>DT_PLTGOT</code> “RTLD_LAZY is not supported”), <code>soinfo::link_image</code>, <code>protect_relro</code>, <code>do_dlopen</code> trace slices, <code>/linkerconfig/ld.config.txt</code> path, “not accessible for the namespace” error</li>
+  <li><code>bionic/linker/linker_soinfo.cpp</code>: <code>soinfo::gnu_lookup</code> (Bloom filter), <code>call_constructors</code></li>
+  <li><code>bionic/linker/linker_gnu_hash.h</code>: DJB hash, NEON variant on arm/arm64</li>
+  <li><code>bionic/linker/linker_main.cpp</code>: PIE requirement since API 21</li>
+  <li><code>bionic/linker/linker_namespaces.h</code> and <code>art/libnativeloader/library_namespaces.cpp</code>: <code>android_namespace_t</code>, <code>shared_lib_sonames</code> link allow-lists, <code>clns</code> class-loader namespaces</li>
+  <li><code>bionic/libc/private/CFIShadow.h</code>: <code>kLibraryAlignment</code> (256 KiB)</li>
+  <li><code>frameworks/base/core/java/android/webkit/WebViewLibraryLoader.java</code> and <code>frameworks/base/native/webview/loader/loader.cpp</code>: 1 GiB zygote reservation, <code>RelroFileCreator</code>, <code>WRITE_RELRO</code>/<code>USE_RELRO</code>, relro file path</li>
+  <li><code>bionic/libc/bionic/malloc_common.cpp</code>, <code>malloc_common.h</code>, <code>malloc_common_dynamic.cpp</code>, <code>gwp_asan_wrappers.cpp</code>: dispatch table, debug/hooks libraries, GWP-ASan, <code>MALLOC_USE_APP_DEFAULTS</code></li>
+  <li><code>bionic/libc/bionic/malloc_tagged_pointers.h</code>: <code>POINTER_TAG = 0xB4</code></li>
+  <li><code>bionic/libc/include/malloc.h</code>: <code>M_DECAY_TIME</code>, <code>M_PURGE</code> (API 28), <code>M_PURGE_ALL</code> (API 34)</li>
+  <li><code>bionic/libc/Android.bp</code>: <code>USE_SCUDO</code>, <code>malloc_low_memory</code> → <code>libjemalloc5</code></li>
+  <li><code>external/scudo/config/custom_scudo_config.h</code>: <code>AndroidNormalConfig</code>, size-class table, TSD counts, release intervals, secondary cache limits, disabled type-mismatch checks and quarantine</li>
+  <li><code>external/scudo/standalone/chunk.h</code>: header bitfield, header size, checksum</li>
+  <li><code>external/scudo/standalone/primary64.h</code>: region reservation and naming, random offset, block shuffling, <code>releaseToOSMaybe</code></li>
+  <li><code>external/scudo/standalone/secondary.h</code>: guard pages, block placement</li>
+  <li><code>external/scudo/standalone/combined.h</code>, <code>memtag.h</code>, <code>wrappers_c.cpp</code>, <code>tsd_shared.h</code>, <code>report.cpp</code>: release on drain, MTE retagging, <code>M_DECAY_TIME</code>, TSD count and per-TSD locking (<code>ScopedTSD</code>, <code>tryLock</code>), abort messages</li>
+  <li><code>system/memory/libmeminfo/tools/showmap.cpp</code>: smaps summary tool</li>
+  <li><code>readelf -lW</code>, <code>llvm-readelf -r -d</code> and <code>llvm-objdump -d</code> on <code>system/lib64/libhwui.so</code> from an arm64 platform build: segment layout, RELR counts, PLT stub</li>
+  <li>External documents: Linux <a href="https://docs.kernel.org/filesystems/proc.html" target="_blank">Documentation/filesystems/proc.rst</a> (smaps fields, RSS/PSS), <a href="https://source.android.com/docs/security/test/scudo" target="_blank">source.android.com Scudo page</a> (default since Android 11), and TCMalloc’s design document, <code>docs/design.md</code> in the TCMalloc repository (per-CPU caches, page heap)</li>
+</ul>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>

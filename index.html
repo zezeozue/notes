@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Notes on Android and Perfetto internals</title>
+<meta name="description" content="Long-form explainers on the Android runtime, native memory, the input and display pipeline, Kotlin coroutines and Perfetto's trace processor." />
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="assets/site.css" />
+<script src="assets/site.js"></script>
+</head>
+<body class="home">
+<main>
+<div class="bar">
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</div>
+
+<h1>Notes on Android and Perfetto internals</h1>
+<p class="subtitle">Long-form explainers on the Android runtime, native memory and Parcel, the path from a touch to pixels,
+Kotlin coroutines, and how Perfetto's trace processor works. Each note opens with an “At a glance” summary
+and explains the rest with figures and tables.</p>
+
+<h2 class="group">Android runtime and memory</h2>
+<ul class="notes-list">
+  <li><a href="art_costs/index.html">
+    <span class="note-title">Where the costs are in ART: cheap until the GC, a lock or native code gets involved</span>
+    <span class="note-sub">A bottom-up tour of the Android Runtime: object layout, the garbage collectors, what the compiler can remove, locks, strings and JNI.</span>
+    <span class="note-meta">Objects · GC · compiler · Strings · JNI</span>
+  </a></li>
+  <li><a href="java_sdk_zero_copy/index.html">
+    <span class="note-title">Zero-copy Java to native on ART: a non-movable byte[] removes a copy and keeps Java writes fast</span>
+    <span class="note-sub">How a non-movable array lets native code read bytes that Java just wrote, without a copy, and what that means for bounds checks, side effects and reachability.</span>
+    <span class="note-meta">Non-movable arrays · BCE · side effects · reachability</span>
+  </a></li>
+  <li><a href="native_memory_elf_malloc/index.html">
+    <span class="note-title">Native memory on Android: where each page in smaps comes from</span>
+    <span class="note-sub">From the page up: how the kernel hands out memory, how the dynamic linker maps ELF files and shares RELRO, and how Scudo malloc carves up the heap.</span>
+    <span class="note-meta">Pages · ELF · linker64 · RELRO · Scudo</span>
+  </a></li>
+  <li><a href="parcel_native_memory/index.html">
+    <span class="note-title">How Parcel holds native memory: its buffers, the copy a Binder call makes, and what keeps that copy alive in system_server</span>
+    <span class="note-sub">How a Parcel lays out and grows its buffers, how a Binder call and a Bundle copy them into malloc, and which system_server structures keep app payloads alive.</span>
+    <span class="note-meta">Parcel · Binder · Bundle · system_server</span>
+  </a></li>
+</ul>
+
+<h2 class="group">Android UI and app code</h2>
+<ul class="notes-list">
+  <li><a href="input_display_pipeline/index.html">
+    <span class="note-title">How a touch becomes pixels, and how Android decides a frame was late</span>
+    <span class="note-sub">A touch through the kernel, system_server, the app's UI and render threads, the GPU and SurfaceFlinger, and how FrameTimeline judges each frame.</span>
+    <span class="note-meta">evdev · Choreographer · BLAST · FrameTimeline</span>
+  </a></li>
+  <li><a href="kotlin_coroutines_flows/index.html">
+    <span class="note-title">Kotlin coroutines and flows: how async work outlives the UI</span>
+    <span class="note-sub">Suspend functions, jobs, cold and hot flows, combine and Compose's remember, explained for engineers who know Android Views: what each keeps alive, and the common leak patterns that follow.</span>
+    <span class="note-meta">suspend · Job · cold/hot · StateFlow · combine · Compose</span>
+  </a></li>
+</ul>
+
+<h2 class="group">Perfetto</h2>
+<ul class="notes-list">
+  <li><a href="trace_processor_internals/index.html">
+    <span class="note-title">How trace processor turns an out-of-order trace file into fast SQL tables</span>
+    <span class="note-sub">The life of a trace: sorting, trackers, columnar dataframes, the bytecode query engine and the SQLite layer.</span>
+    <span class="note-meta">Sorter · trackers · dataframes · bytecode · SQLite</span>
+  </a></li>
+  <li><a href="perfettosql_next/index.html">
+    <span class="note-title">PerfettoSQL: every statement goes through a generated parser, and pipe queries run on Perfetto's own executor</span>
+    <span class="note-sub">How PerfettoSQL text becomes results: tokens, a Lemon-generated LALR(1) parser, macros and pipe operators.</span>
+    <span class="note-meta">Tokens · Lemon LALR(1) · macros · |&gt; pipelines</span>
+  </a></li>
+  <li><a href="trace_merging/index.html">
+    <span class="note-title">Trace merging lines up files from different machines well, but two files from one phone need care</span>
+    <span class="note-sub">How trace processor puts several trace files on one timeline: clocks, clock snapshots, archives and machines, and the pitfalls when two files come from the same device.</span>
+    <span class="note-meta">Clocks · snapshots · archives · machines</span>
+  </a></li>
+</ul>
+
+<footer class="site-foot">
+  <span>Plain HTML, CSS and a little JavaScript. Works offline.</span>
+  <span>License: see the LICENSE file in the repository.</span>
+</footer>
+</main>
+</body>
+</html>

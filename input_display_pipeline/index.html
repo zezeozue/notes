@@ -1,0 +1,1390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Input and display pipeline</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="evdev · Choreographer · BLAST · FrameTimeline">Input and display pipeline</span>
+  <span class="tb-spacer"></span>
+  <a class="tb-x" href="../kotlin_coroutines_flows/index.html">Coroutines &amp; Flows</a>
+  <a class="tb-x" href="../art_costs/index.html">Costs in ART</a>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#glance">At a glance</a>
+  <a href="#overview">A frame takes two periods</a>
+  <div class="ph">I · Input</div>
+  <a href="#evdev">1 · Kernel touch records</a>
+  <a href="#reader">2 · Reader and dispatcher threads</a>
+  <a href="#dispatcher">3 · Picking a window, the socket</a>
+  <a href="#anr" style="padding-left:18px">queues and the ANR timer</a>
+  <a href="#resample">4 · Batching and resampling</a>
+  <div class="ph">II · Producing a frame</div>
+  <a href="#vsync">5 · Predicted VSYNC, two wake-ups</a>
+  <a href="#choreographer">6 · Choreographer's fixed order</a>
+  <a href="#renderthread">7 · UI thread and RenderThread</a>
+  <div class="ph">III · Buffers &amp; composition</div>
+  <a href="#blast">8 · Buffer queues and BLAST</a>
+  <a href="#bounce" style="padding-left:18px">resize bounce</a>
+  <a href="#fences">9 · Fences</a>
+  <a href="#sf">10 · Display hardware and GPU</a>
+  <div class="ph">IV · Jank</div>
+  <a href="#stuffing">11 · Buffer stuffing</a>
+  <a href="#frametimeline">12 · How FrameTimeline judges</a>
+  <a href="#ft-slices" style="padding-left:18px">what the slices span</a>
+  <a href="#ft-classify" style="padding-left:18px">how a frame is classified</a>
+  <a href="#ft-table" style="padding-left:18px">jank_type and jank_tag</a>
+  <a href="#ft-perceptible" style="padding-left:18px">perceptible vs not</a>
+  <a href="#sql">13 · Queries</a>
+  <a href="#method">14 · Numbers and method</a>
+  <a href="#sources">Sources</a>
+</nav>
+
+<main id="top">
+<h1>How a touch becomes pixels, and how Android decides a frame was late</h1>
+<p class="lead">A touch passes through the kernel, two threads in system_server, the app's two drawing threads, the GPU,
+SurfaceFlinger and the display hardware before it reaches the screen. Every stage works to a deadline set by the display's refresh.
+This note follows one frame through each stage, then shows how FrameTimeline decides which frames were janky.
+Each section ends with what it means when you read a trace.</p>
+<p class="m">Code is from AOSP as of Android 17: <code>frameworks/native</code>, <code>frameworks/base</code> and
+<code>external/perfetto</code>. Excerpts marked <em>shape</em> are simplified. Timelines assume a fixed refresh rate and omit
+the small phase offsets unless stated.</p>
+
+<h2 id="glance">At a glance</h2>
+<ul>
+<li><b>Input.</b> The kernel reads the touch, system_server picks the window under the finger, and a socket carries the event to the app.</li>
+<li><b>Making a frame.</b> Once per refresh, the app runs input, animation and layout, then a second thread and the GPU draw the image.</li>
+<li><b>Showing it.</b> SurfaceFlinger collects every app's finished image, and the display hardware combines them on the next refresh.</li>
+<li><b>Jank.</b> A stage that misses its deadline leaves the old image on screen for one more refresh. The user sees a stutter.</li>
+<li><b>Reading a trace.</b> FrameTimeline marks each frame as on time, late because of the app, late because of the system, or queued behind a late frame.</li>
+</ul>
+<p><b>Terms.</b> A panel does not redraw continuously. It reads a finished image out of memory line by line, top to bottom. This
+read-out is <b>scanout</b>, and the number of scanouts per second is the <b>refresh rate</b>. The display can switch images only
+between two scanouts, at a <b>VSYNC</b> (vertical sync) signal. At 60 Hz that is every 16.7 ms.
+A frame's <b>deadline</b> is the latest time its work can finish and still make its VSYNC. A late or repeated frame is <b>jank</b>.
+<b>SurfaceFlinger</b> is the system process that combines every app's images and the system UI into the one image the panel shows.
+A <b>buffer</b> is one image in memory (Section 8). A <b>fence</b> is a kernel object that signals when the GPU or display is done
+with a buffer (Section 9). <b>Latching</b> is SurfaceFlinger taking a new buffer for the frame it is building. <b>HWC</b>, the
+hardware composer, is the display hardware's driver interface (Section 10). doFrame and DrawFrames are the per-frame trace slices
+on the app's UI thread and on its <b>RenderThread</b>, the second thread that issues GPU commands (Sections 6 and 7).</p>
+
+<!-- ═════════════════════════ OVERVIEW ═════════════════════════ -->
+<h2 id="overview">A frame takes about two refresh periods from the app's start to the screen</h2>
+<p>The app gets one refresh period to draw a frame, and SurfaceFlinger gets the next one to put it on screen. That holds with the
+default scheduling durations (Section 5). The work is spread across several threads and two processes, the app and SurfaceFlinger.
+Everything in this note exists to have the right image fully rendered at the right VSYNC.</p>
+
+<figure>
+<figcaption><b>Figure 1. One frame needs two refresh periods: one for the app, one for SurfaceFlinger.</b> The app has until V1
+to finish its CPU and GPU work. SurfaceFlinger composes in the next period, and the panel shows the result at V2. In steady state
+the stages overlap: while SurfaceFlinger composes frame N, the app is already working on N+1.</figcaption>
+<svg viewBox="0 0 1000 345" role="img" aria-label="One frame across threads">
+  <text x="336" y="18" class="tms">V0 (app wakes)</text>
+  <text x="566" y="18" class="tms">V1 (deadline, SF wakes)</text>
+  <text x="796" y="18" class="tms">V2 (present)</text>
+  <line x1="330" y1="24" x2="330" y2="336" class="ln dash"/>
+  <line x1="560" y1="24" x2="560" y2="336" class="ln dash"/>
+  <line x1="790" y1="24" x2="790" y2="336" class="ln dash"/>
+
+  <text x="10" y="54" class="ts">input (system_server)</text>
+  <text x="10" y="104" class="ts">app UI thread</text>
+  <text x="10" y="154" class="ts">app RenderThread</text>
+  <text x="10" y="204" class="ts">GPU</text>
+  <text x="10" y="254" class="ts">SurfaceFlinger</text>
+  <text x="10" y="304" class="ts">display</text>
+
+  <rect x="152" y="38" width="165" height="24" rx="2" class="ba"/><text x="162" y="54" class="tms">InputReader, Dispatcher</text>
+  <text x="152" y="78" class="ts">touch samples → socket</text>
+  <path d="M317,50 C326,50 324,100 330,100" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="332" y="88" width="118" height="24" rx="2" class="b2"/><text x="342" y="104" class="tms">doFrame</text>
+  <rect x="450" y="88" width="12" height="24" class="bw"/>
+  <text x="332" y="128" class="ts">input · animation · traversal · sync</text>
+
+  <rect x="462" y="138" width="78" height="24" rx="2" class="ba"/><text x="470" y="154" class="tms">DrawFrames</text>
+  <text x="462" y="178" class="ts">record → GPU commands → queueBuffer</text>
+
+  <rect x="485" y="188" width="70" height="24" rx="2" class="bv"/><text x="495" y="204" class="tms">GPU</text>
+  <text x="550" y="228" class="ts" text-anchor="end">acquire fence signals</text>
+  <path d="M555,212 L564,236" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="562" y="238" width="98" height="24" rx="2" class="bw"/><text x="572" y="254" class="tms">composite</text>
+  <text x="562" y="278" class="ts">latch, HWC validate/present</text>
+  <path d="M660,250 C730,250 800,256 806,284" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="330" y="288" width="460" height="24" class="b"/><text x="342" y="304" class="tms">previous frame</text>
+  <rect x="790" y="288" width="200" height="24" class="bg"/><text x="800" y="304" class="tms">new frame visible</text>
+  <text x="792" y="328" class="ts">present fence signals</text>
+</svg>
+</figure>
+
+<!-- ═════════════════════════ PART I ═════════════════════════ -->
+<div class="part">Part I · Input</div>
+
+<h2 id="evdev"><span class="n">1</span>The kernel reports each touch as a short run of small fixed-size records</h2>
+<p>Linux gives Android one generic format for every input device, so Android needs no driver protocol per vendor. The touch
+controller is a small processor on the panel. It scans its capacitive grid at its own rate, independent of the display refresh. When it
+has new contacts, it interrupts the phone's main chip, the SoC. The kernel touch driver then publishes the contacts on a device
+file, <code>/dev/input/eventN</code>. This interface is <b>evdev</b> (event device), and Android reads it with ordinary read() calls.</p>
+<p>evdev is a stream of fixed-size records. Each record holds a timestamp, a <b>type</b>, a <b>code</b> and a <b>value</b>. The type
+says key, absolute axis or sync. The code says which key or axis. On a 64-bit kernel each record is 24 bytes.</p>
+
+<figure>
+<figcaption><b>Figure 2. Two thirds of each record is the timestamp.</b> The timestamp is a struct timeval. The event itself is only
+8 bytes, so one touch takes several records and needs a packet boundary (below).</figcaption>
+<svg viewBox="0 0 1000 120" role="img" aria-label="struct input_event layout">
+  <text x="150" y="20" class="tms">0</text><text x="430" y="20" class="tms">8</text><text x="710" y="20" class="tms">16</text>
+  <text x="776" y="20" class="tms">18</text><text x="846" y="20" class="tms">20</text><text x="970" y="20" class="tms">24</text>
+  <line x1="150" y1="26" x2="990" y2="26" class="ln"/>
+  <text x="10" y="56" class="tb">input_event</text><text x="10" y="72" class="tms">64-bit</text>
+  <rect x="150" y="38" width="280" height="36" class="b2"/><text x="160" y="60" class="tms">time.tv_sec (8)</text>
+  <rect x="430" y="38" width="280" height="36" class="b2"/><text x="440" y="60" class="tms">time.tv_usec (8)</text>
+  <rect x="710" y="38" width="70" height="36" class="ba"/><text x="720" y="60" class="tms">type</text>
+  <rect x="780" y="38" width="70" height="36" class="ba"/><text x="790" y="60" class="tms">code</text>
+  <rect x="850" y="38" width="140" height="36" class="bg"/><text x="860" y="60" class="tms">value (s32)</text>
+  <text x="150" y="100" class="ts">type is EV_SYN, EV_KEY, EV_ABS…; code selects the axis or key; value is the reading.</text>
+</svg>
+</figure>
+
+<p>A touch needs several values for several fingers at once, so the kernel groups records into packets. The reader must know which
+values belong together and which finger is which. The kernel's <b>multi-touch protocol B</b> answers both:</p>
+<ul>
+  <li>Each finger lives in a numbered <b>slot</b>.</li>
+  <li>A tracking id names the contact for as long as the finger is down.</li>
+  <li>The driver sends only values that changed.</li>
+  <li>A SYN_REPORT record closes one atomic packet.</li>
+</ul>
+<p>The older protocol A re-sent every contact anonymously on each report. One finger going down looks like this (example values):</p>
+<pre><code><span class="c">// one packet from /dev/input/eventN (example)</span>
+EV_ABS  ABS_MT_SLOT         0      <span class="c">// talk about slot 0</span>
+EV_ABS  ABS_MT_TRACKING_ID  42     <span class="c">// new contact id; -1 later means "lifted"</span>
+EV_ABS  ABS_MT_POSITION_X   540
+EV_ABS  ABS_MT_POSITION_Y   1280
+EV_KEY  BTN_TOUCH           1
+EV_SYN  SYN_REPORT          0      <span class="c">// end of packet: now it is consistent</span></code></pre>
+<p>Touch timestamps come from the kernel, not from the moment Android read the event. EventHub, the input reader's wrapper around
+the device files (Section 2), asks the kernel to stamp events with <code>CLOCK_MONOTONIC</code>, a clock that never jumps and pauses
+while the device is suspended. It does this with ioctl(EVIOCSCLOCKID), a control call on the device file.
+That kernel time is what <code>MotionEvent.getEventTime()</code> returns. A <b>MotionEvent</b> is the Java object an app receives for
+each touch or pointer event. It holds an action, such as DOWN, MOVE or UP, plus the coordinates of every pointer.</p>
+
+<h2 id="reader"><span class="n">2</span>system_server turns raw records into screen coordinates on one thread and routes them on another</h2>
+<p>Raw records are in panel units, unrotated, and know nothing about windows, so system_server converts and routes them. The code
+is <b>inputflinger</b>, native code inside <b>system_server</b>, the process that hosts the window manager and most system
+services. It has two main threads. The <b>InputReader</b> thread turns raw records into Android events. The
+<b>InputDispatcher</b> thread decides which window gets each event and delivers it.</p>
+<p>EventHub sleeps until any input device has data, then reads a batch of records. The kernel holds a wakelock from the interrupt
+until the reader has picked the events up. A wakelock keeps the device from suspending. The exact limits are in Section 14.</p>
+<p>InputReader hands each device's records to a <b>mapper</b>. For a touchscreen that is MultiTouchInputMapper, a kind of
+TouchInputMapper. It collects axis values until SYN_REPORT. Then it applies rotation and scaling to get display coordinates and
+emits one motion record, a NotifyMotionArgs in inputflinger's terms.</p>
+<pre><code><span class="c">// TouchInputMapper, on SYN_REPORT</span>
+TouchInputMapper::sync → processRawTouches → cookAndDispatch → dispatchTouches
+<span class="c">// raw panel units → display coordinates → NotifyMotionArgs</span></code></pre>
+
+<figure>
+<figcaption><b>Figure 3. Input crosses two threads in system_server, then a socket into the app.</b> A chain of filter stages sits
+between the reader and the dispatcher. Window positions for hit testing come from SurfaceFlinger, which knows where every layer
+really is on screen. Section 3 covers hit testing, the socket, the app side and the ANR timer.</figcaption>
+<svg viewBox="0 0 1000 230" role="img" aria-label="inputflinger pipeline">
+  <text x="10" y="24" class="th">kernel</text>
+  <text x="190" y="24" class="th">InputReader thread</text>
+  <text x="800" y="24" class="th">InputDispatcher thread</text>
+  <rect x="10" y="36" width="150" height="58" rx="2" class="b2"/><text x="20" y="60" class="tm">/dev/input/event*</text><text x="20" y="80" class="ts">evdev records</text>
+  <path d="M160,65 L186,65" class="ln" marker-end="url(#ah)"/>
+  <rect x="190" y="36" width="170" height="58" rx="2" class="ba"/><text x="200" y="60" class="tb">EventHub</text><text x="200" y="80" class="ts">epoll_wait, read()</text>
+  <path d="M360,65 L386,65" class="ln" marker-end="url(#ah)"/>
+  <rect x="390" y="36" width="180" height="58" rx="2" class="ba"/><text x="400" y="60" class="tb">InputReader</text><text x="400" y="80" class="ts">TouchInputMapper::sync</text>
+  <path d="M570,65 L596,65" class="ln" marker-end="url(#ah)"/>
+  <rect x="600" y="36" width="170" height="58" rx="2" class="b0"/><text x="610" y="60" class="tb">listener stages</text><text x="610" y="80" class="ts">palm rejection, filters…</text>
+  <path d="M770,65 L796,65" class="ln" marker-end="url(#ah)"/>
+  <rect x="800" y="36" width="190" height="58" rx="2" class="ba"/><text x="810" y="60" class="tb">InputDispatcher</text><text x="810" y="80" class="ts">hit test, queues, ANR</text>
+
+  <path d="M315,148 L315,124 L840,124 L840,98" class="ln dash" marker-end="url(#ah)"/>
+  <text x="470" y="118" class="ts">window list for hit testing</text>
+  <rect x="190" y="148" width="250" height="58" rx="2" class="b2"/><text x="200" y="172" class="tb">SurfaceFlinger</text><text x="200" y="192" class="ts">WindowInfosListener updates</text>
+
+  <path d="M895,94 L895,146" class="lna" marker-end="url(#aha)"/>
+  <rect x="800" y="148" width="190" height="58" rx="2" class="bw"/><text x="810" y="172" class="tb">InputChannel</text><text x="810" y="192" class="ts">socketpair, SOCK_SEQPACKET</text>
+  <path d="M800,168 L724,168" class="lna" marker-end="url(#aha)"/>
+  <text x="738" y="162" class="tms">MOTION</text>
+  <path d="M722,190 L798,190" class="lng dash" marker-end="url(#ahg)"/>
+  <text x="732" y="206" class="tms">FINISHED</text>
+  <rect x="470" y="148" width="250" height="58" rx="2" class="b0"/><text x="480" y="172" class="tb">app main thread Looper</text><text x="480" y="192" class="ts">InputConsumer, ViewRootImpl</text>
+</svg>
+</figure>
+<p>The filter stages are a chain of InputListener stages built in InputManager.cpp. Each stage can change, drop or annotate an event
+before passing it on. In order, they include palm rejection (UnwantedInteractionBlocker), accessibility key filters such as bounce
+and sticky keys (InputFilter), the mouse and stylus pointer icons (PointerChoreographer) and motion classification (InputProcessor),
+plus a few more.</p>
+
+<h2 id="dispatcher"><span class="n">3</span>The dispatcher picks the window under the finger and sends the event over a socket, not Binder</h2>
+<p>The dispatcher has two jobs: find the window under the finger, and deliver the event without letting a stuck app block everyone
+else. SurfaceFlinger pushes the current window list to the dispatcher whenever it changes. For a touch down, the dispatcher walks
+that list front to back and picks the first touchable window under the point. <b>Spy windows</b>, such as system gesture monitors,
+also receive the stream without being the target.</p>
+<pre><code>InputDispatcher::onWindowInfosChanged            <span class="c">// SurfaceFlinger pushes the latest WindowInfo list</span>
+DispatcherTouchState::findTouchedWindowTargets   <span class="c">// on touch down</span>
+  findTouchedWindowAt                            <span class="c">// front to back: first touchable window under the point</span></code></pre>
+<p>Each window has an <b>InputChannel</b>: one end of a pair of already-connected local sockets, created in one call. The socket
+type keeps message boundaries, so one send is exactly one input message. The app gets its end when the window is added, and the
+main thread's event loop (its Looper) watches it. The dispatcher's end stays in system_server. The same socket carries the app's
+<b>finished</b> signal back.</p>
+<pre><code><span class="src">frameworks/native/libs/input/InputTransport.cpp</span>constexpr size_t SOCKET_BUFFER_SIZE = 32 * 1024;
+...
+if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets)) { ... }   <span class="c">// SEQPACKET: one send() is one InputMessage</span>
+setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &amp;bufferSize, sizeof(bufferSize));
+setsockopt(sockets[0], SOL_SOCKET, SO_RCVBUF, &amp;bufferSize, sizeof(bufferSize));</code></pre>
+
+<h3 id="anr">An input ANR fires when the oldest event sent to a window stays unfinished too long</h3>
+<p>If an app stops reading its socket, the system must notice and tell the user. That is an <b>ANR</b> (Application Not
+Responding): the dialog and bug report that system_server raises when an app has not handled input, a broadcast or a service call
+in time. For input, each connection keeps two queues. The <b>outbound queue</b> holds events not yet written to the socket. Once an
+event is sent, it moves to the <b>wait queue</b> and an ANR deadline is armed. It leaves the wait queue only when the app's
+finished signal for it arrives. If the socket is full (WOULD_BLOCK), events wait in the outbound queue until the app catches up.</p>
+
+<figure>
+<figcaption><b>Figure 4. Every sent event waits for a finished signal, and the oldest unfinished one is held to the timeout.</b> The iq, oq and wq
+counters (inbound, outbound and wait queue lengths) appear in system_server traces. A growing wq for your window means its main thread is not finishing events.</figcaption>
+<svg viewBox="0 0 1000 225" role="img" aria-label="Dispatcher queues and ANR timer">
+  <rect x="10" y="30" width="170" height="44" rx="2" class="b2"/><text x="20" y="50" class="tm">mInboundQueue</text><text x="20" y="66" class="ts">trace counter iq</text>
+  <path d="M180,52 L206,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="210" y="30" width="200" height="44" rx="2" class="ba"/><text x="220" y="50" class="tm">outboundQueue</text><text x="220" y="66" class="ts">counter oq:&lt;channel&gt;</text>
+  <path d="M410,52 L436,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="440" y="30" width="150" height="44" rx="2" class="bw"/><text x="450" y="50" class="tm">socket</text><text x="450" y="66" class="ts">publishMotionEvent</text>
+  <path d="M590,52 L616,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="620" y="30" width="170" height="44" rx="2" class="b0"/><text x="630" y="50" class="tm">app consumes</text><text x="630" y="66" class="ts">sendFinishedSignal</text>
+  <path d="M515,74 L515,100 L412,100" class="ln" marker-end="url(#ah)"/>
+  <rect x="210" y="88" width="200" height="44" rx="2" class="bv"/><text x="220" y="108" class="tm">waitQueue</text><text x="220" y="124" class="ts">counter wq:&lt;channel&gt;</text>
+  <path d="M705,74 L705,120 L412,120" class="lng dash" marker-end="url(#ahg)"/>
+  <text x="520" y="138" class="ts tg">FINISHED: entry erased, deadline cleared</text>
+
+  <line x1="210" y1="180" x2="990" y2="180" class="ln"/>
+  <line x1="210" y1="172" x2="210" y2="188" class="ln"/><line x1="988" y1="172" x2="988" y2="188" class="lnr"/>
+  <text x="214" y="204" class="tms">0: enters waitQueue</text>
+  <text x="986" y="204" class="tms tr" text-anchor="end">timeout: ANR</text>
+  <text x="10" y="184" class="th">per connection</text>
+</svg>
+</figure>
+
+<p>The default timeout is 5 seconds. Slow emulators stretch it, and a window or application can carry its own. When an event is
+sent, the dispatcher records its timeout time in an ANR tracker. The oldest overdue connection gets the ANR. Key events
+have a second ANR path: no focused window to receive them. Only that path can warn early: behind a feature flag, the dispatcher
+sends a pre-ANR notice at half the timeout, or a fixed window before the deadline, whichever is earlier.</p>
+<pre><code><span class="src">frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp</span>const std::chrono::duration DEFAULT_INPUT_DISPATCHING_TIMEOUT = std::chrono::milliseconds(
+        android::os::IInputConstants::UNMULTIPLIED_DEFAULT_DISPATCHING_TIMEOUT_MILLIS *
+        HwTimeoutMultiplier());   <span class="c">// 5000 ms × 1 on real hardware; larger on slow emulators</span>
+...
+<span class="c">// startDispatchCycleLocked, after a successful publish (shape, simplified)</span>
+connection-&gt;waitQueue.emplace_back(std::move(dispatchEntry));
+<span class="hw">mAnrTracker.insert(timeoutTime, connection-&gt;getToken());</span>
+<span class="c">// the entry leaves waitQueue when the finished signal for its sequence number arrives</span>
+<span class="c">// processAnrsLocked() calls onAnrLocked() for the oldest overdue connection</span></code></pre>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+An input ANR is not "the app was slow for 5 s". It is "the oldest event sent to this window was not finished for 5 s". A single long
+main-thread task blocks every event behind it, including ones the app would have handled instantly.
+</blockquote>
+
+<h2 id="resample"><span class="n">4</span>The app collects touch moves and handles them once per frame</h2>
+<p>The touch panel and the display run on unrelated clocks, so the app batches moves and handles them once per frame. Delivering
+every MOVE the moment it arrives would make the app lay out several times per frame and throw away all but the last result.
+Instead the app side <b>batches</b> moves: it collects them without delivering them. It consumes them once per frame, in the
+input step of <b>Choreographer</b>, the per-thread object that runs an app's work once per VSYNC (Section 6).</p>
+<p>The rule is simple: only moves (ACTION_MOVE and ACTION_HOVER_MOVE) wait, and anything else goes out at once. The batching code is InputConsumer::consume in
+<code>libs/input/InputConsumer.cpp</code>.
+Figure 5 shows the three cases.</p>
+
+<figure>
+<figcaption><b>Figure 5. Only moves wait for the next frame. Every other event flushes the batch and goes out at once.</b> A
+pending batch is flushed before a DOWN, UP or key so the order is kept. A pointer CANCEL instead drops the pending batch, which is
+about to be cancelled anyway.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 236" role="img" aria-label="Batching rules in InputConsumer::consume: moves are appended to a batch, other events flush it and go out at once, pointer CANCEL drops it">
+  <text x="10" y="20" class="th">event arrives</text>
+  <text x="250" y="20" class="th">InputConsumer::consume</text>
+  <text x="600" y="20" class="th">delivered to the app</text>
+
+  <rect x="10" y="34" width="200" height="48" rx="3" class="ba"/>
+  <text x="22" y="54" class="tb">MOVE, HOVER_MOVE</text>
+  <text x="22" y="72" class="ts">pointer moves</text>
+  <path d="M210,58 L246,58" class="ln" marker-end="url(#ah)"/>
+  <rect x="250" y="34" width="300" height="48" rx="3" class="b2"/>
+  <text x="262" y="54" class="t">append to the batch</text>
+  <text x="262" y="72" class="ts">one batch per device and source</text>
+  <path d="M550,58 L596,58" class="lna" marker-end="url(#aha)"/>
+  <rect x="600" y="34" width="250" height="48" rx="3" class="ba"/>
+  <text x="612" y="54" class="t">at the next frame</text>
+  <text x="612" y="72" class="ts">Choreographer input step</text>
+
+  <rect x="10" y="100" width="200" height="48" rx="3" class="bg"/>
+  <text x="22" y="120" class="tb">DOWN, UP, keys</text>
+  <text x="22" y="138" class="ts">every other event</text>
+  <path d="M210,124 L246,124" class="ln" marker-end="url(#ah)"/>
+  <rect x="250" y="100" width="300" height="48" rx="3" class="b2"/>
+  <text x="262" y="120" class="t">flush the pending batch first</text>
+  <text x="262" y="138" class="ts">keeps events in order</text>
+  <path d="M550,124 L596,124" class="lng" marker-end="url(#ahg)"/>
+  <rect x="600" y="100" width="250" height="48" rx="3" class="bg"/>
+  <text x="612" y="120" class="t">immediately</text>
+  <text x="612" y="138" class="ts">returned by consume()</text>
+
+  <rect x="10" y="166" width="200" height="48" rx="3" class="br"/>
+  <text x="22" y="186" class="tb">pointer CANCEL</text>
+  <text x="22" y="204" class="ts">the gesture is ending</text>
+  <path d="M210,190 L246,190" class="ln" marker-end="url(#ah)"/>
+  <rect x="250" y="166" width="300" height="48" rx="3" class="b2"/>
+  <text x="262" y="186" class="t">drop the pending batch</text>
+  <text x="262" y="204" class="ts">finished as unhandled</text>
+  <path d="M550,190 L596,190" class="lnr" marker-end="url(#ahr)"/>
+  <rect x="600" y="166" width="250" height="48" rx="3" class="br"/>
+  <text x="612" y="186" class="t">CANCEL immediately</text>
+  <text x="612" y="204" class="ts">batched moves never delivered</text>
+</svg>
+</figure>
+
+<p>When a batch is waiting, ViewRootImpl asks Choreographer for an input callback, and the next frame drains the batch.</p>
+<pre><code><span class="src">frameworks/base/core/java/android/view/ViewRootImpl.java</span><span class="c">// called by NativeInputEventReceiver when a batch is pending</span>
+public void onBatchedInputEventPending(int source) {
+    final boolean unbuffered = mUnbufferedInputDispatch
+            || (source &amp; mUnbufferedInputSource) != SOURCE_CLASS_NONE;
+    if (unbuffered) { ... consumeBatchedInputEvents(-1); return; }
+    scheduleConsumeBatchedInput();   <span class="c">// postVsyncCallback(CALLBACK_INPUT, ...)</span>
+}
+<span class="c">// at the next frame: doConsumeBatchedInput(frameTimeNanos) drains the batch</span></code></pre>
+<p>View.requestUnbufferedDispatch opts out, and moves are delivered as they arrive. Drawing and stylus apps use it when they
+want every sample with minimal delay.</p>
+
+<h3>Resampling evens out the uneven number of samples per frame</h3>
+<p>Batching makes per-frame steps uneven, and <b>resampling</b> evens them out. With a 240 Hz panel and a 60 Hz display, some frames
+get four new samples and some get five. A finger moving at constant speed would then jump by uneven steps. So the app synthesizes
+the pointer position at a fixed offset before the frame time. The real samples are not lost. They travel in the same MotionEvent
+as its <b>history</b>, readable with getHistoricalX/Y.</p>
+
+<figure>
+<figcaption><b>Figure 6. The app reports where the finger was 5 ms before the frame, interpolated between real samples.</b> T is
+the frame time Choreographer passes in. Samples at or before T − 5 ms go out in this frame. A newer sample, if present, stays in
+the batch and is used to interpolate. The synthetic sample has PointerCoords.isResampled set.</figcaption>
+<svg viewBox="0 0 1000 215" role="img" aria-label="Touch resampling">
+  <text x="10" y="54" class="ts">raw samples</text>
+  <line x1="120" y1="50" x2="980" y2="50" class="ln dash"/>
+  <circle cx="248" cy="50" r="5" class="fa"/><circle cx="416" cy="50" r="5" class="fa"/><circle cx="584" cy="50" r="5" class="fa"/><circle cx="752" cy="50" r="5" class="fw"/>
+  <text x="241" y="74" class="tms">s1</text><text x="409" y="74" class="tms">s2</text><text x="577" y="74" class="tms">s3</text><text x="745" y="74" class="tms">s4</text>
+  <circle cx="700" cy="50" r="5" class="fg"/>
+  <text x="606" y="32" class="ts tg">lerp(s3, s4) at T − 5 ms</text>
+  <path d="M248,88 L248,94 L584,94 L584,88" class="lna"/>
+  <text x="300" y="110" class="ts ta">consumed this frame (as MotionEvent history)</text>
+  <text x="726" y="110" class="ts tw">held for the next frame</text>
+
+  <line x1="120" y1="140" x2="980" y2="140" class="ln"/>
+  <line x1="700" y1="36" x2="700" y2="146" class="lng dash"/>
+  <line x1="900" y1="134" x2="900" y2="146" class="ln"/>
+  <text x="890" y="162" class="tms">T</text>
+  <text x="648" y="162" class="tms">T − 5 ms</text>
+  <text x="120" y="162" class="tms">time →</text>
+  <text x="10" y="194" class="ts">No newer sample? Extrapolate from the last two, only if they are 2–20 ms apart, and never further than</text>
+  <text x="10" y="209" class="ts">min(gap / 2, 8 ms) past the last real sample.</text>
+</svg>
+</figure>
+
+<table>
+  <thead><tr><th>Constant (InputConsumer.cpp, Resampler.cpp)</th><th>Value</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>RESAMPLE_LATENCY</code></td><td>5 ms</td><td>Sample time is <code>frameTime − 5 ms</code>. A little latency buys interpolation instead of prediction.</td></tr>
+    <tr><td><code>RESAMPLE_MIN_DELTA</code></td><td>2 ms</td><td>Samples closer than this are not used for interpolation or extrapolation.</td></tr>
+    <tr><td><code>RESAMPLE_MAX_DELTA</code></td><td>20 ms</td><td>No extrapolation from samples further apart than this.</td></tr>
+    <tr><td><code>RESAMPLE_MAX_PREDICTION</code></td><td>8 ms</td><td>Extrapolation limit, further bounded by half the last sample gap.</td></tr>
+  </tbody>
+</table>
+<p>Resampling applies only to pointer moves from a finger, mouse, stylus or unknown tool. It is on by default and controlled by
+the ro.input.resampling property. Resampler.cpp carries the same constants for the newer InputConsumerNoResampling path.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A MOVE you see in onTouchEvent is usually a synthetic position 5 ms before the frame. The real samples are in getHistoricalX/Y.
+If you need every raw sample, for ink or drawing, read the history or request unbuffered dispatch.
+</blockquote>
+
+<!-- ═════════════════════════ PART II ═════════════════════════ -->
+<div class="part">Part II · Producing a frame</div>
+
+<h2 id="vsync"><span class="n">5</span>SurfaceFlinger predicts VSYNC in software and wakes the app and itself at different times</h2>
+<p>SurfaceFlinger does not wake everyone on the hardware VSYNC. It predicts VSYNC in software and wakes each client a set time
+before the VSYNC that client targets. Keeping the hardware VSYNC interrupt on all the time costs power. Waking the app and
+SurfaceFlinger at the same moment would waste a period.</p>
+<p>The prediction is a straight-line fit of VSYNC times, kept honest by the frames that actually reach the screen. The model learns
+from hardware VSYNC, then turns the interrupt off. After that, the times of <b>present fences</b> (Section 9) keep it calibrated.
+If a present fence disagrees with the model, SurfaceFlinger turns hardware VSYNC back on.</p>
+
+<figure>
+<figcaption><b>Figure 7. The VSYNC model learns from the hardware, then runs on feedback from shown frames.</b> The model is
+VSyncPredictor: a linear regression of timestamp against VSYNC count, whose slope is the period and whose intercept is the phase.
+Its sample limits are in Section 14.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 250" role="img" aria-label="VSYNC model feedback loop: hardware VSYNC trains VSyncPredictor, present fences keep it calibrated, a mismatch turns hardware VSYNC back on, and the model schedules VSYNC-app and VSYNC-sf">
+  <rect x="10" y="30" width="210" height="58" rx="3" class="b2"/>
+  <text x="22" y="52" class="tb">Hardware VSYNC</text>
+  <text x="22" y="72" class="ts">interrupt on only while needed</text>
+  <path d="M220,59 L286,59" class="ln" marker-end="url(#ah)"/>
+  <text x="226" y="50" class="ts">timestamps</text>
+
+  <rect x="290" y="22" width="270" height="74" rx="3" class="ba"/>
+  <text x="302" y="44" class="tb">VSyncPredictor</text>
+  <text x="302" y="64" class="ts">line fit: slope = period,</text>
+  <text x="302" y="80" class="ts">intercept = phase</text>
+
+  <path d="M560,44 L646,44" class="lna" marker-end="url(#aha)"/>
+  <path d="M560,74 L646,74" class="lna" marker-end="url(#aha)"/>
+  <rect x="650" y="22" width="200" height="34" rx="3" class="ba"/>
+  <text x="662" y="44" class="t">VSYNC-app (wakes apps)</text>
+  <rect x="650" y="60" width="200" height="34" rx="3" class="bw"/>
+  <text x="662" y="82" class="t">VSYNC-sf (wakes SF)</text>
+
+  <rect x="290" y="150" width="270" height="58" rx="3" class="bg"/>
+  <text x="302" y="172" class="tb">Present fences</text>
+  <text x="302" y="192" class="ts">when each frame really appeared</text>
+  <path d="M425,150 L425,100" class="lng" marker-end="url(#ahg)"/>
+  <text x="432" y="130" class="ts tg">keep the model calibrated</text>
+
+  <path d="M290,179 L115,179 L115,92" class="lnr dash" marker-end="url(#ahr)"/>
+  <text x="124" y="200" class="ts tr">fence disagrees:</text>
+  <text x="124" y="216" class="ts tr">ask for hardware VSYNC again</text>
+  <text x="124" y="232" class="tms">VSyncReactor::addPresentFence</text>
+</svg>
+</figure>
+
+<p>Two clients are scheduled from the model:</p>
+<ul>
+  <li><b>VSYNC-app</b> wakes every Choreographer that asked for a frame. It fires early enough to cover both the app's work and
+  SurfaceFlinger's.</li>
+  <li><b>VSYNC-sf</b> wakes SurfaceFlinger itself, leaving just its own work time before the target VSYNC. It runs commit and
+  composite (Section 10).</li>
+</ul>
+<pre><code><span class="c">// how the two clients are registered (shape)</span>
+<span class="c">// VSYNC-app: the EventThread named "app", SurfaceFlinger's thread that sends VSYNC events to subscribers over a socket</span>
+workDuration  = appWorkDuration;
+readyDuration = sfWorkDuration;     <span class="c">// fires appWorkDuration + sfWorkDuration before the target VSYNC</span>
+<span class="c">// VSYNC-sf: SurfaceFlinger's own MessageQueue callback, registered as "sf"</span>
+workDuration  = sfWorkDuration;     <span class="c">// fires sfWorkDuration before the target VSYNC</span></code></pre>
+<p>Older documentation and properties describe the same schedule as a <b>phase offset</b>: how long after a hardware VSYNC each
+client wakes. AOSP still configures offsets by default and converts them into durations. A device can instead set the durations directly.</p>
+<table>
+  <thead><tr><th>Setting</th><th>Value</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td>sfWorkDuration</td><td>period − sfOffset</td><td>Conversion in <code>impl::PhaseOffsets</code></td></tr>
+    <tr><td>appWorkDuration</td><td>period + sfOffset − appOffset</td><td>Conversion in <code>impl::PhaseOffsets</code></td></tr>
+    <tr><td><code>ro.surface_flinger.vsync_event_phase_offset_ns</code>, <code>vsync_sf_event_phase_offset_ns</code></td><td>1 ms each (default)</td><td>At 60 Hz these give the durations in Figure 8</td></tr>
+    <tr><td><code>debug.sf.use_phase_offsets_as_durations</code></td><td>unset (default)</td><td>When set, SurfaceFlinger uses the work-duration properties instead of converting offsets</td></tr>
+    <tr><td><code>debug.sf.late.sf.duration</code>, <code>debug.sf.late.app.duration</code></td><td>unset (default)</td><td>Set by a device's own configuration to give the durations directly, in nanoseconds</td></tr>
+  </tbody>
+</table>
+
+<figure>
+<figcaption><b>Figure 8. The app wakes just after V0 and must hand SurfaceFlinger a ready buffer by about V1.</b> Drawn to scale
+for 60 Hz with the default durations. Devices tune these durations. During transitions SurfaceFlinger also switches to separate
+"early" durations that give the work more time (VsyncModulator).</figcaption>
+<svg viewBox="0 0 1000 255" role="img" aria-label="VSYNC-app and VSYNC-sf offsets">
+  <text x="10" y="44" class="ts">HW VSYNC (model)</text>
+  <line x1="140" y1="40" x2="990" y2="40" class="ln"/>
+  <line x1="150" y1="30" x2="150" y2="50" class="ln"/><line x1="410" y1="30" x2="410" y2="50" class="ln"/><line x1="670" y1="30" x2="670" y2="50" class="ln"/><line x1="930" y1="30" x2="930" y2="50" class="ln"/>
+  <text x="155" y="26" class="tms">V0</text><text x="415" y="26" class="tms">V1</text><text x="675" y="26" class="tms">V2 target</text><text x="935" y="26" class="tms">V3</text>
+
+  <text x="10" y="94" class="ts">VSYNC-app</text>
+  <line x1="166" y1="70" x2="166" y2="104" class="lna"/>
+  <rect x="166" y="78" width="260" height="24" rx="2" class="ba"/><text x="176" y="94" class="tms">appWorkDuration</text>
+
+  <text x="10" y="144" class="ts">VSYNC-sf</text>
+  <line x1="426" y1="120" x2="426" y2="154" class="lnw"/>
+  <rect x="426" y="128" width="244" height="24" rx="2" class="bw"/><text x="436" y="144" class="tms">sfWorkDuration</text>
+
+  <text x="10" y="194" class="ts">display</text>
+  <rect x="670" y="178" width="260" height="24" class="bg"/><text x="680" y="194" class="tms">frame visible</text>
+
+  <line x1="426" y1="60" x2="426" y2="214" class="lnr dash"/>
+  <text x="432" y="226" class="ts tr">app deadline = target − sfWorkDuration</text>
+  <text x="10" y="248" class="ts">AOSP defaults at 60 Hz (1 ms phase offsets, or unset debug.sf.late.*.duration): sfWorkDuration = period − 1 ms, appWorkDuration = period.</text>
+</svg>
+</figure>
+
+<p>Each VSYNC-app event offers several candidate <b>frame timelines</b>, one period apart. Each has a vsync id, a deadline and an
+expected presentation time, and Choreographer uses the preferred one. The vsync id is the number you see in
+<code>Choreographer#doFrame 123456</code> and in <code>DrawFrames 123456</code> on RenderThread. It is also the name of the
+FrameTimeline slices (Section 12). The candidates travel in VsyncEventData, and the cap is in Section 14.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Your frame budget is not "16.7 ms from doFrame". It is "from VSYNC-app to the deadline", roughly one period with default
+durations. It covers the UI thread, RenderThread and the GPU together.
+</blockquote>
+
+<h2 id="choreographer"><span class="n">6</span>Choreographer runs each frame's work in a fixed order: input, animation, layout, draw</h2>
+<p>Choreographer turns each VSYNC-app event into one ordered pass of work, so a frame is never drawn from half-updated state. An
+app has many sources of per-frame work: input, animators, layout, drawing. If each ran whenever its message reached the front of
+the main thread's queue, a frame could mix old and new state, or lay out the same views twice. There is one Choreographer per
+Looper thread. Code that wants to run on the next frame posts a callback into one of five queues. Choreographer asks for a VSYNC
+only when some queue has work.</p>
+<p>The public form is a <b>frame callback</b>, a Choreographer.FrameCallback posted with postFrameCallback. It runs once in the next frame, in
+the animation queue after input, and receives that frame's VSYNC time.</p>
+<table>
+  <thead><tr><th>Type</th><th>Value</th><th>Trace slice</th><th>Typical users</th></tr></thead>
+  <tbody>
+    <tr><td><code>CALLBACK_INPUT</code></td><td>0</td><td><code>input</code></td><td>Batched input from ViewRootImpl (Section 4)</td></tr>
+    <tr><td><code>CALLBACK_ANIMATION</code></td><td>1</td><td><code>animation</code></td><td><code>postFrameCallback</code>, <code>postVsyncCallback</code>, animators</td></tr>
+    <tr><td><code>CALLBACK_INSETS_ANIMATION</code></td><td>2</td><td><code>insets_animation</code></td><td>Window inset animations, combined into one update</td></tr>
+    <tr><td><code>CALLBACK_TRAVERSAL</code></td><td>3</td><td><code>traversal</code></td><td><code>ViewRootImpl.doTraversal</code>: measure, layout, draw</td></tr>
+    <tr><td><code>CALLBACK_COMMIT</code></td><td>4</td><td><code>commit</code></td><td>Post-draw work; frame time may be adjusted for delays during traversal</td></tr>
+  </tbody>
+</table>
+<p>The order is the point. Input and animations change state first, so that one traversal measures, lays out and records the whole
+frame once.</p>
+
+<figure>
+<figcaption><b>Figure 9. On the UI thread track, doFrame holds the five steps, and draw ends with the hand-off to RenderThread.</b>
+The draw slice is named "draw-" + mTag. Its last part is the hand-off to RenderThread (Section 7).</figcaption>
+<svg viewBox="0 0 1000 130" role="img" aria-label="doFrame slice nesting">
+  <rect x="10" y="20" width="980" height="22" class="b2"/><text x="18" y="35" class="tms">Choreographer#doFrame 5709209</text>
+  <rect x="10" y="46" width="150" height="22" class="ba"/><text x="18" y="61" class="tms">input</text>
+  <rect x="160" y="46" width="160" height="22" class="bv"/><text x="168" y="61" class="tms">animation</text>
+  <rect x="320" y="46" width="130" height="22" class="b"/><text x="328" y="61" class="tms">insets_animation</text>
+  <rect x="450" y="46" width="450" height="22" class="bg"/><text x="458" y="61" class="tms">traversal</text>
+  <rect x="900" y="46" width="90" height="22" class="b"/><text x="908" y="61" class="tms">commit</text>
+  <rect x="460" y="72" width="110" height="22" class="b0"/><text x="468" y="87" class="tms">measure</text>
+  <rect x="570" y="72" width="90" height="22" class="b0"/><text x="578" y="87" class="tms">layout</text>
+  <rect x="660" y="72" width="230" height="22" class="b0"/><text x="668" y="87" class="tms">draw-ViewRootImpl[…]</text>
+  <rect x="800" y="98" width="90" height="22" class="bw"/><text x="806" y="113" class="tms">sync wait</text>
+  <text x="460" y="113" class="ts">records RenderNodes, then syncAndDrawFrame →</text>
+</svg>
+</figure>
+
+<p>If the UI thread starts a frame a full period late or more, Choreographer snaps the frame time forward to the latest VSYNC. The
+trace then shows a "resynced" doFrame slice. When many frames were skipped, it also logs the familiar "Skipped N frames!" warning.</p>
+<pre><code><span class="c">// Choreographer.doFrame (shape)</span>
+if (jitterNanos &gt;= frameIntervalNanos)   <span class="c">// started a full period late or more</span>
+    <span class="c">// snap the frame time to the latest VSYNC; slice "Choreographer#doFrame - resynced to …"</span>
+if (skippedFrames &gt;= SKIPPED_FRAME_WARNING_LIMIT)   <span class="c">// 30 by default, debug.choreographer.skipwarning</span>
+    <span class="c">// logs "Skipped N frames!  The application may be doing too much work on its main thread."</span></code></pre>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Work posted with Handler.post runs between frames and competes with them. Work posted to Choreographer runs inside the frame in a
+known order. A resynced doFrame means the main thread was busy past a whole VSYNC before the frame could even start.
+</blockquote>
+
+<h2 id="renderthread"><span class="n">7</span>The UI thread records what to draw, and RenderThread turns it into GPU commands</h2>
+<p>Since Android 5.0, drawing is split across two threads so the main thread can get back to input sooner. Drawing has two very
+different halves. One decides what to draw: it walks the view tree and runs app code. The other tells the GPU how to draw it: it
+builds command buffers and uploads textures. hwui, Android's native UI renderer, gives each half its own thread.</p>
+<p>The UI thread only <b>records</b>. Each View has a native RenderNode holding a <b>display list</b>: a recorded list of drawing
+operations, such as "draw this text here", that can be replayed later. A RenderNode also holds properties such as translation,
+alpha and clip. The <b>RenderThread</b>, one per app process, turns those display lists into GPU commands.</p>
+<p>Each RenderNode keeps two copies of its state so the two threads never touch the same data. The UI thread writes the staging
+copy (mStagingProperties and mStagingDisplayList), and RenderThread reads the live one. A simple property change, such as
+setTranslationY, marks a staging field dirty without re-recording the display list.</p>
+<p>At the end of draw, the UI thread hands the frame to RenderThread and waits. RenderThread copies the staging state into the live
+tree and uploads new bitmaps. Then it normally releases the UI thread before it starts drawing.</p>
+<pre><code><span class="src">frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp</span><span class="c">// UI thread: ThreadedRenderer.syncAndDrawFrame → DrawFrameTask::postAndWait (blocks on a condition variable)</span>
+void DrawFrameTask::run() {
+    ATRACE_FORMAT("DrawFrames %" PRId64, vsyncId);
+    ...
+    canUnblockUiThread = syncFrameState(info);   <span class="c">// prepareTree: staging → live, upload bitmaps</span>
+    ...
+    if (canUnblockUiThread) unblockUiThread();
+    if (CC_LIKELY(canDrawThisFrame)) context-&gt;draw(solelyTextureViewUpdates);
+    ...
+    <span class="hw">if (!canUnblockUiThread) unblockUiThread();   // texture cache full: UI waits for the draw</span>
+}</code></pre>
+<p>If the texture cache, the GPU memory where hwui keeps uploaded bitmaps, runs out of space, the UI thread stays blocked through the
+whole draw. In code, syncFrameState returns info.prepareTextures, which is false in that case.</p>
+
+<figure>
+<figcaption><b>Figure 10. The UI thread normally waits only for the sync, but blocks longer when RenderThread is still busy with
+the previous frame.</b> A long block in syncAndDrawFrame on frame N+1 usually means RenderThread was still on frame N. It is often
+waiting in dequeueBuffer, the call that takes a free buffer to draw into (Section 8). RenderThread submits the GPU commands and
+queues the buffer before the GPU has run them. A fence covers the rest (Section 9).</figcaption>
+<svg viewBox="0 0 1000 215" role="img" aria-label="UI thread and RenderThread hand-off">
+  <line x1="10" y1="22" x2="10" y2="205" class="ln dash"/><line x1="450" y1="22" x2="450" y2="205" class="ln dash"/><line x1="890" y1="22" x2="890" y2="205" class="ln dash"/>
+  <text x="14" y="18" class="tms">VSYNC-app</text><text x="454" y="18" class="tms">VSYNC-app</text><text x="894" y="18" class="tms">VSYNC-app</text>
+  <text x="16" y="40" class="th">UI thread</text>
+  <rect x="10" y="46" width="320" height="24" rx="2" class="b2"/><text x="18" y="62" class="tms">doFrame N</text>
+  <rect x="330" y="46" width="40" height="24" fill="url(#hatch)" class="hatch-l"/>
+  <rect x="450" y="46" width="110" height="24" rx="2" class="b2"/><text x="458" y="62" class="tms">doFrame N+1</text>
+  <rect x="560" y="46" width="100" height="24" fill="url(#hatchr)" class="hatch-r"/>
+  <text x="680" y="62" class="ts tr">blocked: RenderThread still on N</text>
+  <text x="16" y="112" class="th">RenderThread</text>
+  <rect x="330" y="118" width="40" height="24" class="bw"/>
+  <rect x="370" y="118" width="270" height="24" rx="2" class="ba"/><text x="378" y="134" class="tms">draw N: dequeue, issue, queueBuffer</text>
+  <rect x="640" y="118" width="20" height="24" class="bw"/>
+  <rect x="660" y="118" width="220" height="24" rx="2" class="ba"/><text x="668" y="134" class="tms">draw N+1</text>
+  <path d="M370,116 L370,74" class="lng" marker-end="url(#ahg)"/>
+  <path d="M660,116 L660,74" class="lng" marker-end="url(#ahg)"/>
+  <text x="250" y="158" class="ts">syncFrameState (bars), then unblock</text>
+  <text x="16" y="184" class="th">GPU</text>
+  <rect x="470" y="190" width="230" height="20" rx="2" class="bv"/><text x="478" y="204" class="tms">frame N on GPU</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+When the UI thread looks stuck in syncAndDrawFrame, look at RenderThread at the same moment, not at your view code. The
+cause is almost always on RenderThread or downstream of it.
+</blockquote>
+
+<!-- ═════════════════════════ PART III ═════════════════════════ -->
+<div class="part">Part III · Buffers &amp; composition</div>
+
+<h2 id="blast"><span class="n">8</span>Buffers pass between the app and SurfaceFlinger through a small shared pool, without copies</h2>
+<p>The app and SurfaceFlinger share a small pool of image buffers, so frames change hands without copying. The app draws in one
+process and SurfaceFlinger shows the result in another, at different times. The app must also never draw into an image that is
+still on screen. A <b>BufferQueue</b> solves both. It is a small pool of graphics buffers in shared memory, between a
+<b>producer</b> that draws and a <b>consumer</b> that displays.</p>
+<p>A buffer cycles through four steps. The producer <b>dequeues</b> a free buffer, draws into it, and <b>queues</b> it. The
+consumer <b>acquires</b> it, uses it, and <b>releases</b> it once it is no longer needed.</p>
+<pre><code>dequeueBuffer → draw → queueBuffer → acquireBuffer → use → releaseBuffer   <span class="c">// producer: first three; consumer: last three</span></code></pre>
+<p>SurfaceFlinger composes <b>layers</b>, one per surface. Each layer has a buffer and geometry: position, size, crop and transform.
+Layer changes arrive as a <b>transaction</b> (SurfaceControl.Transaction), a batch that SurfaceFlinger applies atomically, all in
+the same display frame. <b>Latching</b> is SurfaceFlinger taking a layer's newest ready buffer for the frame it is about to compose.</p>
+<p>Since Android 12, <b>BLAST</b> lets an app window's buffer and geometry change land in the same frame. BLAST stands for buffer
+as layer state. Before it, SurfaceFlinger owned each window's queue consumer, while window geometry travelled separately in
+transactions. A new buffer and a new size could therefore land on different frames, the "bounce" below. With BLAST,
+BLASTBufferQueue runs the consumer side inside the app. It acquires each queued buffer and sends it to SurfaceFlinger as one more
+field of a transaction.</p>
+<pre><code><span class="src">frameworks/native/libs/gui/BLASTBufferQueue.cpp · acquireNextBufferLocked</span>t-&gt;setBuffer(mSurfaceControl, buffer, fence, bufferItem.mFrameNumber, mProducerId,
+             releaseBufferCallback, dequeueTime);     <span class="c">// fence = the acquire fence</span>
+t-&gt;setDataspace(...); t-&gt;setBufferCrop(mSurfaceControl, crop); t-&gt;setTransform(...);
+...
+t-&gt;addTransactionCompletedCallback(makeTransactionCallbackThunk(), nullptr);</code></pre>
+
+<figure>
+<figcaption><b>Figure 11. A buffer goes out with an acquire fence and comes back with a release fence.</b> BBQ is
+BLASTBufferQueue. The acquire fence says when the GPU has finished drawing the buffer. The release fence says when the display has
+stopped reading it (Section 9). The pool size is the buffering depth. With two buffers (double buffering), the app can draw only
+while the other one is on screen. A third (triple buffering) lets one buffer be on screen, one wait in a transaction and one be
+drawn, so a single slow frame does not stall the app.</figcaption>
+<svg viewBox="0 0 1000 220" role="img" aria-label="Buffer lifecycle with BLAST">
+  <text x="10" y="22" class="th">app process</text><text x="610" y="22" class="th">SurfaceFlinger</text>
+  <rect x="10" y="32" width="180" height="70" rx="2" class="b0"/><text x="20" y="54" class="tb">FREE</text><text x="20" y="72" class="ts">slot in the app's queue</text><text x="20" y="88" class="ts">may carry a release fence</text>
+  <path d="M190,67 L206,67" class="ln" marker-end="url(#ah)"/>
+  <rect x="210" y="32" width="180" height="70" rx="2" class="ba"/><text x="220" y="54" class="tb">DEQUEUED</text><text x="220" y="72" class="ts">RenderThread draws into it</text><text x="220" y="88" class="ts">GPU may still be writing</text>
+  <path d="M390,67 L406,67" class="ln" marker-end="url(#ah)"/>
+  <rect x="410" y="32" width="180" height="70" rx="2" class="bw"/><text x="420" y="54" class="tb">QUEUED</text><text x="420" y="72" class="ts">queued with acquire fence</text><text x="420" y="88" class="ts">BBQ acquires it</text>
+  <path d="M590,67 L606,67" class="ln" marker-end="url(#ah)"/>
+  <rect x="610" y="32" width="180" height="70" rx="2" class="bv"/><text x="620" y="54" class="tb">IN TRANSACTION</text><text x="620" y="72" class="ts">waits to be latched</text><text x="620" y="88" class="ts">then on screen</text>
+  <path d="M790,67 L806,67" class="ln" marker-end="url(#ah)"/>
+  <rect x="810" y="32" width="180" height="70" rx="2" class="bg"/><text x="820" y="54" class="tb">REPLACED</text><text x="820" y="72" class="ts">a newer buffer latched</text><text x="820" y="88" class="ts">release fence pending</text>
+  <path d="M900,102 L900,140 L100,140 L100,106" class="lng dash" marker-end="url(#ahg)"/>
+  <text x="300" y="158" class="ts tg">releaseBufferCallback: the buffer returns to the app with its release fence</text>
+  <text x="10" y="190" class="ts">Buffer count = NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS + 2 (hwui setBufferCount). The minimum depends on how many buffers SurfaceFlinger</text>
+  <text x="10" y="206" class="ts">may hold, which grows with the refresh rate (calculateMaxAcquiredBufferCount). Three in total is common at 60 Hz, not a fixed rule.</text>
+</svg>
+</figure>
+
+<p>Two BLAST settings matter for jank. First, BLAST sets an infinite dequeue timeout, so dequeueBuffer blocks when no buffer is
+free. Second, BLAST layers turn on backpressure (eEnableBackpressure), so one layer advances at most one buffer per SurfaceFlinger
+frame. If SurfaceFlinger already has a ready buffer for that layer in the current frame, the next buffer transaction waits. The
+trace shows this as <code>hasPendingBuffer &lt;layer&gt;</code> on SurfaceFlinger's main thread. In the app process, the counter
+<code>QueuedBuffer - &lt;name&gt;BLAST#&lt;id&gt;</code> shows how many buffers are in flight.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A RenderThread stuck in dequeueBuffer is waiting for SurfaceFlinger to release a buffer. The queue is full because the app
+is ahead of the display, not because the app is slow at that moment.
+</blockquote>
+
+<h3 id="bounce">BLAST fixed the resize bounce by applying the new buffer and the new size together</h3>
+<p>Before BLAST, a resized window could briefly show old content inside its new bounds. Two owners decide what a window shows. The
+window manager (WM) in system_server decides where the window is and how big. The app decides what is drawn inside, and needs a
+frame or more to lay out and render at a new size. Before BLAST these travelled on two channels. WM changed the layer's size and
+crop with a transaction. The app's buffers reached SurfaceFlinger's own queue consumer, which latched them whenever they were
+ready.</p>
+<p>The two rarely landed on the same display frame. For a frame or two, SurfaceFlinger showed the old-size buffer inside the new
+bounds: stretched, cropped, or with a strip of background. Then the new-size buffer arrived and the content snapped into place.
+During a resize animation this repeats every frame, so the content visibly wobbles against its own window edge. That artefact is
+the <b>bounce</b>. The BLAST code still spells out the hazard. In freeze scaling mode (below) it refuses to move the destination
+bounds before a matching buffer exists:</p>
+<pre><code><span class="src">frameworks/native/libs/gui/BLASTBufferQueue.cpp · acquireNextBufferLocked</span><span class="c">// Only update mSize for destination bounds if the incoming buffer matches the requested size.</span>
+<span class="c">// Otherwise, it could cause stretching since the destination bounds will update before the</span>
+<span class="c">// buffer with the new size is acquired.</span>
+if (mRequestedSize == getBufferSize(bufferItem) ||
+    bufferItem.mScalingMode != NATIVE_WINDOW_SCALING_MODE_FREEZE) {
+    mSize = mRequestedSize;
+}</code></pre>
+
+<figure>
+<figcaption><b>Figure 12. With BLAST a resize may appear a frame later, but never half-done.</b> Before BLAST the bounds change on
+frame 2, but the matching buffer arrives only on frame 3, so frame 2 shows a mismatch. With BLAST the window manager holds its
+change until the app's first new-size buffer is ready, then applies both in one transaction.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Resize before and with BLAST">
+  <text x="186" y="16" class="tms">SF frame 1</text><text x="386" y="16" class="tms">SF frame 2</text>
+  <text x="586" y="16" class="tms">SF frame 3</text><text x="786" y="16" class="tms">SF frame 4</text>
+  <line x1="180" y1="22" x2="180" y2="240" class="ln dash"/><line x1="380" y1="22" x2="380" y2="240" class="ln dash"/>
+  <line x1="580" y1="22" x2="580" y2="240" class="ln dash"/><line x1="780" y1="22" x2="780" y2="240" class="ln dash"/>
+  <line x1="980" y1="22" x2="980" y2="240" class="ln dash"/>
+
+  <text x="10" y="40" class="th">before BLAST</text>
+  <text x="10" y="63" class="ts">window bounds (WM)</text>
+  <rect x="180" y="48" width="200" height="22" class="b"/><text x="190" y="63" class="tms">old size</text>
+  <rect x="380" y="48" width="600" height="22" class="bw"/><text x="390" y="63" class="tms">new size, applied at once</text>
+  <text x="10" y="91" class="ts">app buffer</text>
+  <rect x="180" y="76" width="400" height="22" class="b"/><text x="190" y="91" class="tms">old-size buffer (app still redrawing)</text>
+  <rect x="580" y="76" width="400" height="22" class="bg"/><text x="590" y="91" class="tms">new-size buffer</text>
+  <text x="10" y="119" class="ts">on screen</text>
+  <rect x="180" y="104" width="200" height="22" class="b"/><text x="190" y="119" class="tms">consistent</text>
+  <rect x="380" y="104" width="200" height="22" class="br"/><text x="390" y="119" class="tms">stretched or cropped</text>
+  <rect x="580" y="104" width="400" height="22" class="bg"/><text x="590" y="119" class="tms">consistent</text>
+
+  <text x="10" y="152" class="th">with BLAST</text>
+  <text x="10" y="175" class="ts">window bounds (WM)</text>
+  <rect x="180" y="160" width="400" height="22" class="b"/><text x="190" y="175" class="tms">old size (change held back)</text>
+  <rect x="580" y="160" width="400" height="22" class="bv"/><text x="590" y="175" class="tms">new size</text>
+  <text x="10" y="203" class="ts">app buffer</text>
+  <rect x="180" y="188" width="400" height="22" class="b"/><text x="190" y="203" class="tms">old-size buffer (app still redrawing)</text>
+  <rect x="580" y="188" width="400" height="22" class="bv"/><text x="590" y="203" class="tms">new-size buffer, same transaction</text>
+  <text x="10" y="231" class="ts">on screen</text>
+  <rect x="180" y="216" width="400" height="22" class="b"/><text x="190" y="231" class="tms">old content in old bounds</text>
+  <rect x="580" y="216" width="400" height="22" class="bg"/><text x="590" y="231" class="tms">new content in new bounds</text>
+</svg>
+</figure>
+
+<p>BLAST makes this fix possible because a buffer is now a transaction field, so it can be merged with any other transaction. The
+protocol that uses it is <b>BLAST sync</b>, run by BLASTSyncEngine in WM and described in
+<code>services/core/java/com/android/server/wm/BLASTSync.md</code>.
+Figure 13 shows the three steps.</p>
+
+<figure>
+<figcaption><b>Figure 13. BLAST sync: WM tags the change, the app draws one frame into a transaction, and WM applies it together
+with the new geometry.</b> The sync sequence id ties the app's buffer to the window change that asked for it.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 300" role="img" aria-label="BLAST sync sequence between the window manager, the app and SurfaceFlinger">
+  <text x="90" y="20" class="th">window manager</text>
+  <text x="420" y="20" class="th">app</text>
+  <text x="700" y="20" class="th">SurfaceFlinger</text>
+  <line x1="130" y1="30" x2="130" y2="290" class="ln dash"/>
+  <line x1="440" y1="30" x2="440" y2="290" class="ln dash"/>
+  <line x1="740" y1="30" x2="740" y2="290" class="ln dash"/>
+
+  <rect x="20" y="40" width="220" height="44" rx="3" class="b2"/>
+  <text x="30" y="58" class="t">1. change size or config</text>
+  <text x="30" y="75" class="ts">bump the window's sync seq id</text>
+  <path d="M240,62 L436,62" class="lna" marker-end="url(#aha)"/>
+  <text x="252" y="56" class="ts">change + seq id</text>
+
+  <rect x="300" y="96" width="280" height="62" rx="3" class="ba"/>
+  <text x="310" y="114" class="t">2. next traversal sees the new id</text>
+  <text x="310" y="131" class="tms">createSyncIfNeeded → SurfaceSyncGroup</text>
+  <text x="310" y="148" class="ts">next buffer goes into a transaction</text>
+  <text x="590" y="122" class="ts">not sent to SF</text>
+  <text x="590" y="138" class="tms">syncNextTransaction</text>
+
+  <rect x="300" y="172" width="280" height="44" rx="3" class="ba"/>
+  <text x="310" y="190" class="tms">reportDrawFinished</text>
+  <text x="310" y="207" class="ts">finishDrawing(window, transaction, seqId)</text>
+  <path d="M300,194 L244,194" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="20" y="172" width="220" height="44" rx="3" class="b2"/>
+  <text x="30" y="190" class="t">3. merge buffer transaction</text>
+  <text x="30" y="207" class="ts">with WM's geometry changes</text>
+  <path d="M130,216 L130,246 L736,246" class="lng" marker-end="url(#ahg)"/>
+  <text x="300" y="240" class="ts tg">one merged transaction</text>
+  <rect x="640" y="256" width="200" height="34" rx="3" class="bg"/>
+  <text x="652" y="278" class="t">buffer + bounds, same frame</text>
+</svg>
+</figure>
+
+<p>Separately, hwui sets freeze scaling mode on its surfaces (NATIVE_WINDOW_SCALING_MODE_FREEZE). In that mode, BLASTBufferQueue
+keeps the destination size at the old value until a buffer of the requested size arrives. It also rejects buffers whose size
+matches neither (rejectBuffer), so a stale buffer is never stretched into new bounds.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A resize, rotation or window transition now waits for your first frame at the new size. A slow performTraversals after a
+configuration change shows up as a delayed transition, not as a stretched frame. With the view trace category on, the
+<code>&lt;window&gt;-reportDrawFinished seqId=N</code> instant on the main thread marks when your synced frame was handed back.
+</blockquote>
+
+<h2 id="fences"><span class="n">9</span>Fences let each stage hand work on before the hardware has finished it</h2>
+<p>Every hand-off carries a <b>fence</b>, so CPU threads wait for the GPU or the display only when they need the data. A fence is a
+kernel sync_file: a file descriptor (fd) that signals once some hardware work is done. Without fences, RenderThread would wait for the GPU before
+handing over a buffer, and SurfaceFlinger would wait for the panel before releasing one. The pipeline would run one step at a time.
+An fd can be passed to another process cheaply. The receiver waits only when it actually needs the data, often on the GPU rather than the CPU.</p>
+<table>
+  <thead><tr><th>Fence</th><th>Created by → given to</th><th>Signals when</th><th>Used for</th></tr></thead>
+  <tbody>
+    <tr><td><b>acquire</b></td><td>App GPU driver → SurfaceFlinger, in <code>setBuffer</code></td><td>The GPU finished writing the buffer</td><td>SF should not latch before it signals (see below). FrameTimeline uses it as the app's actual end time.</td></tr>
+    <tr><td><b>present</b></td><td>HWC (display driver) → SurfaceFlinger, per display frame</td><td>The composed frame starts being shown</td><td>FrameTimeline's actual present time; calibrates <code>VSyncPredictor</code> (Section 5).</td></tr>
+    <tr><td><b>release</b></td><td>HWC / SF → app, in the release callback</td><td>The display (or SF's GPU) stopped reading the old buffer</td><td>The app's GPU waits on it before overwriting the buffer.</td></tr>
+  </tbody>
+</table>
+
+<figure>
+<figcaption><b>Figure 14. RenderThread queues buffer B while the GPU is still drawing it, and SurfaceFlinger latches B once its
+acquire fence signals.</b> The AutoSingleLayer exception is below. Buffer A goes back to the app with a release fence before it is
+free. The app may start the next frame in A and let the GPU wait.</figcaption>
+<svg viewBox="0 0 1000 205" role="img" aria-label="Fence timeline">
+  <text x="10" y="44" class="ts">app RenderThread</text>
+  <text x="10" y="84" class="ts">app GPU</text>
+  <text x="10" y="124" class="ts">SurfaceFlinger</text>
+  <text x="10" y="164" class="ts">display</text>
+  <rect x="150" y="30" width="110" height="22" rx="2" class="ba"/><text x="158" y="45" class="tms">draw buffer B</text>
+  <line x1="260" y1="26" x2="260" y2="56" class="lna"/><text x="266" y="45" class="tms">queueBuffer(B, acquire)</text>
+  <rect x="200" y="70" width="210" height="22" rx="2" class="bv"/><text x="208" y="85" class="tms">GPU renders B</text>
+  <circle cx="410" cy="81" r="5" class="fg"/><text x="420" y="85" class="ts tg">acquire fence signals</text>
+  <rect x="560" y="110" width="120" height="22" rx="2" class="bw"/><text x="568" y="125" class="tms">latch B, present</text>
+  <rect x="150" y="150" width="610" height="22" class="b"/><text x="158" y="165" class="tms">buffer A on screen</text>
+  <rect x="760" y="150" width="230" height="22" class="bg"/><text x="768" y="165" class="tms">buffer B on screen</text>
+  <circle cx="760" cy="161" r="5" class="fg"/>
+  <text x="610" y="194" class="ts">present fence (B shown) and release fence (A free) signal here</text>
+  <line x1="760" y1="140" x2="760" y2="180" class="lng dash"/>
+</svg>
+</figure>
+
+<p>SurfaceFlinger normally skips a buffer whose GPU work is not done, so one slow layer cannot make it miss its deadline for every
+layer. The trace then shows <code>fence unsignaled &lt;layer&gt;</code>, and the transaction waits for a later frame. The default
+exception is AutoSingleLayer. If a single layer is updating with a simple buffer-only change, SurfaceFlinger may latch it anyway and
+let HWC wait on the fence. Perfetto records the outcome for each frame in latched_fence_state. The setting and the three outcome
+values are in Section 14.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+RenderThread finishing on time is not enough. The frame is ready when the GPU finishes, which is when the acquire fence signals.
+GPU-heavy frames miss deadlines with an idle CPU.
+</blockquote>
+
+<h2 id="sf"><span class="n">10</span>The display hardware blends most layers itself, and SurfaceFlinger uses the GPU only for the rest</h2>
+<p>Phones blend most layers in the display controller while scanning out, and SurfaceFlinger uses the GPU only for layers the
+hardware cannot handle. The panel shows one image, but the screen is made of many layers: the app, the status bar, the navigation
+bar, the wallpaper, perhaps a dialog. Combining them is <b>composition</b>. Doing it on the GPU every frame costs power and GPU time.</p>
+<p>On VSYNC-sf, SurfaceFlinger's main thread runs two steps. <b>Commit</b> applies ready transactions: it latches buffers, updates
+geometry and works out what changed. <b>Composite</b> builds the frame for each display and hands it to the <b>Hardware
+Composer</b> (HWC). HWC is the display's hardware abstraction layer (HAL), the vendor-implemented interface to the display controller.</p>
+<p>HWC picks a composition type for each layer. With <b>DEVICE</b>, the display hardware reads the layer's buffer directly into an
+<b>overlay plane</b>, a hardware layer it blends on the fly during scanout. With <b>CLIENT</b>, SurfaceFlinger's RenderEngine first
+draws the layer on the GPU into a single <b>client target</b> buffer, which HWC then shows. A few rarer types exist (Section 14).</p>
+
+<figure>
+<figcaption><b>Figure 15. Simple layers go straight to hardware planes, while effects such as blur go through the GPU.</b> This is
+an example split. HWC decides which layers go to CLIENT, based on the display hardware: number of planes, supported scaling,
+rotation, blending and effects such as blur.</figcaption>
+<svg viewBox="0 0 1000 220" role="img" aria-label="Device vs client composition">
+  <text x="10" y="20" class="th">visible layers</text>
+  <rect x="10" y="30" width="220" height="30" rx="2" class="b0"/><text x="20" y="50" class="tms">status bar</text>
+  <rect x="10" y="66" width="220" height="30" rx="2" class="b0"/><text x="20" y="86" class="tms">app window</text>
+  <rect x="10" y="102" width="220" height="30" rx="2" class="b0"/><text x="20" y="122" class="tms">navigation bar</text>
+  <rect x="10" y="138" width="220" height="30" rx="2" class="b0"/><text x="20" y="158" class="tms">dialog with background blur</text>
+  <rect x="10" y="174" width="220" height="30" rx="2" class="b0"/><text x="20" y="194" class="tms">wallpaper</text>
+  <text x="620" y="20" class="th">HWC output</text>
+  <rect x="620" y="30" width="370" height="30" rx="2" class="bg"/><text x="630" y="50" class="tms">DEVICE plane: status bar</text>
+  <rect x="620" y="66" width="370" height="30" rx="2" class="bg"/><text x="630" y="86" class="tms">DEVICE plane: app window</text>
+  <rect x="620" y="102" width="370" height="30" rx="2" class="bg"/><text x="630" y="122" class="tms">DEVICE plane: navigation bar</text>
+  <rect x="380" y="150" width="190" height="40" rx="2" class="bw"/><text x="390" y="167" class="tms">RenderEngine (GPU)</text><text x="390" y="183" class="ts">CLIENT layers</text>
+  <rect x="620" y="155" width="370" height="30" rx="2" class="bw"/><text x="630" y="175" class="tms">client target: blur dialog + wallpaper</text>
+  <path d="M230,45 L616,45" class="lng" marker-end="url(#ahg)"/>
+  <path d="M230,81 L616,81" class="lng" marker-end="url(#ahg)"/>
+  <path d="M230,117 L616,117" class="lng" marker-end="url(#ahg)"/>
+  <path d="M230,153 L376,165" class="lnw" marker-end="url(#ahw)"/>
+  <path d="M230,189 L376,177" class="lnw" marker-end="url(#ahw)"/>
+  <path d="M570,170 L616,170" class="lnw" marker-end="url(#ahw)"/>
+</svg>
+</figure>
+<p>Client composition costs GPU time and memory bandwidth inside SurfaceFlinger's budget. FrameTimeline marks such frames with
+<code>gpu_composition = 1</code>. Slow GPU composition shows up as SurfaceFlinger GPU Deadline Missed.</p>
+<p>Each frame, SurfaceFlinger and HWC exchange two commands. Validate sends the layer list and gets back HWC's choice for each
+layer. Present queues the frame for the next scanout and hands back the fences (Section 9).</p>
+
+<figure>
+<figcaption><b>Figure 16. SurfaceFlinger asks HWC to validate the layers, renders any CLIENT layers, then presents.</b> The commands
+are in DisplayCommand.aidl. A combined presentOrValidateDisplay also exists, which can do both steps in one call.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 236" role="img" aria-label="validateDisplay and presentDisplay exchange between SurfaceFlinger and HWC">
+  <text x="130" y="20" class="th">SurfaceFlinger</text>
+  <text x="620" y="20" class="th">HWC (display HAL)</text>
+  <line x1="180" y1="30" x2="180" y2="226" class="ln dash"/>
+  <line x1="670" y1="30" x2="670" y2="226" class="ln dash"/>
+
+  <path d="M180,50 L666,50" class="lna" marker-end="url(#aha)"/>
+  <text x="196" y="44" class="tms">validateDisplay</text>
+  <text x="330" y="44" class="ts">the layer list</text>
+  <path d="M670,82 L184,82" class="lna" marker-end="url(#aha)"/>
+  <text x="420" y="76" class="ts">a composition type for each layer</text>
+
+  <rect x="20" y="98" width="320" height="40" rx="3" class="bw"/>
+  <text x="32" y="116" class="t">any CLIENT layer?</text>
+  <text x="32" y="131" class="ts">RenderEngine draws them into the client target</text>
+
+  <path d="M180,160 L666,160" class="lna" marker-end="url(#aha)"/>
+  <text x="196" y="154" class="tms">presentDisplay</text>
+  <path d="M670,196 L184,196" class="lng" marker-end="url(#ahg)"/>
+  <text x="280" y="190" class="ts tg">present fence + release fences for the replaced buffers</text>
+  <rect x="690" y="144" width="160" height="34" rx="3" class="bg"/>
+  <text x="702" y="166" class="t">queued for scanout</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Effects that the display controller cannot do push layers to CLIENT composition: blur, unusual blending or scaling, more layers than
+planes. That moves cost onto the GPU inside SurfaceFlinger. In a trace, frames with gpu_composition = 1 or long RenderEngine work
+on SurfaceFlinger point there, not at the app's draw.
+</blockquote>
+
+<!-- ═════════════════════════ PART IV ═════════════════════════ -->
+<div class="part">Part IV · Jank</div>
+
+<h2 id="stuffing"><span class="n">11</span>One late frame can leave every later frame a period behind: buffer stuffing</h2>
+<p><b>Buffer stuffing</b> is when the app has more finished buffers queued than the display can take on schedule. It usually
+starts with one late frame. Figure 17 follows four frames at 60 Hz, using the simple schedule from Section 5. Frame k starts at
+Vk, must be ready one VSYNC later, and is expected on screen one VSYNC after that.</p>
+
+<figure>
+<figcaption><b>Figure 17. One slow GPU frame causes one visible repeat, then every frame arrives a period late.</b> f1's CPU work
+is short, but its GPU work runs past V2. At V2 SurfaceFlinger has nothing new, so the panel repeats f0 at V3: the one visible
+hitch. f2 and f3 finish on time. But backpressure lets SurfaceFlinger take only one buffer per frame, and f1 is first in line. From
+V4 on, a new frame appears every VSYNC, each one period later than planned.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="Buffer stuffing timeline">
+  <text x="154" y="18" class="tms">V0</text><text x="274" y="18" class="tms">V1</text><text x="394" y="18" class="tms">V2</text><text x="514" y="18" class="tms">V3</text>
+  <text x="634" y="18" class="tms">V4</text><text x="754" y="18" class="tms">V5</text><text x="874" y="18" class="tms">V6</text><text x="970" y="18" class="tms">V7</text>
+  <line x1="150" y1="24" x2="150" y2="232" class="ln dash"/><line x1="270" y1="24" x2="270" y2="232" class="ln dash"/><line x1="390" y1="24" x2="390" y2="232" class="ln dash"/>
+  <line x1="510" y1="24" x2="510" y2="232" class="ln dash"/><line x1="630" y1="24" x2="630" y2="232" class="ln dash"/><line x1="750" y1="24" x2="750" y2="232" class="ln dash"/>
+  <line x1="870" y1="24" x2="870" y2="232" class="ln dash"/><line x1="990" y1="24" x2="990" y2="232" class="ln dash"/>
+
+  <text x="10" y="46" class="ts">UI + RenderThread</text>
+  <rect x="150" y="32" width="65" height="22" rx="2" class="ba"/><text x="158" y="47" class="tms">f0</text>
+  <rect x="270" y="32" width="60" height="22" rx="2" class="ba"/><text x="278" y="47" class="tms">f1</text>
+  <rect x="390" y="32" width="60" height="22" rx="2" class="ba"/><text x="398" y="47" class="tms">f2</text>
+  <rect x="510" y="32" width="60" height="22" rx="2" class="ba"/><text x="518" y="47" class="tms">f3</text>
+
+  <text x="10" y="86" class="ts">GPU</text>
+  <rect x="185" y="72" width="60" height="22" rx="2" class="bv"/><text x="193" y="87" class="tms">f0</text>
+  <rect x="300" y="72" width="120" height="22" rx="2" class="br"/><text x="308" y="87" class="tms">f1 (slow)</text>
+  <rect x="420" y="72" width="60" height="22" rx="2" class="bv"/><text x="428" y="87" class="tms">f2</text>
+  <rect x="540" y="72" width="60" height="22" rx="2" class="bv"/><text x="548" y="87" class="tms">f3</text>
+
+  <text x="10" y="126" class="ts">SF latches</text>
+  <rect x="270" y="112" width="40" height="22" rx="2" class="bw"/><text x="280" y="127" class="tms">f0</text>
+  <rect x="390" y="112" width="40" height="22" rx="2" class="br"/><text x="402" y="127" class="tms">—</text>
+  <rect x="510" y="112" width="40" height="22" rx="2" class="bw"/><text x="520" y="127" class="tms">f1</text>
+  <rect x="630" y="112" width="40" height="22" rx="2" class="bw"/><text x="640" y="127" class="tms">f2</text>
+  <rect x="750" y="112" width="40" height="22" rx="2" class="bw"/><text x="760" y="127" class="tms">f3</text>
+
+  <text x="10" y="166" class="ts">display</text>
+  <rect x="150" y="152" width="240" height="22" fill="url(#hatch)" class="hatch-l"/>
+  <rect x="390" y="152" width="120" height="22" class="b"/><text x="398" y="167" class="tms">f0</text>
+  <rect x="510" y="152" width="120" height="22" class="br"/><text x="518" y="167" class="tms">f0 again</text>
+  <rect x="630" y="152" width="120" height="22" class="bg"/><text x="638" y="167" class="tms">f1</text>
+  <rect x="750" y="152" width="120" height="22" class="bg"/><text x="758" y="167" class="tms">f2</text>
+  <rect x="870" y="152" width="120" height="22" class="bg"/><text x="878" y="167" class="tms">f3</text>
+
+  <text x="10" y="206" class="ts">ready, not latched</text>
+  <rect x="480" y="194" width="150" height="10" class="bw"/>
+  <rect x="600" y="210" width="150" height="10" class="bw"/>
+  <text x="462" y="203" class="tms">f2</text><text x="582" y="219" class="tms">f3</text>
+
+  <text x="270" y="254" class="ts tr">f1 · App Deadline Missed: GPU done after V2, expected V3, shown V4</text>
+  <text x="390" y="270" class="ts tw">f2 · Buffer Stuffing: deadline V3 = f1's latch, expected V4, shown V5</text>
+  <text x="510" y="286" class="ts tw">f3 · Buffer Stuffing: deadline V4 = f2's latch, expected V5, shown V6</text>
+</svg>
+</figure>
+
+<p>Once stuffed, the queue stays one buffer deep until the app pauses for a frame. The animation looks smooth, but every frame
+carries one extra period of touch-to-display latency. If another frame is late while stuffed, all buffers are in use and
+RenderThread blocks in dequeueBuffer.</p>
+<p>As of Android 17, Choreographer can recover from stuffing on its own. When RenderThread waits too long for a buffer release,
+Choreographer skips one VSYNC to drain a buffer. It then shifts animation time back by one frame until the animation goes idle.
+The trace shows a Buffer stuffing recovery track.</p>
+
+<figure>
+<figcaption><b>Figure 18. Stuffing recovery: detect a long buffer wait, skip one VSYNC, then run animations one frame behind.</b>
+One recovery per animation is built in. Recovering again within the same animation, and the 100 ms cap on accumulated delay,
+are behind feature flags (bufferStuffingMultiRecovery, bufferStuffingRecoveryThreshold). hwui reports how long RenderThread waited for a buffer
+release.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 128" role="img" aria-label="Buffer stuffing recovery steps in Choreographer">
+  <rect x="10" y="20" width="200" height="72" rx="3" class="bw"/>
+  <text x="22" y="42" class="tb">1. Detect</text>
+  <text x="22" y="62" class="ts">buffer-release wait longer</text>
+  <text x="22" y="78" class="ts">than half a frame interval</text>
+  <path d="M210,56 L226,56" class="ln" marker-end="url(#ah)"/>
+  <rect x="230" y="20" width="190" height="72" rx="3" class="bw"/>
+  <text x="242" y="42" class="tb">2. Mark stuffed</text>
+  <text x="242" y="62" class="tms">onWaitForBufferRelease</text>
+  <path d="M420,56 L436,56" class="ln" marker-end="url(#ah)"/>
+  <rect x="440" y="20" width="190" height="72" rx="3" class="ba"/>
+  <text x="452" y="42" class="tb">3. Skip one VSYNC</text>
+  <text x="452" y="62" class="ts">next doFrame drains a buffer</text>
+  <text x="452" y="78" class="tms">DELAY_FRAME</text>
+  <path d="M630,56 L646,56" class="ln" marker-end="url(#ah)"/>
+  <rect x="650" y="20" width="200" height="72" rx="3" class="bg"/>
+  <text x="662" y="42" class="tb">4. Offset animations</text>
+  <text x="662" y="62" class="ts">time back one frame until idle</text>
+  <text x="662" y="78" class="tms">OFFSET</text>
+  <text x="10" y="116" class="ts">With the threshold flag on, accumulated delay is capped at 100 ms.</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Do not optimize the frames tagged Buffer Stuffing. They were on time. Find the first late frame before the run, here f1, and fix
+that. Then decide whether the extra period of latency matters for your interaction.
+</blockquote>
+
+<h2 id="frametimeline"><span class="n">12</span>FrameTimeline compares each frame's plan with what happened, and says whose fault a late frame was</h2>
+<p>FrameTimeline records, for every frame, what the scheduler planned and what actually happened. That tells you which frames
+the user saw stutter, and who caused it. A long doFrame does not prove the user saw a stutter. A stutter may also have nothing to
+do with the app. <b>FrameTimeline</b> is a SurfaceFlinger module in Android 12 and later. It records a <b>SurfaceFrame</b> for each
+app buffer or transaction, and a <b>DisplayFrame</b> for each SurfaceFlinger frame. Perfetto shows them as each process's
+<b>Expected Timeline</b> and <b>Actual Timeline</b> tracks, from the tables expected_frame_timeline_slice and
+actual_frame_timeline_slice.</p>
+
+<h3 id="ft-slices">An app's actual slice ends when its buffer is ready, not when it is shown</h3>
+<p>For an app frame, neither slice runs from start to present. Present time is an attribute of the slice instead.</p>
+<ul>
+  <li><b>Expected</b> runs from the predicted start, the VSYNC-app wake-up, to the predicted <b>deadline</b>
+  (mPredictions.endTime).</li>
+  <li><b>Actual</b> runs from the start of Choreographer#doFrame to the moment the buffer was both queued and finished on the GPU.
+  In code that is max(acquire fence time, queue time), set in SurfaceFrame::setAcquireFenceTime. Dropped frames end at the drop
+  time.</li>
+</ul>
+
+<figure>
+<figcaption><b>Figure 19. The expected slice ends at the deadline, the actual slice ends when the buffer is ready, and present
+time is a separate attribute.</b> Here the frame finished late, so its actual slice runs past the deadline. Present time is read from
+present_type and Present Delay (ms).</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 196" role="img" aria-label="Expected and actual FrameTimeline slices for an app frame, and where present time sits">
+  <line x1="200" y1="24" x2="200" y2="168" class="ln dash"/>
+  <line x1="520" y1="24" x2="520" y2="168" class="lnr dash"/>
+  <line x1="760" y1="24" x2="760" y2="168" class="ln dash"/>
+  <text x="204" y="18" class="tms">VSYNC-app</text>
+  <text x="524" y="18" class="tms tr">deadline</text>
+  <text x="764" y="18" class="tms">present</text>
+
+  <text x="10" y="56" class="ts">Expected Timeline</text>
+  <rect x="200" y="40" width="320" height="24" rx="2" class="b2"/>
+  <text x="210" y="56" class="tms">predicted start → deadline</text>
+
+  <text x="10" y="102" class="ts">Actual Timeline</text>
+  <rect x="226" y="86" width="374" height="24" rx="2" class="br"/>
+  <text x="236" y="102" class="tms">doFrame start → buffer ready</text>
+  <text x="604" y="102" class="ts">max(acquire fence, queue)</text>
+
+  <text x="10" y="148" class="ts">present (attribute)</text>
+  <circle cx="760" cy="144" r="5" class="fg"/>
+  <text x="560" y="148" class="ts">present_type, Present Delay</text>
+  <text x="10" y="186" class="ts">For SurfaceFlinger's DisplayFrames, the actual slice does run from SurfaceFlinger's wake-up to the screen update.</text>
+</svg>
+</figure>
+
+<h3 id="ft-classify">The legacy rules sort late frames by whether the app finished late</h3>
+<p>A frame counts as presented on time if it is within 2 ms of the prediction. It finished late if it finished any time after its
+deadline. The deadline-based logic, now called the legacy classification, is Figure 20. The exact thresholds are in Section 14.</p>
+
+<figure>
+<figcaption><b>Figure 20. Legacy classification: a late present is the app's fault only if the app also finished late.</b> This
+is classifyJankLegacyLocked. How these reasons become one jank tag is in Figure 21.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 262" role="img" aria-label="Legacy FrameTimeline classification rules mapping conditions to jank types">
+  <text x="10" y="18" class="th">condition</text>
+  <text x="560" y="18" class="th">jank_type</text>
+
+  <rect x="10" y="28" width="520" height="40" rx="3" class="b0"/>
+  <text x="22" y="53" class="t">Presented on time</text>
+  <path d="M530,48 L556,48" class="ln" marker-end="url(#ah)"/>
+  <rect x="560" y="28" width="290" height="40" rx="3" class="bg"/>
+  <text x="572" y="53" class="t">None</text>
+
+  <rect x="10" y="78" width="520" height="40" rx="3" class="b0"/>
+  <text x="22" y="103" class="t">Presented late and finished late</text>
+  <path d="M530,98 L556,98" class="ln" marker-end="url(#ah)"/>
+  <rect x="560" y="78" width="290" height="40" rx="3" class="br"/>
+  <text x="572" y="96" class="t">App Deadline Missed</text>
+  <text x="572" y="111" class="ts">plus any DisplayFrame jank</text>
+
+  <rect x="10" y="128" width="520" height="56" rx="3" class="b0"/>
+  <text x="22" y="148" class="t">Presented late, deadline at or before the previous frame's latch,</text>
+  <text x="22" y="164" class="t">and expected on the VSYNC that frame was latched for</text>
+  <text x="22" y="178" class="ts">finish deadline moves to previous latch + one period</text>
+  <path d="M530,156 L556,156" class="ln" marker-end="url(#ah)"/>
+  <rect x="560" y="128" width="290" height="56" rx="3" class="bw"/>
+  <text x="572" y="150" class="t">Buffer Stuffing</text>
+  <text x="572" y="168" class="ts">late only if it missed the moved deadline</text>
+
+  <rect x="10" y="194" width="520" height="56" rx="3" class="b0"/>
+  <text x="22" y="214" class="t">Presented late or early, finished on time,</text>
+  <text x="22" y="230" class="t">no DisplayFrame jank</text>
+  <path d="M530,222 L556,222" class="ln" marker-end="url(#ah)"/>
+  <rect x="560" y="194" width="290" height="56" rx="3" class="b2"/>
+  <text x="572" y="214" class="t">SurfaceFlinger Scheduling</text>
+  <text x="572" y="230" class="ts">if off by a whole number of periods,</text>
+  <text x="572" y="244" class="ts">otherwise Prediction Error</text>
+</svg>
+</figure>
+
+<blockquote class="warn"><span class="lbl">Version note</span>
+Android 17 adds a second, cadence-based classification behind a SurfaceFlinger feature flag (use_experimental_jank_classification).
+With the flag on, SurfaceFlinger writes the new result into jank_type and moves the legacy result into the Jank type (experimental)
+arg. With the flag off, it is the other way round. The new one judges presentation cadence: the rhythm at which frames reach the
+screen. A frame is on cadence if the gap since the
+previous frame's present matches the expected gap, and the expected gap is short enough to be an animation. An on-cadence frame
+with more than 2 ms of present delay is Buffer Stuffing. The app deadline check subtracts time spent in dequeueBuffer. Frames that
+fit neither pattern become Non Animating. In the stuffing example both classifications agree. The cadence limits are in
+Section 14.
+</blockquote>
+
+<h3 id="ft-table">jank_type lists every reason, and jank_tag sums them up for the slice colour</h3>
+<p>jank_type is a comma-separated list of reasons, and jank_tag is one summary used for the slice colour. The strings come from
+JankTypeBitmaskToStringId in Perfetto's frame_timeline_event_parser.cc. For app frames:</p>
+<table>
+  <thead><tr><th>jank_type reason</th><th>Bit in JankInfo.h</th><th>jank_tag (app frame)</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>None</code></td><td>None</td><td>No Jank</td><td>Presented as predicted.</td></tr>
+    <tr><td><code>App Deadline Missed</code></td><td>AppDeadlineMissed</td><td class="bad">Self Jank</td><td>The frame (CPU and GPU) finished after its deadline and was presented late.</td></tr>
+    <tr><td><code>App Resynced Jitter</code></td><td>AppResyncedJitter</td><td class="bad">Self Jank</td><td>The app moved its frame time because the main thread started late (Choreographer resync).</td></tr>
+    <tr><td><code>Unknown Jank</code></td><td>Unknown</td><td class="bad">Self Jank</td><td>Legacy: finished late but presented early, or invalid present time.</td></tr>
+    <tr><td><code>Buffer Stuffing</code></td><td>BufferStuffing</td><td class="warn">Buffer Stuffing</td><td>On time, but queued behind earlier buffers. Tag applies only when it is the sole reason.</td></tr>
+    <tr><td><code>SurfaceFlinger CPU Deadline Missed</code></td><td>SurfaceFlingerCpuDeadlineMissed</td><td>Other Jank</td><td>SF main thread ran past its deadline.</td></tr>
+    <tr><td><code>SurfaceFlinger GPU Deadline Missed</code></td><td>SurfaceFlingerGpuDeadlineMissed</td><td>Other Jank</td><td>SF's client composition on the GPU was late.</td></tr>
+    <tr><td><code>SurfaceFlinger Scheduling</code></td><td>SurfaceFlingerScheduling</td><td>Other Jank</td><td>Present off by whole VSYNCs with on-time work, e.g. SF woke at the wrong time.</td></tr>
+    <tr><td><code>Prediction Error</code></td><td>PredictionError</td><td>Other Jank</td><td>Present off by a non-multiple of the period: the VSYNC model drifted.</td></tr>
+    <tr><td><code>Display HAL</code></td><td>DisplayHAL</td><td>Other Jank</td><td>Below SF: HWC or the panel presented late.</td></tr>
+    <tr><td><code>SurfaceFlinger Stuffing</code></td><td>SurfaceFlingerStuffing</td><td>SurfaceFlinger Stuffing</td><td>SF's previous frame ran into this frame's VSYNC (DisplayFrames). Tag applies only when it is the sole reason.</td></tr>
+    <tr><td><code>Dropped Frame</code></td><td>Dropped</td><td>Dropped Frame</td><td>Replaced by a newer buffer before it was shown.</td></tr>
+    <tr><td><code>Non Animating</code>, <code>Display not ON</code>, <code>PowerModeChange in progress</code></td><td>NonAnimating, DisplayNotOn, …</td><td>Non-perceivable Jank</td><td>Late but not part of an animation, or the display was off.</td></tr>
+  </tbody>
+</table>
+<p>The tag follows a priority order, set in CalculateSurfaceFrameJankTag. Any app reason wins, so
+<code>"App Deadline Missed, Buffer Stuffing"</code> is Self Jank. On SurfaceFlinger's own DisplayFrames, the SurfaceFlinger reasons
+are Self Jank. The Perfetto UI draws stuffed frames light green ("high latency state") and dropped frames blue.</p>
+
+<figure>
+<figcaption><b>Figure 21. The tag takes the most serious reason, and only motion-breaking reasons count as perceptible.</b>
+Rules are checked top to bottom, for app frames. The stuffing and non-perceivable tags apply only when those are the frame's only
+reasons.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 248" role="img" aria-label="Priority order from jank_type reasons to jank_tag, grouped by whether the user can see it">
+  <text x="10" y="18" class="th">if jank_type contains</text>
+  <text x="480" y="18" class="th">jank_tag</text>
+  <text x="700" y="18" class="th">user sees</text>
+
+  <rect x="10" y="28" width="440" height="40" rx="3" class="b0"/>
+  <text x="22" y="46" class="t">any app reason</text>
+  <text x="22" y="61" class="ts">App Deadline Missed, App Resynced Jitter, Unknown Jank</text>
+  <path d="M450,48 L476,48" class="ln" marker-end="url(#ah)"/>
+  <rect x="480" y="28" width="200" height="40" rx="3" class="br"/>
+  <text x="492" y="53" class="tb">Self Jank</text>
+
+  <rect x="10" y="76" width="440" height="40" rx="3" class="b0"/>
+  <text x="22" y="94" class="t">else any SurfaceFlinger or display reason</text>
+  <text x="22" y="109" class="ts">SF CPU or GPU Deadline Missed, Scheduling, Prediction Error, Display HAL</text>
+  <path d="M450,96 L476,96" class="ln" marker-end="url(#ah)"/>
+  <rect x="480" y="76" width="200" height="40" rx="3" class="br"/>
+  <text x="492" y="101" class="tb">Other Jank</text>
+
+  <rect x="700" y="28" width="150" height="88" rx="3" class="br"/>
+  <text x="712" y="66" class="tb">a stutter</text>
+  <text x="712" y="84" class="ts">perceptible</text>
+
+  <rect x="10" y="124" width="440" height="40" rx="3" class="b0"/>
+  <text x="22" y="149" class="t">only Buffer Stuffing, or only SurfaceFlinger Stuffing</text>
+  <path d="M450,144 L476,144" class="ln" marker-end="url(#ah)"/>
+  <rect x="480" y="124" width="200" height="40" rx="3" class="bw"/>
+  <text x="492" y="149" class="tb">the same stuffing tag</text>
+  <rect x="700" y="124" width="150" height="40" rx="3" class="bw"/>
+  <text x="712" y="142" class="tb">smooth</text>
+  <text x="712" y="157" class="ts">but higher latency</text>
+
+  <rect x="10" y="172" width="440" height="40" rx="3" class="b0"/>
+  <text x="22" y="190" class="t">only Non Animating, Display not ON</text>
+  <text x="22" y="205" class="ts">or PowerModeChange in progress</text>
+  <path d="M450,192 L476,192" class="ln" marker-end="url(#ah)"/>
+  <rect x="480" y="172" width="200" height="40" rx="3" class="b2"/>
+  <text x="492" y="190" class="tb">Non-perceivable</text>
+  <text x="492" y="205" class="tb">Jank</text>
+  <rect x="700" y="172" width="150" height="40" rx="3" class="b2"/>
+  <text x="712" y="190" class="tb">nothing</text>
+  <text x="712" y="205" class="ts">no motion to break</text>
+  <text x="10" y="238" class="ts">None gives No Jank. Dropped Frame gives the Dropped Frame tag.</text>
+</svg>
+</figure>
+
+<h3 id="ft-perceptible">Only late frames during motion count as perceptible jank</h3>
+<p>A late frame matters only if the user was watching something move. During a scroll or an animation the eye expects a new image
+every period, so one repeated frame breaks the rhythm and is seen. Some frames have no rhythm to break: the first frame after the
+screen was idle, content that changes once, or a frame while the display is off. Counting those as jank would bury the real
+stutters, so both SurfaceFlinger and Perfetto separate them.</p>
+<p>With that flag on, SurfaceFlinger judges a frame by cadence (the version note above). It compares the gap since the previous
+frame's present with the gap that was planned. Some frames get the type Non Animating instead of late:</p>
+<ul>
+  <li>The frame has no usable previous frame, as on the first frame of an animation.</li>
+  <li>The gap is off, but the frames are too far apart to form an animation.</li>
+  <li>The frame carries a negative system content priority (mSystemContentPriority). This check sits behind a further flag.</li>
+</ul>
+<p>While the display is off or changing power mode, the type is Display not ON or PowerModeChange in progress.</p>
+<p>When one of those three types is a frame's only type, Perfetto tags it <b>Non-perceivable Jank</b>
+(CalculateSurfaceFrameJankTag). Everything tagged Self Jank or Other Jank is <b>perceptible</b>: it fell inside an animation and
+changed what the user saw. Buffer Stuffing and SurfaceFlinger Stuffing sit in between. The cadence held, but latency grew.</p>
+<p>SurfaceFlinger also rates how bad each janky frame was, in the jank_severity_type column. The value is None, Partial, Full, or
+Unknown when there is too little information (calculateJankSeverity). The score is computed only for the jank reasons. It measures
+how far the actual present gap was from the expected one, relative to the frame interval.</p>
+
+<figure>
+<figcaption><b>Figure 22. Severity: misses under about one frame interval are Partial, and bigger ones are Full.</b> Frames whose
+only types are stuffing, Non Animating or display state score None. Dropped frames score Unknown.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 150" role="img" aria-label="Jank severity score scale: below 0.9 Partial, 0.9 and above Full">
+  <text x="10" y="18" class="th">jank severity score</text>
+  <rect x="40" y="34" width="720" height="34" class="bw"/>
+  <rect x="760" y="34" width="90" height="34" class="br"/>
+  <text x="52" y="56" class="tb">Partial</text>
+  <text x="772" y="56" class="tb">Full</text>
+  <line x1="40" y1="68" x2="850" y2="68" class="ln"/>
+  <line x1="40" y1="64" x2="40" y2="78" class="ln"/>
+  <line x1="760" y1="64" x2="760" y2="78" class="ln"/>
+  <text x="40" y="92" class="tms" text-anchor="middle">0</text>
+  <text x="760" y="92" class="tms" text-anchor="middle">0.9</text>
+  <text x="40" y="114" class="ts">a score of exactly 0 is None</text>
+  <text x="300" y="114" class="ts">missed by less than one frame interval</text>
+  <text x="300" y="130" class="ts">(per JankInfo.h)</text>
+  <text x="850" y="114" class="ts" text-anchor="end">anything higher</text>
+</svg>
+</figure>
+
+<pre><code><span class="c">-- perceptible jank only, with severity, for one app</span>
+SELECT jank_type, jank_severity_type, COUNT(*) AS frames
+FROM actual_frame_timeline_slice
+JOIN process USING (upid)
+WHERE process.name = 'com.example.app'
+  AND jank_tag IN ('Self Jank', 'Other Jank')
+GROUP BY jank_type, jank_severity_type
+ORDER BY frames DESC;</code></pre>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Count Self Jank for the app, Other Jank for the system, and treat Buffer Stuffing as latency. Leave Non-perceivable Jank out of
+user-facing numbers. Read present_type and on_time_finish together. A late present with an on-time finish is never the app's CPU
+budget.
+</blockquote>
+
+<h2 id="sql"><span class="n">13</span>Three queries cover frames by tag, per-thread time and input latency</h2>
+<p>Summary of frames by tag and type for one process. The actual_frame_timeline_slice table needs no INCLUDE: it is in the prelude,
+the set of tables Trace Processor always provides.</p>
+<pre><code>SELECT jank_tag, jank_type, present_type, COUNT(*) AS frames,
+       ROUND(AVG(dur) / 1e6, 2) AS avg_actual_ms
+FROM actual_frame_timeline_slice
+JOIN process USING (upid)
+WHERE process.name = 'com.example.app'
+GROUP BY jank_tag, jank_type, present_type
+ORDER BY frames DESC;</code></pre>
+<p>Per-frame breakdown of Self Jank into UI thread and RenderThread time. The android_frames table, from Perfetto's standard SQL
+library (stdlib), already joins
+Choreographer#doFrame, DrawFrames and the timeline slices by vsync id.</p>
+<pre><code>INCLUDE PERFETTO MODULE android.frames.timeline;
+
+SELECT f.frame_id,
+       a.jank_type,
+       ROUND(a.dur / 1e6, 2)  AS actual_ms,
+       ROUND(ui.dur / 1e6, 2) AS do_frame_ms,
+       ROUND(rt.dur / 1e6, 2) AS draw_frames_ms
+FROM android_frames f
+JOIN actual_frame_timeline_slice a ON a.id = f.actual_frame_timeline_id
+JOIN slice ui ON ui.id = f.do_frame_id
+JOIN slice rt ON rt.id = f.draw_frame_id
+WHERE f.process_name = 'com.example.app'
+  AND a.jank_tag = 'Self Jank'
+ORDER BY f.ts;</code></pre>
+<p>Input latency per event. The android_input_events table splits each event's latency into dispatch, handling and ack.
+Dispatch runs from the dispatcher to the app. Handling runs from the app receiving the event to sending finished. The table also
+links each event to the frame it landed in, and end_to_end_latency_dur runs from read time to that frame's present.</p>
+<pre><code>INCLUDE PERFETTO MODULE android.input;
+
+SELECT event_action, dispatch_latency_dur, handling_latency_dur,
+       ack_latency_dur, end_to_end_latency_dur, frame_id
+FROM android_input_events
+WHERE process_name = 'com.example.app'
+ORDER BY read_time;</code></pre>
+
+<h2 id="method"><span class="n">14</span>Numbers and method</h2>
+<p>This note explains mechanisms, so it reports no measurements. Every number below is a constant or default read from
+AOSP as of Android 17 (frameworks/native, frameworks/base) and Perfetto (external/perfetto). Excerpts marked
+<em>shape</em> are simplified. Timelines assume a fixed refresh rate and omit the small phase offsets unless stated. The files are
+listed under Sources.</p>
+<table>
+  <thead><tr><th>What</th><th>Value</th><th>Identifier</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>VSYNC interval</td><td>16.7 ms at 60 Hz, 8.3 ms at 120 Hz</td><td>refresh period</td><td>Overview</td></tr>
+    <tr><td>evdev record size, 64-bit kernel</td><td>24 bytes: 16 timestamp, 2 type, 2 code, 4 value</td><td><code>struct input_event</code>, <code>struct timeval</code></td><td>uapi linux/input.h</td></tr>
+    <tr><td>Ready device fds per EventHub wake-up</td><td>up to 16</td><td><code>EPOLL_MAX_EVENTS</code></td><td>EventHub.h</td></tr>
+    <tr><td>Records read per EventHub call</td><td>up to 256</td><td><code>EVENT_BUFFER_SIZE</code></td><td>EventHub.cpp</td></tr>
+    <tr><td>EventHub wait and wakelock</td><td>blocks in epoll_wait on all input device fds, registered with EPOLLWAKEUP</td><td><code>EventHub::getEvents</code>, <code>EPOLLWAKEUP</code></td><td>EventHub.cpp</td></tr>
+    <tr><td>InputChannel socket buffers</td><td>32 KB send and receive</td><td><code>SOCKET_BUFFER_SIZE</code></td><td>InputTransport.cpp</td></tr>
+    <tr><td>Input dispatch timeout</td><td>5000 ms × HwTimeoutMultiplier (1 on real hardware)</td><td><code>UNMULTIPLIED_DEFAULT_DISPATCHING_TIMEOUT_MILLIS</code></td><td>IInputConstants.aidl</td></tr>
+    <tr><td>Pre-ANR notice, no-focused-window path only</td><td>half the timeout or a default window before the deadline, whichever is longer; behind a feature flag</td><td><code>processNoFocusedWindowPreAnrLocked</code>, <code>DEFAULT_PRE_ANR_TIMEOUT_WINDOW</code></td><td>InputDispatcher.cpp</td></tr>
+    <tr><td>Resampling</td><td>5, 2, 20 and 8 ms (table in Section 4)</td><td><code>RESAMPLE_*</code></td><td>InputConsumer.cpp, Resampler.cpp</td></tr>
+    <tr><td>VSYNC model history</td><td>keeps 20 timestamps, needs 6 before predicting</td><td><code>VsyncSchedule::createTracker</code></td><td>VsyncSchedule.cpp</td></tr>
+    <tr><td>VSYNC model outlier rule</td><td>discards samples more than 20% of a period off</td><td><code>VsyncSchedule::createTracker</code></td><td>VsyncSchedule.cpp</td></tr>
+    <tr><td>Default phase offsets</td><td>1 ms each</td><td><code>ro.surface_flinger.vsync_event_phase_offset_ns</code>, <code>vsync_sf_event_phase_offset_ns</code></td><td>VsyncConfiguration.cpp</td></tr>
+    <tr><td>Candidate frame timelines per VSYNC-app event</td><td>up to 7</td><td><code>kFrameTimelinesCapacity</code> in <code>VsyncEventData</code></td><td>VsyncEventData.h</td></tr>
+    <tr><td>Skipped-frames log warning</td><td>30 frames</td><td><code>SKIPPED_FRAME_WARNING_LIMIT</code>, <code>debug.choreographer.skipwarning</code></td><td>Choreographer.java</td></tr>
+    <tr><td>Choreographer resync</td><td>start late by one period or more</td><td><code>jitterNanos ≥ frameIntervalNanos</code></td><td>Choreographer.java</td></tr>
+    <tr><td>hwui split into UI thread and RenderThread</td><td>since Android 5.0</td><td>hwui</td><td>Section 7</td></tr>
+    <tr><td>BLAST for app windows; FrameTimeline</td><td>since Android 12</td><td>BLASTBufferQueue, FrameTimeline</td><td>Sections 8 and 12</td></tr>
+    <tr><td>Latching with an unsignalled fence</td><td>AutoSingleLayer by default</td><td><code>LatchUnsignaledConfig::AutoSingleLayer</code>, <code>debug.sf.auto_latch_unsignaled</code></td><td>SurfaceFlinger.cpp</td></tr>
+    <tr><td>Latch outcome per frame in Perfetto</td><td>Latched Signaled, Latched Unsignaled, Delayed Latch Fence Unsignaled</td><td><code>latched_fence_state</code></td><td>frame_timeline_event_parser.cc</td></tr>
+    <tr><td>HWC composition types</td><td>DEVICE, CLIENT, SOLID_COLOR, CURSOR, SIDEBAND, DISPLAY_DECORATION, REFRESH_RATE_INDICATOR</td><td><code>Composition</code></td><td>Composition.aidl</td></tr>
+    <tr><td>SurfaceFlinger steps on VSYNC-sf</td><td>commit, then composite</td><td><code>SurfaceFlinger::commit</code>, <code>SurfaceFlinger::composite</code></td><td>SurfaceFlinger.cpp</td></tr>
+    <tr><td>Stuffing recovery trigger</td><td>buffer-release wait over half a frame interval</td><td><code>Choreographer.onWaitForBufferRelease</code></td><td>Choreographer.java</td></tr>
+    <tr><td>Stuffing recovery cap and flags</td><td>100 ms of accumulated delay, applied only behind a feature flag</td><td><code>MAX_BUFFER_STUFFING_DELAY_NS</code>, <code>bufferStuffingMultiRecovery</code>, <code>bufferStuffingRecoveryThreshold</code>, <code>DELAY_FRAME</code>, <code>OFFSET</code></td><td>Choreographer.java</td></tr>
+    <tr><td>Legacy jank thresholds</td><td>present within 2 ms is on time; finish more than 0 ms after the deadline is late; start within 2 ms is on time</td><td><code>JankClassificationThresholds</code></td><td>FrameTimeline.h</td></tr>
+    <tr><td>Cadence classification switch</td><td>used for jank_type only when the flag is enabled</td><td><code>use_experimental_jank_classification</code></td><td>FrameTimeline.h</td></tr>
+    <tr><td>Cadence rule, with the flag</td><td>gap within 30% of the expected gap</td><td><code>kDeltaFramesRatioThreshold</code></td><td>FrameTimeline.cpp</td></tr>
+    <tr><td>Animation limit, with the flag</td><td>expected gap under 50 ms</td><td><code>kThresholdFpsForAnimation = 20_Hz</code></td><td>FrameTimeline.cpp</td></tr>
+    <tr><td>Buffer Stuffing, with the flag</td><td>on cadence with more than 2 ms of present delay</td><td><code>jank_type</code></td><td>FrameTimeline.cpp</td></tr>
+    <tr><td>Severity Partial vs Full</td><td>score of exactly 0 is None, below 0.9 is Partial, higher is Full</td><td><code>calculateJankSeverity</code>, <code>JankSeverityType</code></td><td>FrameTimeline.cpp, JankInfo.h</td></tr>
+  </tbody>
+</table>
+
+<h2 id="sources">Sources</h2>
+<ul>
+  <li><code>bionic/libc/kernel/uapi/linux/input.h</code>: <code>struct input_event</code> layout; event codes in <code>input-event-codes.h</code></li>
+  <li><code>frameworks/native/services/inputflinger/reader/EventHub.cpp</code>: <code>EVENT_BUFFER_SIZE</code>, <code>epoll_wait</code>, <code>EPOLLWAKEUP</code>, <code>EVIOCSCLOCKID</code>; <code>EPOLL_MAX_EVENTS</code> in <code>include/EventHub.h</code></li>
+  <li><code>…/reader/mapper/TouchInputMapper.cpp</code>: <code>sync</code>, <code>processRawTouches</code>, <code>cookAndDispatch</code></li>
+  <li><code>frameworks/native/services/inputflinger/InputManager.cpp</code>: listener stages between reader and dispatcher</li>
+  <li><code>…/dispatcher/InputDispatcher.cpp</code>: <code>DEFAULT_INPUT_DISPATCHING_TIMEOUT</code>, <code>startDispatchCycleLocked</code>, no-focused-window pre-ANR, <code>processAnrsLocked</code>, <code>findTouchedWindowTargets</code>, <code>onWindowInfosChanged</code>, <code>iq</code>/<code>oq:</code>/<code>wq:</code> counters</li>
+  <li><code>frameworks/native/libs/input/android/os/IInputConstants.aidl</code>: <code>UNMULTIPLIED_DEFAULT_DISPATCHING_TIMEOUT_MILLIS = 5000</code></li>
+  <li><code>frameworks/native/libs/input/InputTransport.cpp</code>: <code>socketpair(AF_UNIX, SOCK_SEQPACKET)</code>, 32 KB buffers</li>
+  <li><code>frameworks/native/libs/input/InputConsumer.cpp</code> and <code>Resampler.cpp</code>: batching rules, resample constants and conditions, <code>ro.input.resampling</code></li>
+  <li><code>frameworks/base/core/jni/android_view_InputEventReceiver.cpp</code>: the <code>onBatchedInputEventPending</code> callback, <code>nativeConsumeBatchedInputEvents</code></li>
+  <li><code>frameworks/base/core/java/android/view/ViewRootImpl.java</code>: <code>onBatchedInputEventPending</code>, <code>scheduleConsumeBatchedInput</code>, <code>measure</code>/<code>layout</code>/<code>draw-</code> slices, wait-for-buffer-release callback</li>
+  <li><code>frameworks/base/core/java/android/view/Choreographer.java</code>: callback types and trace titles, <code>doFrame</code>, resync, <code>SKIPPED_FRAME_WARNING_LIMIT</code>, buffer stuffing recovery</li>
+  <li><code>…/surfaceflinger/Scheduler/VsyncSchedule.cpp</code>, <code>VSyncPredictor.cpp</code>, <code>VSyncReactor.cpp</code>: history 20, 6 samples, 20% outliers, regression, present fence feedback</li>
+  <li><code>…/Scheduler/EventThread.cpp</code>, <code>MessageQueue.cpp</code>, <code>Scheduler.cpp</code>: VSYNC-app and VSYNC-sf, work and ready durations, deadline, frame timelines</li>
+  <li><code>…/Scheduler/VsyncConfiguration.cpp</code>: <code>WorkDuration</code> properties and defaults; <code>PhaseOffsets</code>, <code>sfOffsetToDuration</code>, <code>appOffsetToDuration</code>; <code>DefaultFactory::createVsyncConfiguration</code> (<code>SurfaceFlingerDefaultFactory.cpp</code>) for the <code>use_phase_offsets_as_durations</code> switch</li>
+  <li><code>frameworks/native/libs/gui/include/gui/VsyncEventData.h</code>: <code>kFrameTimelinesCapacity = 7</code></li>
+  <li><code>frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp</code>: <code>postAndWait</code>, <code>syncFrameState</code>, <code>unblockUiThread</code>, <code>DrawFrames</code> slice</li>
+  <li><code>frameworks/base/libs/hwui/RenderNode.h</code>: staging properties and display list</li>
+  <li><code>frameworks/base/libs/hwui/renderthread/CanvasContext.cpp</code>: <code>setBufferCount</code>, <code>prepareTree</code></li>
+  <li><code>frameworks/native/libs/gui/BLASTBufferQueue.cpp</code>: <code>acquireNextBufferLocked</code>, <code>setBuffer</code>, release callback, infinite dequeue timeout, backpressure flag, <code>QueuedBuffer</code> counter, <code>rejectBuffer</code> and the destination-size comment (bounce)</li>
+  <li><code>frameworks/base/services/core/java/com/android/server/wm/BLASTSync.md</code> and <code>BLASTSyncEngine.java</code>: BLAST sync protocol and its guarantee; <code>ViewRootImpl.createSyncIfNeeded</code>, <code>reportDrawFinished</code> for the client side</li>
+  <li><code>frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp</code>: <code>commit</code>, <code>composite</code>, <code>hasPendingBuffer</code>, <code>fence unsignaled</code>, <code>getLatchUnsignaledConfig</code>, <code>calculateMaxAcquiredBufferCount</code>; enum in <code>SurfaceFlinger.h</code></li>
+  <li><code>hardware/interfaces/graphics/composer/aidl/…/composer3/Composition.aidl</code>: composition types; <code>DisplayCommand.aidl</code> (<code>validateDisplay</code>, <code>presentDisplay</code>); <code>PresentFence.aidl</code>, <code>ReleaseFences.aidl</code></li>
+  <li><code>frameworks/native/libs/gui/include/gui/JankInfo.h</code>: <code>JankType</code> bits, <code>JankSeverityType</code></li>
+  <li><code>…/Scheduler/FrameTimeline.cpp</code> and <code>FrameTimeline.h</code>: thresholds, legacy and current classification, <code>Non Animating</code> conditions, <code>calculateJankSeverity</code>, slice bounds, trace fields; <code>Layer.cpp</code> for last-frame latch timestamps</li>
+  <li><code>external/perfetto/src/trace_processor/importers/proto/frame_timeline_event_parser.cc</code>: jank type strings, <code>SurfaceFrameJanky</code>, <code>DisplayFrameJanky</code>, jank tags, latched fence states</li>
+  <li><code>…/perfetto_sql/stdlib/prelude/after_eof/events.sql</code>: frame timeline table columns</li>
+  <li><code>…/stdlib/android/frames/timeline.sql</code> and <code>android/input.sql</code>: <code>android_frames</code>, <code>android_input_events</code></li>
+  <li><a href="https://perfetto.dev/docs/data-sources/frametimeline" target="_blank">Perfetto docs: FrameTimeline data source</a>: slice semantics and UI colours</li>
+</ul>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>

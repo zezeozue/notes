@@ -1,0 +1,1352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PerfettoSQL: parsers, Lemon, syntaqlite and pipe operators</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="Tokens · Lemon LALR(1) · syntaqlite · macros · |&gt; pipelines">PerfettoSQL: parsers and pipes</span>
+  <span class="tb-spacer"></span>
+  <a class="tb-x" href="../trace_processor_internals/index.html">Trace Processor internals</a>
+  <a class="tb-x" href="../trace_merging/index.html">Trace merging</a>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#glance">At a glance</a>
+  <a href="#overview">Overview: three routes</a>
+  <a href="#example" style="padding-left:18px">one query, start to finish</a>
+  <div class="ph">I · Parsing</div>
+  <a href="#tokens">1 · Tokens</a>
+  <a href="#grammar">2 · Grammars and LALR(1)</a>
+  <a href="#lemon" style="padding-left:18px">what Lemon generates</a>
+  <a href="#syntaqlite">3 · syntaqlite builds the tree</a>
+  <a href="#arena" style="padding-left:18px">the arena AST</a>
+  <a href="#tricks">4 · Grammar tricks</a>
+  <div class="ph">II · PerfettoSQL statements</div>
+  <a href="#macros">5 · Macros and tracebacks</a>
+  <a href="#statements">6 · Statements and dispatch</a>
+  <div class="ph">III · Pipelines</div>
+  <a href="#pipes">7 · Pipe syntax</a>
+  <a href="#compiler">8 · The compiler</a>
+  <a href="#pruning">9 · Column pruning</a>
+  <a href="#bridge">10 · Running through SQLite</a>
+  <a href="#lowering">11 · Lowering and execution</a>
+  <a href="#run" style="padding-left:18px">the running example, executed</a>
+  <div class="ph">IV · Extending</div>
+  <a href="#new-op">12 · Adding a pipe operator</a>
+  <a href="#method">Numbers and method</a>
+  <a href="#sources">Sources</a>
+</nav>
+
+<main id="top">
+<h1>PerfettoSQL: every statement goes through a generated parser, and pipe queries run on Perfetto's own executor</h1>
+<p class="lead">This page explains how Trace Processor turns PerfettoSQL text into results.
+It starts with tokens and grammars, then follows one query through the parser, the pipeline compiler and the executor.
+It ends with a recipe for adding a new pipe operator.</p>
+<p class="m">Code is from the upstream Perfetto repository, main as of late October 2026, and code marked <em>shape</em> is simplified.
+Pipe syntax is experimental and changes quickly, so treat the names as a snapshot. Its status is in the design doc
+<code>docs/design-docs/perfetto-sql-pipelines.md</code> in the Perfetto repository.</p>
+
+<h2 id="glance">At a glance</h2>
+<ul>
+<li><b>One parser for everything.</b> Perfetto parses every statement itself, with a parser generated from SQLite's grammar plus Perfetto's additions.</li>
+<li><b>Three routes.</b> Plain SQL goes on to SQLite. Perfetto's own statements run in C++. Pipe queries go to a separate compiler.</li>
+<li><b>Macros stay traceable.</b> Macros expand while the text is being tokenized, and errors still point at the text you wrote.</li>
+<li><b>Pipes skip SQLite's interpreter.</b> A pipe query becomes a plan that Perfetto runs in fast column batches. SQLite only hands the rows back.</li>
+<li><b>Adding an operator is small.</b> A new pipe stage needs about five files of real work. The hard part is saying which columns it reads and what order it leaves.</li>
+</ul>
+<p><b>Terms.</b> A <b>token</b> is the smallest unit of text that means something, such as a keyword or a name.
+A <b>grammar</b> is the set of rules that says which token sequences are valid.
+An <b>AST</b> (abstract syntax tree) is the tree of what a statement means.
+<b>Lemon</b> is SQLite's tool that turns a grammar into a parser, and <b>syntaqlite</b> is the project that builds Perfetto's parser with it.</p>
+<p><b>Trace Processor</b> is Perfetto's query engine: it loads a trace and answers SQL over it.
+A <b>dataframe</b> is Perfetto's in-memory column store, where trace data lives.
+A <b>virtual table</b> (vtab) is a SQLite table whose rows come from C++ code.
+A <b>pipeline</b> is a query written with <code>|&gt;</code> stages.
+The <b>standard library</b> (stdlib) is the set of PerfettoSQL modules that ship with Trace Processor, loaded with <code>INCLUDE PERFETTO MODULE</code>.
+Names that start with <code>__intrinsic_</code> are <b>intrinsics</b>: tables and functions Trace Processor registers for its own use, not public API.</p>
+
+<h2 id="overview">Overview: every statement is parsed once by Perfetto, then takes one of three routes</h2>
+<p>Every statement goes through Perfetto's own parser before SQLite sees it.
+SQLite runs a query in two steps. <b>Prepare</b> compiles the text into bytecode for SQLite's interpreter, the <b>VDBE</b> (Virtual Database Engine).
+<b>Step</b> then runs that bytecode one result row at a time.
+Trace data is not in SQLite's own storage. SQLite reads dataframes through virtual tables.</p>
+<p><b>PerfettoSQL</b> is SQLite's SQL plus statements SQLite lacks, such as <code>CREATE PERFETTO TABLE</code>, <code>INCLUDE PERFETTO MODULE</code> and macros.
+It also has a pipe syntax, switched on by a setting called a <b>pragma</b>.
+Pipe stages do not run as VDBE bytecode. They run on Perfetto's own executor.
+It processes rows in <b>batches</b> of up to 2048 rows held as columns, using C++ loops.</p>
+<p>The parser's output then picks one of the three routes in Figure 1.</p>
+
+<figure>
+<figcaption><b>Figure 1. Every statement is parsed by syntaqlite, then goes to one of three places.</b> Plain SQL is parsed a second
+time by SQLite. Extension statements never reach SQLite as written. Pipelines reach it only as a call to one <em>table-valued
+function</em>, a virtual table called like a function in a <code>FROM</code> clause. The table below the figure links each step to its section.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="Route of a PerfettoSQL statement">
+  <text x="10" y="18" class="th">parse (syntaqlite)</text>
+  <rect x="10" y="30" width="150" height="56" rx="2" class="b0"/>
+  <text x="22" y="52" class="tb">SQL text</text><text x="22" y="70" class="tms">SqlSource</text>
+  <path d="M160,58 L196,58" class="ln" marker-end="url(#ah)"/>
+  <rect x="200" y="30" width="200" height="56" rx="2" class="ba"/>
+  <text x="212" y="52" class="tb">tokenizer + macros</text><text x="212" y="70" class="tms">LookupMacro callback</text>
+  <path d="M400,58 L436,58" class="lna" marker-end="url(#aha)"/>
+  <rect x="440" y="30" width="200" height="56" rx="2" class="ba"/>
+  <text x="452" y="52" class="tb">Lemon LALR(1) parser</text><text x="452" y="70" class="tms">SynqPerfettoParse()</text>
+  <path d="M640,58 L676,58" class="lna" marker-end="url(#aha)"/>
+  <rect x="680" y="30" width="310" height="56" rx="2" class="ba"/>
+  <text x="692" y="52" class="tb">arena AST + RewriteTree</text><text x="692" y="70" class="tms">PerfettoSqlParser::ParseStatement</text>
+
+  <text x="180" y="128" class="th">route by root node tag</text>
+  <path d="M835,86 L835,104 L155,104 L155,140" class="ln" marker-end="url(#ah)"/>
+  <path d="M835,104 L450,104 L450,140" class="ln" marker-end="url(#ah)"/>
+  <path d="M835,104 L800,104 L800,140" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="10" y="144" width="290" height="62" rx="2" class="b0"/>
+  <text x="22" y="166" class="tb">SqliteSql (plain SQL)</text><text x="22" y="184" class="ts">macro-expanded text goes to</text><text x="22" y="198" class="tms">sqlite3_prepare: parsed again</text>
+  <rect x="330" y="144" width="290" height="62" rx="2" class="bw"/>
+  <text x="342" y="166" class="tb">PerfettoSQL extension</text><text x="342" y="184" class="tms">ResolveExtensionStatement</text><text x="342" y="198" class="ts">runs it in C++, prepares a dummy</text>
+  <rect x="650" y="144" width="340" height="62" rx="2" class="bv"/>
+  <text x="662" y="166" class="tb">Pipeline (|&gt;)</text><text x="662" y="184" class="tms">pipeline::Compile → LogicalPlan</text><text x="662" y="198" class="ts">compiled while the AST is alive</text>
+
+  <path d="M155,206 L155,238" class="ln" marker-end="url(#ah)"/>
+  <path d="M475,206 L475,238" class="lnw" marker-end="url(#ahw)"/>
+  <path d="M820,206 L820,238" class="lnv" marker-end="url(#ahv)"/>
+  <rect x="10" y="242" width="290" height="46" rx="2" class="b"/>
+  <text x="22" y="262" class="tb">SQLite VDBE</text><text x="22" y="278" class="ts">virtual tables over dataframes</text>
+  <rect x="330" y="242" width="290" height="46" rx="2" class="b"/>
+  <text x="342" y="262" class="tb">catalog changes</text><text x="342" y="278" class="ts">tables, functions, macros, modules</text>
+  <rect x="650" y="242" width="340" height="46" rx="2" class="b"/>
+  <text x="662" y="262" class="tb">SELECT … FROM __intrinsic_pipeline(X'…')</text><text x="662" y="278" class="ts">SQLite drives a core::exec::Pipeline</text>
+</svg>
+</figure>
+
+<h3 id="example">One query, followed from text to rows</h3>
+<p>The page follows one query the whole way: <code>FROM slice |&gt; ORDER BY ts</code>.
+It runs after <code>PERFETTO PRAGMA pipelines = 1;</code>, reads the slice view, and returns its rows sorted by timestamp.
+Each row of this table is one section.</p>
+<table>
+  <thead><tr><th>Step</th><th>What exists afterwards</th><th>§</th></tr></thead>
+  <tbody>
+    <tr><td>Tokenize</td><td>Seven tokens: <code>FROM ID BITOR GT ORDER BY ID</code>, each a type number plus a byte range</td><td><a href="#tokens">1</a></td></tr>
+    <tr><td>Parse</td><td>Lemon's state machine shifts the tokens and reduces grammar rules, running one C action per rule</td><td><a href="#grammar">2</a></td></tr>
+    <tr><td>Build the AST</td><td>Tree nodes appended to an arena as rules reduce. The last one, the root, is a <code>PerfettoPipeline</code></td><td><a href="#arena">3</a></td></tr>
+    <tr><td>Dispatch</td><td><code>ParseStatement</code> sees the root tag <code>SYNTAQLITE_NODE_PERFETTO_PIPELINE</code> and compiles it</td><td><a href="#statements">6</a></td></tr>
+    <tr><td>Compile, prune</td><td>A logical plan of two nodes: <code>Scan(slice)</code> → <code>OrderBy(ts)</code>. Nothing is pruned, because every column is output</td><td><a href="#compiler">8</a>, <a href="#pruning">9</a></td></tr>
+    <tr><td>Bridge to SQLite</td><td>One generated statement: <code>SELECT c0 AS "id", c1 AS "ts", … FROM __intrinsic_pipeline(X'…', …)</code></td><td><a href="#bridge">10</a></td></tr>
+    <tr><td>Lower</td><td>A physical plan: <code>DataframeScan</code> → <code>Sort</code></td><td><a href="#lowering">11</a></td></tr>
+    <tr><td>Execute</td><td>SQLite steps the statement. A cursor pulls batches of up to 2048 rows out of <code>Sort</code> and hands SQLite one row per step</td><td><a href="#run">11</a></td></tr>
+  </tbody>
+</table>
+
+<!-- ═════════════════════════ PART I ═════════════════════════ -->
+<div class="part">Part I · Parsing</div>
+
+<h2 id="tokens"><span class="n">1</span>The tokenizer cuts text into typed tokens and knows nothing about structure</h2>
+<p>Before parsing, a <b>tokenizer</b> (also called a lexer) cuts the text into tokens.
+Tokens are keywords, names, numbers, strings, punctuation, whitespace and comments.
+Each token is a small type number plus the byte range it came from.
+The tokenizer does not check structure. It would happily emit <code>FROM FROM FROM</code>.</p>
+<p>syntaqlite reuses SQLite's hand-written tokenizer. A generated header defines one constant per token type.
+The Perfetto <em>dialect</em> (SQLite's grammar plus Perfetto's additions, Section 3) has about 200 token types, some 20 more than stock SQLite 3.50.6 (sqlite-autoconf-3500600). The table in <a href="#lemon">What Lemon generates</a> has the exact counts.</p>
+
+<figure>
+<figcaption><b>Figure 2. The example query becomes seven tokens, and the pipe arrives as two.</b> Each token is a type number and a byte range; [0,4) means bytes 0 to 3.
+The numbers come from <code>syntaqlite_perfetto.h</code>, for example FROM is 127 and ID, the type for any name, is 40. In the tokenizer's <code>CC_PIPE</code> case, the code for a
+<code>|</code> character, one <code>|</code> becomes BITOR (bitwise OR) and <code>||</code> becomes CONCAT. The <code>&gt;</code> is GT (greater than). Nothing produces a single pipe token (Section 4).</figcaption>
+<svg viewBox="0 0 1000 200" role="img" aria-label="Tokenizing a pipeline">
+  <text x="10" y="18" class="th">bytes</text>
+  <g>
+    <text x="44" y="44" class="tm">F</text><text x="68" y="44" class="tm">R</text><text x="92" y="44" class="tm">O</text><text x="116" y="44" class="tm">M</text><text x="140" y="44" class="tms">·</text>
+    <text x="164" y="44" class="tm">s</text><text x="188" y="44" class="tm">l</text><text x="212" y="44" class="tm">i</text><text x="236" y="44" class="tm">c</text><text x="260" y="44" class="tm">e</text><text x="284" y="44" class="tms">·</text>
+    <text x="308" y="44" class="tm tv">|</text><text x="332" y="44" class="tm tv">&gt;</text><text x="356" y="44" class="tms">·</text>
+    <text x="380" y="44" class="tm">O</text><text x="404" y="44" class="tm">R</text><text x="428" y="44" class="tm">D</text><text x="452" y="44" class="tm">E</text><text x="476" y="44" class="tm">R</text><text x="500" y="44" class="tms">·</text>
+    <text x="524" y="44" class="tm">B</text><text x="548" y="44" class="tm">Y</text><text x="572" y="44" class="tms">·</text><text x="596" y="44" class="tm">t</text><text x="620" y="44" class="tm">s</text>
+    <text x="44" y="64" class="tms">0</text><text x="140" y="64" class="tms">4</text><text x="282" y="64" class="tms">10</text><text x="306" y="64" class="tms">11</text><text x="330" y="64" class="tms">12</text>
+    <text x="378" y="64" class="tms">14</text><text x="522" y="64" class="tms">20</text><text x="594" y="64" class="tms">23</text>
+  </g>
+  <text x="10" y="94" class="th">tokens (type, byte range)</text>
+  <rect x="40"  y="104" width="96"  height="44" rx="2" class="ba"/><text x="50" y="122" class="tm">FROM</text><text x="50" y="139" class="tms">127 [0,4)</text>
+  <rect x="142" y="104" width="104" height="44" rx="2" class="b0"/><text x="152" y="122" class="tm">ID slice</text><text x="152" y="139" class="tms">40 [5,10)</text>
+  <rect x="252" y="104" width="86"  height="44" rx="2" class="bv"/><text x="262" y="122" class="tm">BITOR</text><text x="262" y="139" class="tms">94 [11,12)</text>
+  <rect x="344" y="104" width="86"  height="44" rx="2" class="bv"/><text x="354" y="122" class="tm">GT</text><text x="354" y="139" class="tms">35 [12,13)</text>
+  <rect x="436" y="104" width="104" height="44" rx="2" class="ba"/><text x="446" y="122" class="tm">ORDER</text><text x="446" y="139" class="tms">114 [14,19)</text>
+  <rect x="546" y="104" width="96"  height="44" rx="2" class="ba"/><text x="556" y="122" class="tm">BY</text><text x="556" y="139" class="tms">9 [20,22)</text>
+  <rect x="648" y="104" width="96"  height="44" rx="2" class="b0"/><text x="658" y="122" class="tm">ID ts</text><text x="658" y="139" class="tms">40 [23,25)</text>
+  <text x="762" y="122" class="ts">whitespace is token 185</text><text x="762" y="138" class="ts">(SPACE); the parser skips it</text>
+  <path d="M252,160 L430,160" class="lnv"/>
+  <text x="252" y="180" class="ts tv">"|&gt;" is two tokens: SQLite has no pipe token</text>
+</svg>
+</figure>
+
+<p>Keywords are found by looking up words that look like names. A word like TREE is a keyword in this dialect.
+It can still be used as a column name, thanks to the parser's fallback rule (Section 4).</p>
+
+<h2 id="grammar"><span class="n">2</span>A grammar defines valid statements, and an LALR(1) parser checks them one token at a time</h2>
+<p>A grammar tells the parser two things: whether a token list is a valid statement, and what its structure is.
+It is a set of <b>rules</b>, also called productions, that say how tokens combine.
+Each rule has a left side and a right side. The left side is a <b>nonterminal</b>, a named phrase such as <code>perfetto_pipe_stage</code>.
+The right side is a sequence of symbols. Each symbol is a nonterminal or a <b>terminal</b>.
+A terminal is a token type such as ORDER, a leaf that cannot be broken down further. In Lemon syntax:</p>
+<pre><code><span class="src">perfetto.y</span><span class="c">// a pipe stage can be ORDER BY followed by an order list</span>
+perfetto_pipe_stage(A) ::= ORDER BY perfetto_pipe_order_list(L). {
+    A = synq_parse_perfetto_pipe_order_by(pCtx, L);
+}</code></pre>
+<p>The letters in parentheses name each symbol's <b>semantic value</b>, the C value the parser carries with it.
+The C block is the <b>action</b>. It runs when the rule matches and computes the left side's value, here the ID of a new tree node.</p>
+<p>The actions decide what goes into the tree, so the AST keeps only what carries meaning.
+Matching rules gives a <b>parse tree</b>, with one node per rule and every token as a leaf, keywords included.
+Nobody needs that much. The AST keeps only "an ORDER BY stage with these terms".
+The rule above builds one PerfettoPipeOrderBy node and drops the two keywords. The rule that matches <code>|&gt;</code> builds no node at all (Section 4).</p>
+
+<figure>
+<figcaption><b>Figure 3. The AST keeps the meaning and drops the keywords.</b> Left, the parse tree for the stage <code>ORDER BY ts</code>.
+Right, the node this rule's action builds. The term below it was built earlier, by its own rules. Shape, simplified.</figcaption>
+<svg viewBox="0 0 860 190" style="max-width:860px" role="img" aria-label="Parse tree with every token versus AST with one node">
+  <text x="10" y="18" class="th">parse tree: every rule and token</text>
+  <text x="500" y="18" class="th">AST: what the action keeps</text>
+  <rect x="120" y="30" width="180" height="30" rx="2" class="b2"/><text x="132" y="50" class="tm">perfetto_pipe_stage</text>
+  <path d="M170,60 L60,96" class="ln"/><path d="M200,60 L160,96" class="ln"/><path d="M250,60 L290,96" class="ln"/>
+  <rect x="20" y="98" width="80" height="28" rx="2" class="b0"/><text x="34" y="117" class="tm">ORDER</text>
+  <rect x="120" y="98" width="80" height="28" rx="2" class="b0"/><text x="148" y="117" class="tm">BY</text>
+  <rect x="220" y="98" width="140" height="28" rx="2" class="b2"/><text x="232" y="117" class="tm">order_list</text>
+  <path d="M290,126 L290,146" class="ln"/>
+  <rect x="220" y="148" width="140" height="28" rx="2" class="b2"/><text x="232" y="167" class="tm">order_term: ts</text>
+  <text x="20" y="146" class="ts tr">dropped</text><text x="120" y="146" class="ts tr">dropped</text>
+  <path d="M390,103 L476,103" class="lna" marker-end="url(#aha)"/>
+  <text x="392" y="94" class="ts ta">action runs</text>
+  <rect x="480" y="78" width="190" height="50" rx="2" class="ba"/>
+  <text x="492" y="98" class="tb">PerfettoPipeOrderBy</text><text x="492" y="116" class="tms">terms → [ts]</text>
+  <text x="480" y="160" class="ts">The action adds one node and drops both keywords.</text>
+  <text x="480" y="176" class="ts">Children are built first, so the term node already exists.</text>
+</svg>
+</figure>
+
+<p>An <b>LR parser</b> reads tokens left to right and keeps a stack. At each step it does one of two things.
+It can <b>shift</b>, which pushes the next token. Or it can <b>reduce</b>: when the top of the stack matches a rule's right side, it pops those
+symbols, runs the action and pushes the left side. So it builds the tree bottom-up, finishing children before their parent.</p>
+<p>A state machine decides between shift and reduce. Each <b>state</b> stands for "where we might be in which rules".
+The choice depends on the state plus <b>one token of lookahead</b>, the next token, read but not yet consumed. That is the "(1)" in the name.
+<b>LALR</b> (look-ahead LR) is one way to build the state machine. It merges states that differ only in which lookahead tokens they expect.
+This gives much smaller tables than a full LR parser. The cost is that it sometimes reports conflicts a full LR parser would not. SQLite's grammar fits.</p>
+<p>A <b>conflict</b> means one token of lookahead cannot tell two readings apart.
+The grammar then allows two actions for one state and lookahead: shift or reduce, or reduce by either of two rules.
+A grammar can declare operator precedence (<code>%left</code>, <code>%right</code>) to settle shift/reduce conflicts.
+Lemon reports any conflict left over when it generates the parser, never when a query runs.</p>
+
+<figure>
+<figcaption><b>Figure 4. The parser shifts tokens and reduces rules, so the source node exists before the stage, and the stage before the pipeline.</b>
+Parsing <code>FROM slice |&gt; ORDER BY ts</code>. ε marks a rule with an empty right side, and "$ / ;" is the end of the statement.
+Blue rows are reductions, which run actions that append AST nodes.</figcaption>
+<svg viewBox="0 0 1000 400" role="img" aria-label="Shift-reduce trace">
+  <text x="10" y="18" class="th">stack (top on the right)</text>
+  <text x="520" y="18" class="th">lookahead</text>
+  <text x="640" y="18" class="th">action</text>
+  <line x1="10" y1="26" x2="990" y2="26" class="ln"/>
+  <g>
+    <text x="10" y="50"  class="tms">(empty)</text>                                   <text x="520" y="50"  class="tm">FROM</text>  <text x="640" y="50"  class="ts">shift</text>
+    <text x="10" y="76"  class="tms">FROM</text>                                      <text x="520" y="76"  class="tm">ID</text>    <text x="640" y="76"  class="ts">shift</text>
+    <text x="10" y="102" class="tms">FROM ID</text>                                   <text x="520" y="102" class="tm">BITOR</text> <text x="640" y="102" class="ts ta">reduce nm, dbnm=ε, alias=ε → perfetto_pipe_source</text>
+    <text x="10" y="128" class="tms">FROM perfetto_pipe_source</text>                 <text x="520" y="128" class="tm">BITOR</text> <text x="640" y="128" class="ts ta">reduce perfetto_pipe_stage_list ::= ε</text>
+    <text x="10" y="154" class="tms">FROM source stage_list</text>                    <text x="520" y="154" class="tm">BITOR</text> <text x="640" y="154" class="ts">shift</text>
+    <text x="10" y="180" class="tms">FROM source stage_list BITOR</text>              <text x="520" y="180" class="tm">GT</text>    <text x="640" y="180" class="ts">shift</text>
+    <text x="10" y="206" class="tms">… stage_list BITOR GT</text>                     <text x="520" y="206" class="tm">ORDER</text> <text x="640" y="206" class="ts tv">reduce perfetto_pipe (checks adjacency)</text>
+    <text x="10" y="232" class="tms">… stage_list perfetto_pipe</text>                <text x="520" y="232" class="tm">ORDER</text> <text x="640" y="232" class="ts">shift ORDER, BY, ID</text>
+    <text x="10" y="258" class="tms">… perfetto_pipe ORDER BY ID</text>               <text x="520" y="258" class="tm">$ / ;</text> <text x="640" y="258" class="ts ta">reduce … → expr → order_term → order_list</text>
+    <text x="10" y="284" class="tms">… perfetto_pipe ORDER BY order_list</text>       <text x="520" y="284" class="tm">$ / ;</text> <text x="640" y="284" class="ts ta">reduce → perfetto_pipe_stage (PerfettoPipeOrderBy)</text>
+    <text x="10" y="310" class="tms">FROM source stage_list pipe stage</text>         <text x="520" y="310" class="tm">$ / ;</text> <text x="640" y="310" class="ts ta">reduce → perfetto_pipe_stage_list</text>
+    <text x="10" y="336" class="tms">FROM source stage_list</text>                    <text x="520" y="336" class="tm">$ / ;</text> <text x="640" y="336" class="ts ta">reduce → perfetto_pipeline → cmd</text>
+  </g>
+  <line x1="10" y1="350" x2="990" y2="350" class="ln dash"/>
+  <text x="10" y="372" class="t">Row 3 is the lookahead at work: seeing BITOR, the parser knows the source is finished and reduces it before shifting.</text>
+  <text x="10" y="390" class="ts">Shape, simplified: intermediate SQLite nonterminals (id, nm, term) are folded into one line.</text>
+</svg>
+</figure>
+
+<h3 id="lemon">Lemon turns the grammar into tables and a small C driver</h3>
+<p>Nobody builds these state machines by hand: SQLite's has several hundred states.
+A <b>parser generator</b> reads a grammar and writes the parser for it. Lemon is SQLite's own parser generator, and SQLite's grammar lives in <code>parse.y</code>.
+Lemon computes the LALR states and reports conflicts.
+It then writes one C file with the <b>parse tables</b>, which are the state machine as compressed arrays, plus a driver function that walks them.
+The generated <code>syntaqlite_perfetto.c</code> has the usual Lemon pieces:</p>
+<table>
+  <thead><tr><th>Piece</th><th>In syntaqlite_perfetto.c</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td>Action table</td><td><code>yy_action[]</code>, <code>yy_lookahead[]</code>, <code>yy_shift_ofst[]</code></td><td>For each (state, lookahead) the next action, packed with per-state offsets. <code>YY_ACTTAB_COUNT</code> is 2739.</td></tr>
+    <tr><td>Fallback table</td><td><code>yyFallback[]</code></td><td>For each token, the token to retry with if it cannot be used as is (mostly "→ ID").</td></tr>
+    <tr><td>Driver</td><td><code>SynqPerfettoParse()</code></td><td>Fed one token at a time. Loops shifting and reducing.</td></tr>
+    <tr><td>Lookups</td><td><code>yy_find_shift_action()</code>, <code>yy_find_reduce_action()</code></td><td>Table lookups for the two kinds of decision.</td></tr>
+    <tr><td>Actions</td><td><code>yy_reduce()</code></td><td>One <code>case</code> per rule: the C blocks from the grammar, pasted in.</td></tr>
+  </tbody>
+</table>
+
+<figure>
+<figcaption><b>Figure 5. Perfetto's additions give the parser about a third more states than SQLite's.</b> Lemon constants in stock SQLite 3.50.6
+(<code>sqlite-autoconf-3500600</code>) and in the generated Perfetto dialect: <code>YYNSTATE</code> (states), <code>YYNRULE</code> (rules) and <code>YYNTOKEN</code> (terminals).</figcaption>
+<svg viewBox="0 0 860 200" style="max-width:860px" role="img" aria-label="States, rules and token types in SQLite versus the Perfetto dialect">
+  <text x="10" y="18" class="th">count</text>
+  <rect x="560" y="8" width="12" height="12" rx="2" class="b2"/><text x="578" y="18" class="ts">SQLite 3.50.6</text>
+  <rect x="680" y="8" width="12" height="12" rx="2" class="ba"/><text x="698" y="18" class="ts">Perfetto dialect</text>
+  <line x1="130" y1="30" x2="130" y2="186" class="ln"/>
+  <text x="120" y="56" class="t" text-anchor="end">states</text>
+  <rect x="130" y="34" width="437" height="18" rx="2" class="b2"/><text x="573" y="47" class="tms">583</text>
+  <rect x="130" y="54" width="581" height="18" rx="2" class="ba"/><text x="717" y="67" class="tms">774 (+33%)</text>
+  <text x="120" y="110" class="t" text-anchor="end">rules</text>
+  <rect x="130" y="88" width="307" height="18" rx="2" class="b2"/><text x="443" y="101" class="tms">409</text>
+  <rect x="130" y="108" width="392" height="18" rx="2" class="ba"/><text x="528" y="121" class="tms">523 (+28%)</text>
+  <text x="120" y="164" class="t" text-anchor="end">token types</text>
+  <rect x="130" y="142" width="140" height="18" rx="2" class="b2"/><text x="276" y="155" class="tms">187</text>
+  <rect x="130" y="162" width="155" height="18" rx="2" class="ba"/><text x="291" y="175" class="tms">207 (+11%)</text>
+</svg>
+</figure>
+
+<p>Two Lemon directives matter later. <code>%fallback ID A B C.</code> says: if token A cannot be shifted here, retry it as an ID.
+<code>%wildcard ANY.</code> declares a symbol that matches any token. It sits in SQLite's base grammar, and Perfetto uses it to swallow macro bodies (Section 4).
+Every action also receives a context argument, <code>pCtx</code>, a <code>SynqParseCtx*</code>.
+It owns the node storage (the arena, Section 3) and the parse flags.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A grammar change is a table change. Adding one rule can shift every state number.
+That is why nobody edits the generated C by hand, and why it is checked in whole.
+If Lemon reports a conflict, the new rule is ambiguous with an existing one under one token of lookahead. Fix the grammar, not the action code.
+</blockquote>
+
+<h2 id="syntaqlite"><span class="n">3</span>syntaqlite gives Perfetto the syntax tree that SQLite never exposes</h2>
+<p>Perfetto needs a syntax tree, and SQLite does not offer one.
+SQLite's parser actions fill internal structures and pass them straight to its code generator.
+Perfetto needs a tree to find its own statements, compile pipelines, expand macros with exact error locations, work out a query's columns, and format SQL.
+<b>syntaqlite</b> is a separate project that fills this gap. It reuses SQLite's tokenizer and grammar, but every rule's action builds a typed AST node.
+It also lets you extend the grammar with a <b>dialect</b>: a named set of extra rules, node types and keywords layered on SQLite's.</p>
+<p>Perfetto's dialect is two hand-written files in <code>src/perfetto_sql/syntaqlite/</code>.
+The syntaqlite tool combines them with the base SQLite grammar it carries.
+It writes one self-contained C file and a header, and both are checked in.</p>
+
+<figure>
+<figcaption><b>Figure 6. Two hand-written files become one generated parser.</b> The same files also build the formatter for <code>.sql</code> files.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="syntaqlite generation">
+  <text x="10" y="18" class="th">hand-written (src/perfetto_sql/syntaqlite/)</text>
+  <rect x="10" y="30" width="290" height="60" rx="2" class="ba"/>
+  <text x="22" y="52" class="tb">perfetto.synq · 573 lines</text><text x="22" y="72" class="ts">AST nodes, lists, enums, fmt rules</text>
+  <rect x="10" y="100" width="290" height="60" rx="2" class="ba"/>
+  <text x="22" y="122" class="tb">perfetto.y · 611 lines</text><text x="22" y="142" class="ts">Lemon rules that extend the grammar</text>
+  <rect x="10" y="170" width="290" height="60" rx="2" class="b2"/>
+  <text x="22" y="192" class="tb">base SQLite grammar + runtime</text><text x="22" y="212" class="ts">supplied by the syntaqlite tool</text>
+
+  <path d="M300,60 L376,118" class="lna" marker-end="url(#aha)"/>
+  <path d="M300,130 L376,130" class="lna" marker-end="url(#aha)"/>
+  <path d="M300,200 L376,142" class="ln" marker-end="url(#ah)"/>
+  <rect x="380" y="96" width="250" height="68" rx="2" class="bw"/>
+  <text x="392" y="118" class="tb">tools/gen_syntaqlite_parser</text>
+  <text x="392" y="136" class="tms">syntaqlite dialect generate</text>
+  <text x="392" y="152" class="tms">--name perfetto --macro-style rust</text>
+
+  <path d="M630,118 L686,70" class="lng" marker-end="url(#ahg)"/>
+  <path d="M630,142 L686,180" class="lng" marker-end="url(#ahg)"/>
+  <text x="690" y="18" class="th">generated, checked in</text>
+  <rect x="690" y="30" width="300" height="76" rx="2" class="bg"/>
+  <text x="702" y="52" class="tb">syntaqlite_perfetto.c · 21,855 lines</text>
+  <text x="702" y="70" class="ts">tokenizer, Lemon tables and driver,</text>
+  <text x="702" y="86" class="ts">node builders, macro engine, formatter</text>
+  <rect x="690" y="150" width="300" height="76" rx="2" class="bg"/>
+  <text x="702" y="172" class="tb">syntaqlite_perfetto.h · 4,923 lines</text>
+  <text x="702" y="190" class="ts">node structs, SYNTAQLITE_NODE_* tags,</text>
+  <text x="702" y="206" class="ts">SYNTAQLITE_TK_* tokens, parser API</text>
+</svg>
+</figure>
+
+<p class="m">Build details: the <code>BUILD.gn</code> next to these files compiles the pair into the <code>syntaqlite</code> source set (GN's name for a group of compiled sources).
+Standalone builds also make <code>perfetto_fmt_dialect</code>, a shared library that the <code>syntaqlite fmt --dialect</code> tool loads to format <code>.sql</code> files.
+<code>inline_dispatch.h</code> replaces the dialect's function pointers with direct calls on the hot path.</p>
+
+<p>Each node in the <code>.synq</code> file declares its fields and how to print them.
+An <em>index</em> field holds the ID of another node. An <em>inline</em> field holds a value directly, usually an enum or a byte range into the source.
+The matching grammar rule calls the generated builder for that node, <code>synq_parse_&lt;node&gt;()</code>:</p>
+<div class="two">
+<div>
+<pre><code><span class="src">perfetto.synq</span><span class="k">node</span> PerfettoTreeAccumulate {
+  direction: <span class="k">inline</span> PerfettoTreeDirection
+  aggregates: <span class="k">index</span> PerfettoAggregateList
+
+  fmt {
+    group {
+      "TREE" "ACCUMULATE" space
+      enum_display(direction, { UP="UP" DOWN="DOWN" })
+      nest { line child(aggregates) }
+    }
+  }
+}</code></pre>
+</div>
+<div>
+<pre><code><span class="src">perfetto.y</span>perfetto_pipe_stage(A) ::= TREE ACCUMULATE
+                           perfetto_tree_direction(D)
+                           perfetto_aggregate_list(L). {
+    A = synq_parse_perfetto_tree_accumulate(pCtx,
+        (SyntaqlitePerfettoTreeDirection)D, L);
+}</code></pre>
+<pre><code><span class="src">syntaqlite_perfetto.h (generated)</span><span class="k">typedef struct</span> SyntaqlitePerfettoPipeOrderBy {
+    SyntaqliteNodeTag tag;
+    uint32_t terms;
+} SyntaqlitePerfettoPipeOrderBy;</code></pre>
+</div>
+</div>
+<p>An <em>abstract</em> declaration groups the node types that may fill one slot.
+For example, <code>abstract PerfettoPipeStage</code> lists the eleven stage nodes: <code>PerfettoTreeAccumulate</code>, <code>PerfettoIntervalFlatten</code>,
+<code>PerfettoIntervalFillGaps</code>, <code>PerfettoPipeOrderBy</code>, <code>PerfettoPipeAggregate</code> and six projections. <code>semantic { … }</code> blocks feed syntaqlite's own analysis.
+For example, <code>define_table</code> on <code>CreatePerfettoTableStmt</code> tells that analysis the statement defines a table.</p>
+
+<h3 id="arena">Tree nodes live in one buffer that is thrown away after each statement</h3>
+<p>All of a statement's nodes go into one buffer, the <b>arena</b>, which is reset as a whole before the next statement.
+A statement creates dozens of small nodes that all die together. Allocating and freeing each one would be wasted work.
+Nodes point to each other by <b>node ID</b>, a 32-bit number that names a node within the arena, not by memory address.
+<code>SYNTAQLITE_NULL_NODE</code> (0xFFFFFFFF) means "absent". Lists are nodes too: a tag, a count and an array of child IDs.
+Names are stored as byte ranges into the source (<code>SyntaqliteTextSpan</code>), so they are never copied.</p>
+<p>Because of the reset, memory grows with one statement, not the whole script.
+The catch is that a pointer from <code>syntaqlite_parser_node(p, id)</code> is valid only until the next <code>syntaqlite_parser_next()</code>.</p>
+
+<figure>
+<figcaption><b>Figure 7. Nodes are built children first, so every link points back to an older node and the root comes last.</b>
+The arena for <code>FROM slice |&gt; ORDER BY ts</code>, in creation order from left to right. The root's ID comes from <code>syntaqlite_result_root()</code>.</figcaption>
+<svg viewBox="0 0 1000 316" role="img" aria-label="Arena nodes for a pipeline">
+  <text x="10" y="18" class="tms">arena for FROM slice |&gt; ORDER BY ts (nodes in creation order, left to right)</text>
+  <rect x="10"  y="34" width="210" height="96" rx="2" class="b0"/>
+  <text x="20" y="54" class="tb">PerfettoPipeSource</text>
+  <text x="20" y="74" class="tms">table_name {5, 5}</text><text x="20" y="90" class="tms">schema     (no span)</text>
+  <text x="20" y="106" class="tms">select     NULL</text><text x="20" y="122" class="tms">alias      NULL</text>
+  <rect x="230" y="34" width="150" height="64" rx="2" class="b0"/>
+  <text x="240" y="54" class="tb">ColumnRef</text><text x="240" y="74" class="tms">column {23, 2}</text><text x="240" y="90" class="tms">table (no span)</text>
+  <rect x="390" y="34" width="150" height="64" rx="2" class="b0"/>
+  <text x="400" y="54" class="tb">PipeOrderTerm</text><text x="400" y="74" class="tms">expr →</text><text x="400" y="90" class="tms">sort_order NONE</text>
+  <rect x="550" y="34" width="120" height="64" rx="2" class="b2"/>
+  <text x="560" y="54" class="tb">TermList</text><text x="560" y="74" class="tms">count 1</text><text x="560" y="90" class="tms">[ → ]</text>
+  <rect x="680" y="34" width="120" height="64" rx="2" class="ba"/>
+  <text x="690" y="54" class="tb">PipeOrderBy</text><text x="690" y="74" class="tms">terms →</text>
+  <rect x="810" y="34" width="180" height="64" rx="2" class="b2"/>
+  <text x="820" y="54" class="tb">PipeStageList</text><text x="820" y="74" class="tms">count 1</text><text x="820" y="90" class="tms">[ → ]</text>
+
+  <path d="M445,98 C445,124 300,124 300,100" class="ln" marker-end="url(#ah)"/>
+  <path d="M610,98 C610,126 465,126 465,100" class="ln" marker-end="url(#ah)"/>
+  <path d="M740,98 C740,126 615,126 615,100" class="ln" marker-end="url(#ah)"/>
+  <path d="M880,98 C880,126 745,126 745,100" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="560" y="178" width="250" height="80" rx="2" class="bv"/>
+  <text x="570" y="198" class="tb">PerfettoPipeline (root)</text>
+  <text x="570" y="216" class="tms">from         →</text><text x="570" y="232" class="tms">intersection NULL</text><text x="570" y="248" class="tms">stages       →</text>
+  <path d="M560,212 C330,212 115,200 115,134" class="lnv" marker-end="url(#ahv)"/>
+  <path d="M810,244 C900,244 900,160 900,100" class="lnv" marker-end="url(#ahv)"/>
+
+  <text x="10" y="286" class="ts">{offset, length} spans point into the source, so names are never copied. A span also carries a layer id: 0 for the source, &gt;0 for text</text>
+  <text x="10" y="302" class="ts">produced by a macro expansion (§5). Field names are from syntaqlite_perfetto.h; IDs are drawn as arrows because their values are an arena detail.</text>
+</svg>
+</figure>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+C++ code reads the tree by casting. <code>Node&lt;SyntaqlitePerfettoPipeOrderBy&gt;(parser, id)</code> in
+<code>pipeline/compiler.h</code> is a <code>static_cast</code> of <code>syntaqlite_parser_node()</code>.
+Anything that needs the tree, such as pipeline compilation, must finish before the parser moves on to the next statement.
+</blockquote>
+
+<h2 id="tricks"><span class="n">4</span>Four grammar tricks keep new syntax from breaking existing queries</h2>
+<p>Perfetto's extension grammar is short, but four techniques in it solve real ambiguity problems.</p>
+
+<h3>New keywords still work as names</h3>
+<pre><code><span class="src">perfetto.y</span><span class="c">// Allow extension keywords to be used as regular identifiers.</span>
+%fallback ID PERFETTO FUNCTION MODULE RETURNS MACRO DELEGATES INCLUDE
+          TREE ACCUMULATE UP DOWN INTERVAL INTERSECTION PER EXTEND FLATTEN
+          AGGREGATE FILL GAPS.</code></pre>
+<p>Every new keyword risks breaking queries that use the word as a name, like a column called per or up.
+Fallback makes Lemon retry such a token as a plain name whenever the current state has no action for it.
+So the word acts as a keyword only where a rule expects it.</p>
+
+<h3>The pipe is two tokens that must touch</h3>
+<pre><code><span class="src">perfetto.y</span>perfetto_pipe(A) ::= BITOR(B) GT(G). {
+    <span class="hw">if (B.layer_id != G.layer_id || B.offset + B.n != G.offset) {</span>
+        pCtx-&gt;error = 1;
+    }
+    A = 0;
+}</code></pre>
+<p>The tokenizer has no <code>|&gt;</code> token, so the grammar accepts BITOR followed by GT.
+The action then rejects the pair unless the two characters are next to each other and come from the same <em>layer</em>.
+A layer is one piece of source text or one macro expansion (Section 5).</p>
+
+<figure>
+<figcaption><b>Figure 8. Only a pipe written with no gap, in one piece of text, is accepted.</b> The action compares the two tokens' layer and byte offsets.</figcaption>
+<svg viewBox="0 0 860 150" style="max-width:860px" role="img" aria-label="Pipe accepted only when the two characters are adjacent in the same layer">
+  <text x="10" y="18" class="th">written as</text><text x="250" y="18" class="th">tokens</text><text x="600" y="18" class="th">result</text>
+  <line x1="10" y1="26" x2="850" y2="26" class="ln"/>
+  <text x="10" y="54" class="tm">t |&gt; ORDER BY ts</text>
+  <rect x="250" y="38" width="70" height="24" rx="2" class="bv"/><text x="260" y="55" class="tms">| [2,3)</text>
+  <rect x="324" y="38" width="70" height="24" rx="2" class="bv"/><text x="334" y="55" class="tms">&gt; [3,4)</text>
+  <rect x="600" y="38" width="250" height="24" rx="2" class="bg"/><text x="612" y="55" class="ts">adjacent, same layer: a pipe</text>
+  <text x="10" y="94" class="tm">t | &gt; ORDER BY ts</text>
+  <rect x="250" y="78" width="70" height="24" rx="2" class="bv"/><text x="260" y="95" class="tms">| [2,3)</text>
+  <rect x="340" y="78" width="70" height="24" rx="2" class="bv"/><text x="350" y="95" class="tms">&gt; [4,5)</text>
+  <text x="414" y="95" class="ts tr">gap</text>
+  <rect x="600" y="78" width="250" height="24" rx="2" class="br"/><text x="612" y="95" class="ts">offsets differ: syntax error</text>
+  <text x="10" y="134" class="tm">| from a macro, &gt; typed</text>
+  <rect x="250" y="118" width="70" height="24" rx="2" class="bw"/><text x="260" y="135" class="tms">| layer 1</text>
+  <rect x="324" y="118" width="70" height="24" rx="2" class="bv"/><text x="334" y="135" class="tms">&gt; layer 0</text>
+  <rect x="600" y="118" width="250" height="24" rx="2" class="br"/><text x="612" y="135" class="ts">layers differ: syntax error</text>
+</svg>
+</figure>
+
+<p>Reusing the bitwise OR character has a cost, as the comment above the rule says.
+An expression may end in <code>|</code>, so nothing that ends in a bare expression may come right before a pipe.
+That is why a pipeline's FROM source is only a table or a subquery in parentheses.
+A join's ON expression would be ambiguous: in <code>a JOIN b ON a.x = b.y |&gt; …</code>, the <code>|</code> could continue the expression as a bitwise OR.
+It is also why an ORDER BY term gets the precedence of BITNOT, the <code>~</code> operator, which binds tighter than <code>|</code>. So a term ends at <code>|</code>.</p>
+
+<h3>Empty rules mark exact positions</h3>
+<p>An empty rule (<code>X ::= .</code>) matches nothing, but Lemon must reduce it at one exact point in the input.
+That makes it a hook for running code at that point.</p>
+<div class="two">
+<div>
+<pre><code><span class="src">perfetto.y</span>select_body_start(A) ::= . { A = pCtx-&gt;cur_shift_start; }
+select_body_end(A)   ::= . { A = pCtx-&gt;last_shifted_end; }
+
+cmd(A) ::= CREATE perfetto_or_replace(R) PERFETTO TABLE nm(N)
+           perfetto_table_impl(I) perfetto_table_schema(S)
+           AS select_body_start(BS) select(E) select_body_end(BE). {
+    SyntaqliteTextSpan select_span = {
+        .offset = BS, .length = BE - BS, };
+    ...
+}</code></pre>
+</div>
+<div>
+<p><code>select_body_start/end</code> bracket the body of <code>CREATE PERFETTO TABLE/VIEW/FUNCTION</code>.
+They record its exact source span, without leading whitespace.</p>
+<p><code>before_macro_body</code> sits just before AS in <code>CREATE PERFETTO MACRO</code>.
+Reducing it increments <code>pCtx-&gt;in_macro_def_body</code>. While that is set, the tokenizer does not expand nested macro calls.
+So the body is captured as written, through the ANY wildcard. The macro's <code>cmd</code> action decrements the counter again.</p>
+</div>
+</div>
+
+<h3>Aliases always need AS</h3>
+<p>A pipe alias (<code>perfetto_pipe_alias</code>) is either empty or <code>AS nmorerr</code>, meaning a name or Lemon's built-in <code>error</code> symbol.
+The error symbol lets the parser recover from a bad name.
+A bare alias would let a fallback keyword be read as a name. In <code>FROM t PER cpu</code>, PER would become the alias of t.
+The <code>AliasNeedsAs</code> test in <code>perfetto_sql_connection_unittest.cc</code> checks that <code>FROM t x |&gt; …</code> is a syntax error.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Write <code>|&gt;</code> without a space, and alias with AS. Wrap a join in a subquery before piping it.
+A top-level <code>a | b</code> in an ORDER BY term needs parentheses.
+</blockquote>
+
+<!-- ═════════════════════════ PART II ═════════════════════════ -->
+<div class="part">Part II · PerfettoSQL statements</div>
+
+<h2 id="macros"><span class="n">5</span>Macros expand inside the tokenizer, and errors still point at the text you wrote</h2>
+<p>PerfettoSQL adds <b>macros</b>, text templates expanded before the query runs, because SQL functions cannot take a table or an expression as an argument.
+The standard library keeps needing the same query shape with a different table plugged in, such as "build the callstacks for these callsites".
+A macro definition names typed parameters, with types such as <code>Expr</code> or <code>TableOrSubquery</code>. A call is written <code>name!(arg, …)</code>, the Rust macro style, because the generator runs with <code>--macro-style rust</code>.
+Each <code>$param</code> in the body is replaced by the argument's tokens:</p>
+<pre><code><span class="src">stdlib/stacks/cpu_profiling.sql</span><span class="k">CREATE PERFETTO TABLE</span> _cpu_profiling_callstacks <span class="k">AS</span>
+<span class="k">FROM</span> _callstacks_for_callsites!((SELECT callsite_id FROM cpu_profiling_samples))
+|&gt; <span class="k">TREE ACCUMULATE UP</span> SUM(self_count) <span class="k">AS</span> cumulative_count;</code></pre>
+<p>Many languages expand macros in a separate <b>preprocessing</b> pass over the whole text, as the C preprocessor does. PerfettoSQL has no such pass.
+Instead, syntaqlite's tokenizer asks Perfetto through a callback whenever it meets a call.
+It then feeds the expansion's tokens to the parser as a new <b>layer</b>, a token stream with its own id.
+Layer 0 is the text the user wrote, and expansions are layers 1 and up.
+Perfetto's callback is <code>PerfettoSqlParser::Impl::LookupMacro</code>, shown in Figure 9.</p>
+
+<figure>
+<figcaption><b>Figure 9. Each macro call is checked against the built-in intrinsics first, then against the user's macros.</b>
+What <code>LookupMacro</code> does when the tokenizer meets <code>name!(…)</code>. The result is fed to the parser as a new layer.</figcaption>
+<svg viewBox="0 0 860 210" style="max-width:860px" role="img" aria-label="Decision steps when the tokenizer meets a macro call">
+  <rect x="10" y="30" width="150" height="50" rx="2" class="b0"/><text x="22" y="52" class="tb">tokenizer meets</text><text x="22" y="70" class="tms">name!(args)</text>
+  <path d="M160,55 L196,55" class="ln" marker-end="url(#ah)"/>
+  <rect x="200" y="30" width="180" height="50" rx="2" class="ba"/><text x="212" y="52" class="tb">1 · an intrinsic?</text><text x="212" y="70" class="tms">TryExpand</text>
+  <path d="M380,55 L416,55" class="lng" marker-end="url(#ahg)"/><text x="384" y="47" class="ts tg">yes</text>
+  <rect x="420" y="30" width="430" height="50" rx="2" class="bg"/><text x="432" y="52" class="tb">expand on raw token text</text><text x="432" y="70" class="ts">stringify, token_apply and variants: "preprocessor-compat shims"</text>
+  <path d="M290,80 L290,106" class="ln" marker-end="url(#ah)"/><text x="298" y="98" class="ts">no</text>
+  <rect x="200" y="110" width="180" height="50" rx="2" class="ba"/><text x="212" y="132" class="tb">2 · in macro table?</text><text x="212" y="150" class="ts">and argument count right?</text>
+  <path d="M200,135 L164,135" class="lnr" marker-end="url(#ahr)"/>
+  <rect x="10" y="110" width="150" height="50" rx="2" class="br"/><text x="22" y="132" class="tms">-1 no such macro</text><text x="22" y="150" class="tms">-2 wrong count</text>
+  <path d="M380,135 L416,135" class="lng" marker-end="url(#ahg)"/><text x="384" y="127" class="ts tg">yes</text>
+  <rect x="420" y="110" width="430" height="50" rx="2" class="bg"/><text x="432" y="132" class="tb">3 · substitute $params, pass other $names through</text><text x="432" y="150" class="ts">unknown $names reach SQLite as bind variables</text>
+  <text x="10" y="190" class="ts">Passthrough is how CREATE PERFETTO FUNCTION bodies receive their arguments: their $args are not macro parameters.</text>
+</svg>
+</figure>
+
+<table>
+  <thead><tr><th>Step in Figure 9</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td>1 · intrinsic</td><td><code>IntrinsicMacroExpander::TryExpand</code>, for <code>__intrinsic_stringify</code> and <code>__intrinsic_token_apply</code> with its <code>_prefix</code>, <code>_and</code> and <code>_and_prefix</code> variants</td></tr>
+    <tr><td>2 · macro table</td><td>The connection's macro table, filled by <code>ExecuteCreateMacro</code>. Returns -1 (no such macro) or -2 (wrong argument count).</td></tr>
+    <tr><td>3 · expand</td><td><code>syntaqlite_macro_expansion_expand_and_set_result(…, SYNTAQLITE_EXPAND_PASSTHROUGH_UNKNOWN)</code></td></tr>
+  </tbody>
+</table>
+<p>Step 3 leaves alone any <code>$name</code> that is not one of the macro's parameters.
+SQLite then sees it as a <b>bind variable</b>, a placeholder whose value is supplied when the statement runs.
+That is how a <code>CREATE PERFETTO FUNCTION</code> body receives its arguments.</p>
+
+<h3>Errors map back through every expansion to the text you wrote</h3>
+<p>SQLite only ever sees the expanded text, so its error offsets point into text the user never wrote.
+For example, it may report "no such column" at some byte offset of the expansion.
+Perfetto's <code>SqlSource</code> solves this. It is a string that remembers where each part came from.
+<code>SqlSource::Rewriter</code> builds a new one by replacing byte ranges with other sources, and keeps the originals as a tree.
+<code>AsTraceback(offset)</code> walks that tree back to file, line and column.
+The result is a <b>traceback</b>: the list of locations from the error, through each macro call, to the text you wrote.</p>
+<p><code>RewriteTree</code>, a class in <code>perfetto_sql_parser.cc</code>, rebuilds that tree from the rewrite records syntaqlite kept
+for the statement (<code>syntaqlite_result_rewrite_at</code>). Each record is one replacement.
+It points at its parent: the index of the record it sits inside, or <code>SYNTAQLITE_REWRITE_PARENT_SOURCE</code> if it sits directly in the original source.</p>
+
+<figure>
+<figcaption><b>Figure 10. An error inside a macro argument points at the user's text, not at the copy inside the expansion.</b>
+Literal nested calls in the body become children of the macro's rewrite. Calls that arrive through an argument are tracked separately.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="Macro layers and RewriteTree">
+  <text x="10" y="18" class="th">layer 0 · what the user wrote</text>
+  <rect x="10" y="28" width="980" height="44" rx="2" class="b0"/>
+  <text x="22" y="55" class="tm">FROM </text>
+  <rect x="62" y="36" width="560" height="28" rx="2" class="bw"/>
+  <text x="72" y="55" class="tm">_callstacks_for_callsites!(</text>
+  <rect x="268" y="40" width="340" height="20" rx="2" class="ba"/>
+  <text x="276" y="54" class="tms">(SELECT callsite_id FROM cpu_profiling_samples)</text>
+  <text x="614" y="55" class="tm">)</text>
+  <text x="636" y="55" class="tm">|&gt; TREE ACCUMULATE UP …</text>
+
+  <path d="M120,72 L120,108" class="lnw" marker-end="url(#ahw)"/>
+  <text x="130" y="96" class="tms tw">call range replaced</text>
+
+  <text x="10" y="126" class="th">layer 1 · the macro's body, with $samples substituted</text>
+  <rect x="60" y="136" width="930" height="44" rx="2" class="bw"/>
+  <text x="72" y="163" class="tm">(WITH … body text from stack_profile.sql …</text>
+  <rect x="420" y="144" width="200" height="28" rx="2" class="ba"/>
+  <text x="430" y="163" class="tms">$samples segment</text>
+  <text x="640" y="163" class="tm">… more body …</text>
+
+  <path d="M520,144 C520,110 440,96 440,64" class="lna dash" marker-end="url(#aha)"/>
+  <text x="530" y="118" class="tms ta">AuthoredSourceOf: origin is layer 0</text>
+
+  <text x="10" y="216" class="th">what RewriteTree builds</text>
+  <rect x="10" y="226" width="300" height="56" rx="2" class="bg"/>
+  <text x="22" y="246" class="tb">BuildForUserMacro</text><text x="22" y="264" class="ts">the macro's body text as the base</text>
+  <rect x="330" y="226" width="300" height="56" rx="2" class="bg"/>
+  <text x="342" y="246" class="tb">BuildForArg</text><text x="342" y="264" class="ts">arg text sliced from where it was typed</text>
+  <rect x="650" y="226" width="340" height="56" rx="2" class="bg"/>
+  <text x="662" y="246" class="tb">SqlSource::Rewriter</text><text x="662" y="264" class="ts">nests them: final offset → body → user</text>
+</svg>
+</figure>
+
+<p>Two details keep this cheap. <code>NodeSource</code> returns the source text of one AST node.
+If a statement had no rewrites at all, it returns a plain substring.
+Otherwise it asks <code>syntaqlite_node_is_macro_free()</code> for each node, and builds the tree only for nodes that span an expansion.
+Calls that arrive through an argument are tagged <code>SYNTAQLITE_MACRO_BODY_CALL_ARG_INTERNAL</code> and handled by <code>BuildForArg</code>.</p>
+
+<h2 id="statements"><span class="n">6</span>Each parsed statement goes to SQLite, to a C++ handler, or to the pipeline compiler</h2>
+<p>The parser's root node decides who runs each statement, because SQLite has never heard of <code>CREATE PERFETTO TABLE</code> or <code>|&gt;</code>.
+<code>PerfettoSqlParser</code> wraps the syntaqlite parser.
+Each <code>Next()</code> calls <code>syntaqlite_parser_next()</code> until it gets a statement with a root node. A statement of only comments has none.
+It then builds the rewrite tree and sets <code>statement_sql()</code> to the expanded source of the root.</p>
+<p>Finally it calls <code>ParseStatement</code>, which switches on the root's <b>tag</b>, the node type stored in each node's first field.
+The result is a <code>PerfettoSqlParser::Statement</code>, a <code>std::variant</code> with one alternative per statement kind.
+Any tag it does not list becomes <code>SqliteSql{}</code>.</p>
+
+<table>
+  <thead><tr><th>Syntax</th><th>Root tag → variant</th><th>What the connection does</th></tr></thead>
+  <tbody>
+    <tr><td><code>CREATE [OR REPLACE] PERFETTO TABLE t [USING dataframe] [(schema)] AS select | pipeline</code></td>
+        <td><code>CREATE_PERFETTO_TABLE_STMT</code> → <code>CreateTable</code></td>
+        <td><code>ExecuteCreateTable</code>: prepares the body (SQL, or the pipeline's SQL from <code>PreparePipeline</code>), validates
+        the schema, runs it and copies its rows into a dataframe with <code>BuildRuntimeDataframeFromSqliteStatement</code>, then runs
+        <code>CREATE VIRTUAL TABLE t USING __intrinsic_dataframe</code> (the <code>DataframeModule</code> virtual table that also serves the built-in tables) inside a savepoint, SQLite's nested transaction. Any <code>USING</code> name other than
+        <code>dataframe</code> is an error.</td></tr>
+    <tr><td><code>CREATE PERFETTO VIEW v [(schema)] AS select</code></td>
+        <td><code>CreateView</code></td>
+        <td><code>ExecuteCreateView</code>: prepares the select to check it, compares column names to the schema, then executes a
+        generated <code>CREATE VIEW v AS …</code>. With extra checks enabled it also computes the rows to check their types.</td></tr>
+    <tr><td><code>CREATE PERFETTO FUNCTION f(args) RETURNS type AS select</code></td>
+        <td><code>CreateFunction</code></td>
+        <td>Scalar (returns one value): <code>RegisterLegacyRuntimeFunction</code> (backed by <code>CreatedFunction</code>). <code>RETURNS TABLE(…)</code>:
+        a <code>RuntimeTableFunctionModule</code> virtual table. Variadic arguments (any number of them) are rejected here.</td></tr>
+    <tr><td><code>… RETURNS type DELEGATES TO cpp_fn</code></td>
+        <td><code>CREATE_PERFETTO_DELEGATING_FUNCTION_STMT</code> → <code>CreateFunction</code> with a target</td>
+        <td><code>RegisterDelegatingFunction</code>. A variadic <code>name TYPE...</code> argument is allowed, but only as the last one.</td></tr>
+    <tr><td><code>CREATE PERFETTO MACRO m(a Expr) RETURNS Expr AS …</code></td>
+        <td><code>CreateMacro</code></td>
+        <td><code>ExecuteCreateMacro</code> stores the body <code>SqlSource</code> in the macro table used by <code>LookupMacro</code>.</td></tr>
+    <tr><td><code>CREATE PERFETTO INDEX i ON t(c, …)</code> / <code>DROP PERFETTO INDEX i ON t</code></td>
+        <td><code>CreateIndex</code> / <code>DropIndex</code></td>
+        <td><code>ExecuteCreateIndex</code>: only on tables created at runtime; calls <code>Dataframe::BuildIndex</code> and swaps in
+        <code>AddIndex(…)</code>. Indexes on intrinsic tables "must be declared at compile time".</td></tr>
+    <tr><td><code>INCLUDE PERFETTO MODULE a.b.c</code></td>
+        <td><code>Include</code></td>
+        <td><code>ExecuteInclude</code>: finds the owning package by prefix (<code>FindPackageForModule</code>), pushes a new execution
+        frame for the module's SQL. <code>*</code> includes every package; the old <code>common</code> package gets a dedicated error.</td></tr>
+    <tr><td><code>PERFETTO PRAGMA name = n</code></td>
+        <td><code>Pragma</code></td>
+        <td><code>ExecutePragma</code>: the only setting is <code>pipelines</code>; anything else is "there is no setting".</td></tr>
+    <tr><td><code>FROM … |&gt; …</code> / <code>INTERVAL INTERSECTION OF (…)</code></td>
+        <td><code>PERFETTO_PIPELINE</code> → <code>Pipeline{LogicalPlan}</code></td>
+        <td>Compiled during parsing (Part III), prepared with <code>PreparePipeline</code>.</td></tr>
+    <tr><td>everything else</td><td><code>SqliteSql</code></td><td>The expanded statement text is prepared by SQLite.</td></tr>
+  </tbody>
+</table>
+
+<p><code>PerfettoSqlConnection::ProcessFrame</code> runs the loop, with one branch per route.
+Plain SQL is prepared directly, in the branch marked <code>PERFETTO_LIKELY</code>, a compiler hint that this is the common case.
+A pipeline has its own branch: its plan, compiled during parsing, goes to <code>PreparePipeline</code> (Section 10).
+The running example takes this route, because its root tag is <code>SYNTAQLITE_NODE_PERFETTO_PIPELINE</code>.
+Other extension statements go through <code>ResolveExtensionStatement</code>, which runs them in C++.
+It then returns a dummy statement, because the rest of the loop always expects "the current prepared statement".</p>
+
+<figure>
+<figcaption><b>Figure 11. An include pushes a new frame, so a module runs to the end before the next statement of the query.</b>
+Each frame is one SQL text being executed: the user's query or a module it included. Before every statement, each frame checks again whether pipes are allowed.</figcaption>
+<svg viewBox="0 0 860 200" style="max-width:860px" role="img" aria-label="Stack of execution frames for a query and the modules it includes">
+  <text x="10" y="18" class="th">frame stack (top is running)</text><text x="520" y="18" class="th">pipelines allowed?</text>
+  <rect x="10" y="30" width="460" height="44" rx="2" class="b0"/>
+  <text x="22" y="50" class="tb">user query</text><text x="22" y="66" class="tms">INCLUDE PERFETTO MODULE a.b; FROM t |&gt; …</text>
+  <text x="520" y="56" class="ts">only after PERFETTO PRAGMA pipelines = 1</text>
+  <path d="M60,74 L60,96" class="ln" marker-end="url(#ah)"/><text x="70" y="90" class="ts">INCLUDE pushes</text>
+  <rect x="40" y="100" width="430" height="40" rx="2" class="ba"/>
+  <text x="52" y="118" class="tb">module a.b (standard library)</text><text x="52" y="133" class="ts">found by package prefix</text>
+  <text x="520" y="124" class="ts tg">always: builtin</text>
+  <path d="M90,140 L90,156" class="ln" marker-end="url(#ah)"/>
+  <rect x="70" y="160" width="400" height="34" rx="2" class="ba"/>
+  <text x="82" y="182" class="ts">a module it includes, and so on</text>
+  <text x="520" y="182" class="ts tg">always: builtin</text>
+</svg>
+</figure>
+<p class="m">The check is <code>SetPipelinesAllowed(builtin || pipelines_enabled_)</code>, called on each frame's parser before every statement.
+<code>builtin</code> is true for a standard library module, and <code>pipelines_enabled_</code> is set by the pragma.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Syntax errors in any statement come from syntaqlite, with a traceback into your text.
+Name and type errors in plain SQL, such as "no such column", come from SQLite's second parse of the expanded text.
+They are mapped back through the <code>SqlSource</code> tree.
+Statements take effect one at a time, in order, so a macro or module is visible only to the statements after it.
+</blockquote>
+
+<!-- ═════════════════════════ PART III ═════════════════════════ -->
+<div class="part">Part III · Pipelines</div>
+
+<h2 id="pipes"><span class="n">7</span>Pipe syntax writes a query top to bottom, in the order data flows</h2>
+<p>A pipeline lists a source and then stages, and each <code>|&gt;</code> stage takes the rows of the one before it.
+Plain SQL is written inside-out. The FROM sits in the middle, and each extra step wraps the previous query as a subquery.
+Trace analysis also keeps needing operations SQL expresses badly, like summing a value up a tree of slices or intersecting intervals per CPU.</p>
+
+<figure>
+<figcaption><b>Figure 12. The same query reads inside-out in SQL and top to bottom as a pipeline.</b> Shape, simplified: the SQL column
+shows how each step nests, not a literal translation of TREE ACCUMULATE, which has no plain SQL form.</figcaption>
+<svg viewBox="0 0 860 170" style="max-width:860px" role="img" aria-label="Nested SQL versus a top-to-bottom pipeline">
+  <text x="10" y="18" class="th">plain SQL: read from the middle out</text><text x="470" y="18" class="th">pipeline: read top to bottom</text>
+  <rect x="10" y="28" width="420" height="132" rx="2" class="b2"/>
+  <rect x="26" y="58" width="388" height="86" rx="2" class="bw"/>
+  <rect x="42" y="84" width="356" height="34" rx="2" class="ba"/>
+  <text x="22" y="48" class="tms">SELECT id, ts, name, t FROM (</text>
+  <text x="38" y="76" class="tms">SELECT *, &lt;sum over subtree&gt; AS t FROM (</text>
+  <text x="54" y="106" class="tms">SELECT * FROM slice</text>
+  <text x="38" y="136" class="tms">)</text>
+  <text x="22" y="154" class="tms">) ORDER BY ts</text>
+  <rect x="470" y="28" width="380" height="30" rx="2" class="ba"/><text x="482" y="48" class="tms">FROM slice</text>
+  <path d="M500,58 L500,70" class="ln" marker-end="url(#ah)"/>
+  <rect x="470" y="72" width="380" height="30" rx="2" class="bw"/><text x="482" y="92" class="tms">|&gt; TREE ACCUMULATE UP SUM(dur) AS t</text>
+  <path d="M500,102 L500,114" class="ln" marker-end="url(#ah)"/>
+  <rect x="470" y="116" width="380" height="30" rx="2" class="b2"/><text x="482" y="136" class="tms">|&gt; SELECT id, ts, name, t |&gt; ORDER BY ts</text>
+</svg>
+</figure>
+
+<p>A stage is also called a <b>pipe operator</b>. Three layers below use similar words for it, so Figure 13 keeps them apart.</p>
+
+<figure>
+<figcaption><b>Figure 13. One stage has three names, one per layer.</b> The stage is syntax. Its plan operation is what the compiler
+records about it (Section 8). An executor Operator is one kind of runtime step that a plan operation may produce (Section 11).</figcaption>
+<svg viewBox="0 0 860 110" style="max-width:860px" role="img" aria-label="Stage, plan operation and executor step for ORDER BY">
+  <text x="10" y="18" class="th">syntax (AST)</text><text x="300" y="18" class="th">compiler (logical plan)</text><text x="590" y="18" class="th">executor (physical plan)</text>
+  <rect x="10" y="28" width="250" height="50" rx="2" class="ba"/><text x="22" y="48" class="tb">stage</text><text x="22" y="66" class="tms">PerfettoPipeOrderBy node</text>
+  <path d="M260,53 L296,53" class="ln" marker-end="url(#ah)"/>
+  <rect x="300" y="28" width="250" height="50" rx="2" class="bv"/><text x="312" y="48" class="tb">plan operation</text><text x="312" y="66" class="tms">OrderBy : PlanOperation</text>
+  <path d="M550,53 L586,53" class="ln" marker-end="url(#ah)"/>
+  <rect x="590" y="28" width="260" height="50" rx="2" class="bw"/><text x="602" y="48" class="tb">executor step</text><text x="602" y="66" class="tms">Sort, a Breaker (an Operator)</text>
+  <text x="10" y="100" class="ts">Some stages stop at the first box: SELECT, DROP and RENAME only edit names and add nothing to the plan.</text>
+</svg>
+</figure>
+
+<p>A pipeline is either a statement on its own (<code>cmd ::= perfetto_pipeline</code>) or the body of <code>CREATE PERFETTO TABLE … AS</code>.
+It cannot appear inside a SELECT. User SQL must first run <code>PERFETTO PRAGMA pipelines = 1;</code>, or compilation fails
+with "Pipelines are not enabled". Standard library modules may always use pipes (<code>builtin || pipelines_enabled_</code>).</p>
+
+<table>
+  <thead><tr><th>Construct</th><th>Grammar</th><th>Compiles to</th></tr></thead>
+  <tbody>
+    <tr><td>source</td><td><code>FROM table [AS a]</code>, <code>FROM (select) [AS a]</code></td><td><code>Scan</code></td></tr>
+    <tr><td>source</td><td><code>INTERVAL INTERSECTION OF (rel AS a, rel AS b, …) [PER cols]</code></td><td><code>IntervalIntersect</code></td></tr>
+    <tr><td>stage</td><td><code>TREE ACCUMULATE UP|DOWN SUM(col) AS name, …</code></td><td><code>TreeAccumulate</code></td></tr>
+    <tr><td>stage</td><td><code>INTERVAL FLATTEN [PER cols] AGGREGATE agg AS name, …</code></td><td><code>IntervalFlatten</code></td></tr>
+    <tr><td>stage</td><td><code>ORDER BY col [ASC|DESC], …</code></td><td><code>OrderBy</code></td></tr>
+    <tr><td>stage</td><td><code>SELECT</code>, <code>EXTEND</code>, <code>DROP</code>, <code>RENAME</code>, <code>SET</code>, <code>AS alias</code></td><td>scope changes only (<code>projection::k*</code>)</td></tr>
+    <tr><td>stage</td><td><code>INTERVAL FILL GAPS WITH rel [PER cols]</code></td><td class="warn">parses; compiler returns "not supported yet"</td></tr>
+    <tr><td>stage</td><td><code>AGGREGATE agg AS name, … [GROUP BY cols]</code></td><td class="bad">parses, but has no registration, so compiling it hits a fatal error (Section 12)</td></tr>
+  </tbody>
+</table>
+
+<p>The compiler is deliberately narrow today:</p>
+<ul>
+  <li>Every place that takes an expression accepts only a column reference. <code>ResolveColumnExpr</code> rejects "an expression other than a column".</li>
+  <li>SELECT and EXTEND items are columns or stars. There are no computed columns yet.</li>
+  <li>TREE ACCUMULATE supports only SUM (<code>ResolveSum</code>). INTERVAL FLATTEN also allows <code>COUNT(*)</code>.</li>
+  <li>ORDER BY rejects string columns.</li>
+  <li>A pipeline outputs at most 256 columns (<code>kMaxPipelineColumns</code>).</li>
+</ul>
+
+<div class="two">
+<div>
+<pre><code><span class="src">tree accumulation</span><span class="k">PERFETTO PRAGMA</span> pipelines = 1;
+<span class="k">FROM</span> slice
+|&gt; <span class="k">TREE ACCUMULATE UP</span> SUM(dur) <span class="k">AS</span> subtree_dur
+|&gt; <span class="k">SELECT</span> id, ts, name, subtree_dur
+|&gt; <span class="k">ORDER BY</span> ts;</code></pre>
+</div>
+<div>
+<pre><code><span class="src">pipeline_tests.py (diff test)</span><span class="k">INTERVAL INTERSECTION OF</span> (a <span class="k">AS</span> x, b <span class="k">AS</span> y) <span class="k">PER</span> cpu
+|&gt; <span class="k">SELECT</span> ts, dur, cpu, x.name;</code></pre>
+<p>TREE ACCUMULATE reads columns named id and parent_id from the row.
+An intersection outputs the region's ts and dur, and the PER keys (here cpu).
+Every operand column is also output, but only as <code>alias.col</code>.</p>
+</div>
+</div>
+
+<h2 id="compiler"><span class="n">8</span>The compiler keeps column names apart from column values</h2>
+<p>The compiler turns the AST, which records what the user wrote, into a list of operations that each read and write specific columns.
+On the way, names keep changing. RENAME and AS change them, and a stage can add a new one such as subtree_dur.
+The same word can mean different columns at different stages. The compiler resolves all of that once.</p>
+<p><code>pipeline::Compile(parser, pipeline_node, source_fn, catalog)</code> runs inside <code>ParseStatement</code>, while the AST is still alive.
+So an unsupported query fails at parse time, with a traceback.
+The <b>catalog</b> is how it looks up the relations (tables and views) and dataframes a pipeline can read.</p>
+<p>It produces a <b>logical plan</b> (<code>LogicalPlan</code>), a tree that says <em>what</em> to compute, stage by stage, before any executor steps are chosen.
+Each node (<code>PlanNode</code>) holds one <code>PlanOperation</code> and the IDs of its children.
+The root is the last stage, and the leaves are sources.
+For the running example the plan has two nodes: a Scan of slice, and an OrderBy on ts whose child is the scan.</p>
+<p>The central design choice is in the <code>Compiler</code> class comment: "adding a plan node does not change the visible row,
+and changing the row does not add execution work". So the compiler keeps two things apart:</p>
+<ul>
+  <li><b>Values</b> live in the plan. <code>AddColumn(name, type)</code> allocates a <code>ColumnId</code>, a number that stays the same for the whole plan.
+  Operations refer to inputs and outputs only by this ID.</li>
+  <li><b>Names</b> live in the <code>Scope</code>: the ordered list of visible columns, each a name plus a value ID,
+  and snapshots of that list taken whenever an alias is given.</li>
+</ul>
+<pre><code><span class="src">compiler.h (shape)</span><span class="c">// Scope::row, one entry per visible column</span>
+RowColumn{NamedColumn{name, id}, operation, node, qualified_only}
+<span class="c">// Scope::aliases, a snapshot of row per alias</span></code></pre>
+<p>So RENAME, DROP and SELECT edit the row and add nothing to the plan.
+That is why their registrations have no encoding: they never appear in the plan's byte form (Section 10).
+<code>qualified_only</code> exists for intersections. Operand columns are reachable as x.ts but not as a bare ts, so a bare ts always means the region.</p>
+
+<figure>
+<figcaption><b>Figure 14. The plan only gains nodes for real work, while the scope tracks what each value is called.</b>
+Pruning (Section 9) then uses <code>plan.output()</code> to remove work nobody reads.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="Scope versus logical plan">
+  <text x="10" y="18" class="th">stage</text>
+  <text x="250" y="18" class="th">scope.row (names → ColumnId)</text>
+  <text x="700" y="18" class="th">logical plan</text>
+  <line x1="10" y1="26" x2="990" y2="26" class="ln"/>
+
+  <text x="10" y="56" class="tm">FROM slice</text>
+  <rect x="250" y="38" width="420" height="30" rx="2" class="b0"/>
+  <text x="260" y="58" class="tms">id:c0  ts:c1  dur:c2  …  name:c5  …  parent_id:c7  …</text>
+  <rect x="700" y="38" width="130" height="30" rx="2" class="ba"/><text x="712" y="58" class="tm">Scan</text>
+  <text x="840" y="58" class="ts">AddNode</text>
+
+  <text x="10" y="112" class="tm">|&gt; TREE ACCUMULATE</text><text x="10" y="128" class="tm">   UP SUM(dur) AS t</text>
+  <rect x="250" y="96" width="420" height="30" rx="2" class="b0"/>
+  <text x="260" y="116" class="tms">id:c0  ts:c1  dur:c2  …  </text>
+  <rect x="420" y="100" width="70" height="22" rx="2" class="bg"/><text x="430" y="115" class="tms">t:cN</text>
+  <rect x="700" y="96" width="130" height="30" rx="2" class="ba"/><text x="712" y="116" class="tm">TreeAccumulate</text>
+  <path d="M765,96 L765,70" class="lna" marker-end="url(#aha)"/>
+  <text x="840" y="116" class="ts">AddColumn + Append</text>
+
+  <text x="10" y="170" class="tm">|&gt; SELECT id, t</text>
+  <rect x="250" y="154" width="420" height="30" rx="2" class="bw"/>
+  <text x="260" y="174" class="tms">id:c0  t:cN</text>
+  <text x="700" y="174" class="ts">(nothing added)</text>
+  <text x="840" y="174" class="ts">ReplaceRow</text>
+
+  <text x="10" y="226" class="tm">Finish()</text>
+  <rect x="250" y="210" width="420" height="30" rx="2" class="bg"/>
+  <text x="260" y="230" class="tms">plan.output() = [("id", c0), ("t", cN)]</text>
+  <text x="700" y="230" class="ts">root = TreeAccumulate</text>
+
+  <text x="10" y="276" class="ts">Column IDs are illustrative; Scan allocates one per source column in order. Each source or stage is dispatched by its AST tag through</text>
+  <text x="10" y="292" class="ts">FindOperationBySyntax() to the registration's BuildPlan(Compiler*, ast_node).</text>
+</svg>
+</figure>
+
+<p>The registry of operations is a flat array in <code>operation_registry.cc</code>:</p>
+<pre><code><span class="src">operation_registry.cc</span><span class="k">const</span> OperationRegistration* <span class="k">const</span> kOperations[] = {
+    &amp;Scan::kRegistration,             <span class="c">// Encoding tag 0, source</span>
+    &amp;TreeAccumulate::kRegistration,   <span class="c">// tag 1</span>
+    &amp;IntervalIntersect::kRegistration,<span class="c">// tag 2, source</span>
+    &amp;IntervalFlatten::kRegistration,  <span class="c">// tag 3</span>
+    &amp;OrderBy::kRegistration,          <span class="c">// tag 4</span>
+    &amp;projection::kSelect, &amp;projection::kExtend, &amp;projection::kDrop,
+    &amp;projection::kRename, &amp;projection::kSet,    &amp;projection::kAs,  <span class="c">// no encoding</span>
+};</code></pre>
+<p class="m">The tag comments are added here. Each tag is the first argument of <code>OperationRegistration::Encoding{…}</code> in the operation's
+<code>.cc</code> file. An encoding tag is the number that identifies the operation when the plan is written out as bytes (Section 10).</p>
+<p>A table source is read straight from its dataframe only in one case. The name must be unqualified and found in the catalog,
+and the dataframe must be finalized, meaning complete and no longer being built (<code>Scan::FindDirectDataframe</code>).
+Anything else, including views and subqueries, becomes a <b>SQL scan</b>.
+Its columns and types come from <code>analysis::RelationAnalyzer</code> in <code>src/perfetto_sql/analysis</code>, without running the SQL.
+The running example is a SQL scan, because slice is a <code>CREATE PERFETTO VIEW</code> over <code>__intrinsic_slice</code>
+(<code>stdlib/prelude/after_eof/views.sql</code>).</p>
+
+<h2 id="pruning"><span class="n">9</span>Pruning removes the columns and the work that nothing reads</h2>
+<p><b>Column pruning</b> removes unread columns, and the work that makes them, before anything runs.
+It matters because a source like slice has about fifteen columns, and a query often reads two.
+Every column a scan emits is carried through every stage. For a SQL scan, each column is also first copied row by row into a temporary dataframe (Section 10).</p>
+<p>Right after compiling, <code>Compile</code> calls <code>PruneColumns(plan)</code>.
+It marks a <code>needed</code> bit for each column in <code>plan.output()</code>, then walks from the root to the leaves.
+Each operation's <code>Prune(needed)</code> drops outputs nobody needs and marks the inputs it still reads.
+It returns either <code>nullopt</code>, meaning "keep me", or a child slot (the index of one of its children), meaning "replace me with that child".</p>
+<p>The running example prunes nothing, because it has no SELECT and every slice column is output.
+Figure 15 uses the tree query from Section 8 instead, whose <code>SELECT id, t</code> keeps two columns.</p>
+<pre><code><span class="src">column_pruning.cc</span>PlanNodeId PruneNode(LogicalPlan&amp; plan, PlanNodeId id, std::vector&lt;bool&gt;&amp; needed) {
+  PlanNode&amp; node = plan.nodes()[id];
+  <span class="hg">if (std::optional&lt;uint32_t&gt; child = node.operation().Prune(&amp;needed)) {</span>
+    return PruneNode(plan, node.children()[*child], needed);
+  }
+  for (auto&amp; child : node.children()) child = PruneNode(plan, child, needed);
+  return id;
+}</code></pre>
+
+<figure>
+<figcaption><b>Figure 15. Pruning walks back from the output and keeps only what each step still reads.</b>
+ORDER BY keys and tree structure columns survive because their operations mark them. A scan never drops to zero columns,
+because "a batch with no columns has no rows".</figcaption>
+<svg viewBox="0 0 1000 210" role="img" aria-label="Backward pruning pass">
+  <text x="10" y="18" class="th">root → leaves</text>
+  <rect x="10" y="30" width="290" height="70" rx="2" class="bg"/>
+  <text x="22" y="52" class="tb">seed from output</text><text x="22" y="72" class="tms">needed = {id, t}</text>
+  <path d="M300,65 L346,65" class="lng" marker-end="url(#ahg)"/>
+  <rect x="350" y="30" width="300" height="70" rx="2" class="ba"/>
+  <text x="362" y="52" class="tb">TreeAccumulate::Prune</text><text x="362" y="72" class="tms">t needed → keep; mark</text><text x="362" y="88" class="tms">id, parent_id, dur</text>
+  <path d="M650,65 L696,65" class="lna" marker-end="url(#aha)"/>
+  <rect x="700" y="30" width="290" height="70" rx="2" class="ba"/>
+  <text x="712" y="52" class="tb">Scan::Prune</text><text x="712" y="72" class="tms">keep id, dur, parent_id;</text><text x="712" y="88" class="tms">drop the other columns</text>
+
+  <text x="10" y="134" class="th">if the SELECT had not kept t</text>
+  <rect x="350" y="144" width="300" height="52" rx="2" class="br"/>
+  <text x="362" y="166" class="tb">aggregates_ empty → return 0</text><text x="362" y="184" class="ts">the whole stage is spliced out</text>
+  <rect x="700" y="144" width="290" height="52" rx="2" class="b0"/>
+  <text x="712" y="166" class="ts">no numbering, no tree sort, no fold;</text><text x="712" y="184" class="ts">Scan keeps at least one column</text>
+</svg>
+</figure>
+
+<h2 id="bridge"><span class="n">10</span>A pipeline reaches SQLite as one call to a table-valued function</h2>
+<p>To the rest of Trace Processor, a pipeline must still look like SQL.
+Results stream through the same prepared-statement API, and <code>CREATE PERFETTO TABLE … AS pipeline</code> reuses the SELECT path.
+So <code>PreparePipeline</code> turns the plan into one SELECT over <code>__intrinsic_pipeline</code>.
+That is an <em>eponymous</em> table-valued function: SQLite exposes it under its module name, with no CREATE VIRTUAL TABLE needed.
+<code>SelectPipelineSql(plan)</code> builds the statement in three steps:</p>
+<ol>
+  <li><b>SQL scans become arguments.</b> Each one becomes a numbered argument: a small query that collects its rows into a dataframe.
+  The dataframe reaches the pipeline as a tagged C pointer that only the pipeline can read.
+  The query runs where the pipeline was written, so it sees the views in scope there.
+  Code: <code>MoveSqlSourcesToDataframeArgs</code> (leaves <code>Scan::DataframeArg{i}</code>), <code>DataframeAgg</code>, <code>sqlite3_result_pointer</code> with tag <code>"PIPELINE_DATAFRAME"</code>.</li>
+  <li><b>The plan becomes bytes.</b> <code>SerializePlan</code> writes each source and stage as its encoding tag plus a payload.
+  Columns are referred to by position. The bytes become a hex blob literal, <code>X'…'</code>.</li>
+  <li><b>Both go into one SELECT.</b> The result is <code>SELECT c0 AS "id", c1 AS "t" FROM __intrinsic_pipeline(X'…' [, (SELECT __intrinsic_dataframes(…))])</code>.
+  The inner SELECT makes SQLite build the dataframe list once.
+  Otherwise it would be rebuilt on every call to the virtual table's <code>Filter</code> callback, which starts a scan.</li>
+</ol>
+<p>For the running example, with the column lists shortened, SQLite actually prepares this statement:</p>
+<pre><code><span class="src">shape, simplified: output of SelectPipelineSql for FROM slice |&gt; ORDER BY ts</span><span class="k">SELECT</span> c0 <span class="k">AS</span> "id", c1 <span class="k">AS</span> "ts", c2 <span class="k">AS</span> "dur", …
+<span class="k">FROM</span> __intrinsic_pipeline(
+  X'…',                                  <span class="c">-- serialized plan: Scan(argument 0), OrderBy(ts)</span>
+  (<span class="k">SELECT</span> __intrinsic_dataframes(
+     (<span class="k">SELECT</span> __intrinsic_dataframe_agg('id,ts,dur,…', "id", "ts", "dur", …) <span class="k">FROM</span> slice))))</code></pre>
+
+<figure>
+<figcaption><b>Figure 16. The plan crosses SQLite as a plain value and is unpacked only when SQLite starts the scan.</b>
+At run time <code>BindDataframeArgs</code> also takes each SQL relation's column types from the dataframe actually built,
+because at compile time they were only guesses.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Pipeline through SQLite">
+  <text x="10" y="18" class="th">prepare time (parser thread)</text>
+  <text x="780" y="18" class="th">run time (SQLite calls back)</text>
+  <rect x="10" y="30" width="230" height="56" rx="2" class="bv"/>
+  <text x="22" y="52" class="tb">LogicalPlan</text><text x="22" y="70" class="ts">pruned</text>
+  <path d="M240,58 L276,58" class="lnv" marker-end="url(#ahv)"/>
+  <rect x="280" y="30" width="210" height="56" rx="2" class="bv"/>
+  <text x="292" y="52" class="tb">SelectPipelineSql</text><text x="292" y="70" class="ts">blob + dataframe args</text>
+  <path d="M490,58 L526,58" class="ln" marker-end="url(#ah)"/>
+  <rect x="530" y="30" width="210" height="56" rx="2" class="b"/>
+  <text x="542" y="52" class="tb">sqlite3_prepare</text><text x="542" y="70" class="ts">a normal statement</text>
+  <path d="M740,58 L776,58" class="ln" marker-end="url(#ah)"/>
+  <rect x="780" y="30" width="210" height="56" rx="2" class="ba"/>
+  <text x="792" y="52" class="tb">PipelineModule::Filter</text><text x="792" y="70" class="ts">argv[0] blob, argv[1] list</text>
+
+  <path d="M885,86 L885,120" class="lna" marker-end="url(#aha)"/>
+  <rect x="530" y="124" width="460" height="56" rx="2" class="ba"/>
+  <text x="542" y="146" class="tb">PerfettoSqlConnection::LoadPipeline</text>
+  <text x="542" y="164" class="tms">DeserializePlan → BindDataframeArgs → Lower</text>
+  <path d="M760,180 L760,206" class="lna" marker-end="url(#aha)"/>
+  <rect x="530" y="210" width="460" height="34" rx="2" class="bg"/>
+  <text x="542" y="232" class="tms">RowCursor over PhysicalPlan::source(); Column() reads ColumnViews</text>
+
+  <text x="10" y="130" class="ts">Deserializing looks every named dataframe up in the catalog</text>
+  <text x="10" y="146" class="ts">again: the blob is plain bytes in SQL, so the reader checks it</text>
+  <text x="10" y="162" class="ts">(PlanReader flags malformed input as failed instead of crashing).</text>
+  <text x="10" y="194" class="ts">A SQL relation with no rows arrives as a null pointer and is</text>
+  <text x="10" y="210" class="ts">bound as empty columns (Scan::BindDataframeArgs).</text>
+</svg>
+</figure>
+
+<h2 id="lowering"><span class="n">11</span>Lowering adds only the executor steps that are still missing</h2>
+<p><b>Lowering</b> turns the logical plan into concrete executor steps, and skips any step whose result is already true.
+A logical OrderBy says "rows sorted by ts". It does not say whether a sort is needed, or which executor class does it.
+Two stages may need the same preparation, such as numbering tree nodes. The input may also already be in the right order.</p>
+<p><code>pipeline::Lower(plan)</code> produces a <code>PhysicalPlan</code>: a source (<code>core::exec::Source</code>), a chain of steps,
+and which batch column each output name reads.
+A <code>Lowering</code> object assigns batch positions, the column slot in each batch that holds a value (<code>Define(id)</code>).
+It also tracks what is already true about the rows.
+It tracks three things:</p>
+<ul>
+  <li><b>Order</b>: which columns the rows are grouped by, and which ascend within a group.
+  <code>Scan::Lower</code> marks every dataframe column whose sort state is not <code>Unsorted</code> as ascending.
+  <code>SortRows</code> then skips the sort for a single ascending key, with no grouping, that is already ascending.</li>
+  <li><b>Tree columns</b> (<code>TreeColumns</code>): <code>PrepareTree</code> adds <code>TreeNumberNodes</code> once.
+  It adds <code>TreeChildFirst</code> (UP) or <code>TreeParentFirst</code> (DOWN), which reorder rows so children come before parents or the reverse,
+  only when the direction changes.
+  So back-to-back TREE ACCUMULATE stages share them.</li>
+  <li><b>Types</b>: <code>RequireInt64</code> adds an <code>AssertType</code> step only when a column's type is unknown and not yet checked.</li>
+</ul>
+<p>The executor, in <code>src/trace_processor/core/exec/</code>, is pull-based. The consumer asks for the next batch, and each step asks
+the one before it. It has three kinds of node:</p>
+<div class="cards">
+  <div class="card"><div class="lbl">Source</div><p>Produces batches: <code>DataframeScan</code>, <code>IntervalIntersect</code>, and <code>Pipeline</code> itself.</p></div>
+  <div class="card"><div class="lbl">Transform</div><p>Changes a batch in place and never holds rows back, so nothing is copied or buffered: <code>AssertType</code>, <code>TreeNumberNodes</code>, <code>TreeAccumulateUp/Down</code>.</p></div>
+  <div class="card"><div class="lbl">Operator</div><p>Reads an input batch into a separate output batch. So it may keep rows, which <code>Finish</code> emits after the last input, or emit several outputs per input. Examples: <code>TreeParentFirst</code>, <code>IntervalFlatten</code>, and the breakers below.</p></div>
+</div>
+<p>A <b>breaker</b>, short for pipeline breaker, is an Operator that must read all of its input before it can emit anything.
+Sort, GroupBy and TreeChildFirst are breakers. Everything before a breaker streams. Nothing after it starts until its input runs out.</p>
+<p>A <code>Pipeline</code> is a list of steps, and each step is a Transform or an Operator.
+It cuts the list into <b>segments</b> at each Operator, and a segment's Transforms run on the batch in place.
+Batches hold at most 2048 rows (<code>kMaxBatchRows</code> in
+<code>core/exec/selection.h</code>).
+Figure 17 shows segments and breakers together in a longer query.</p>
+<pre><code><span class="src">core/exec/pipeline.h (shape)</span>std::vector&lt;Step&gt;  <span class="c">// Step = std::variant&lt;std::unique_ptr&lt;Transform&gt;, std::unique_ptr&lt;Operator&gt;&gt;</span></code></pre>
+
+<figure>
+<figcaption><b>Figure 17. This tree query has two breakers, which cut it into three segments.</b>
+What <code>Lower</code> would emit for this plan, following <code>PrepareTree</code> and <code>SortRows</code> in <code>physical_plan.cc</code>.
+Nothing after TreeChildFirst runs until the scan is exhausted.</figcaption>
+<svg viewBox="0 0 1000 200" role="img" aria-label="Physical pipeline for tree accumulation">
+  <text x="10" y="18" class="tms">FROM slice |&gt; TREE ACCUMULATE UP SUM(dur) AS t |&gt; ORDER BY ts</text>
+  <rect x="10" y="40" width="150" height="56" rx="2" class="b2"/>
+  <text x="22" y="62" class="tb">DataframeScan</text><text x="22" y="80" class="ts">source</text>
+  <path d="M160,68 L186,68" class="ln" marker-end="url(#ah)"/>
+  <rect x="190" y="40" width="160" height="56" rx="2" class="bg"/>
+  <text x="202" y="62" class="tb">TreeNumberNodes</text><text x="202" y="80" class="ts">transform: +2 cols</text>
+  <path d="M350,68 L376,68" class="ln" marker-end="url(#ah)"/>
+  <rect x="380" y="40" width="150" height="56" rx="2" class="bw"/>
+  <text x="392" y="62" class="tb">TreeChildFirst</text><text x="392" y="80" class="ts">breaker: buffers</text>
+  <path d="M530,68 L556,68" class="ln" marker-end="url(#ah)"/>
+  <rect x="560" y="40" width="170" height="56" rx="2" class="bg"/>
+  <text x="572" y="62" class="tb">TreeAccumulateUp</text><text x="572" y="80" class="ts">transform: +1 col</text>
+  <path d="M730,68 L756,68" class="ln" marker-end="url(#ah)"/>
+  <rect x="760" y="40" width="110" height="56" rx="2" class="bw"/>
+  <text x="772" y="62" class="tb">Sort</text><text x="772" y="80" class="ts">breaker</text>
+  <path d="M870,68 L896,68" class="ln" marker-end="url(#ah)"/>
+  <rect x="900" y="40" width="90" height="56" rx="2" class="ba"/>
+  <text x="912" y="62" class="tb">cursor</text><text x="912" y="80" class="ts">SQLite</text>
+
+  <line x1="10" y1="120" x2="370" y2="120" class="lng"/><text x="10" y="138" class="ts tg">segment 1 (in place)</text>
+  <line x1="380" y1="120" x2="750" y2="120" class="lnw"/><text x="380" y="138" class="ts tw">segment 2: starts at an Operator</text>
+  <line x1="760" y1="120" x2="870" y2="120" class="lnw"/><text x="760" y="138" class="ts tw">segment 3</text>
+  <text x="10" y="172" class="t">TreeChildFirst reorders rows, so Lowering clears its Order; the later ORDER BY ts therefore needs a real Sort.</text>
+  <text x="10" y="190" class="ts">With a SUM over a column of unknown type, an AssertType(Int64) transform would also appear before the fold.</text>
+</svg>
+</figure>
+
+<h3 id="run">The running example sorts its whole input before SQLite sees the first row</h3>
+<p>The running example pays for a full sort, because its input comes through a view and arrives unsorted.
+When SQLite starts the generated statement, it first evaluates the argument subquery.
+There <code>DataframeAgg</code> reads every row of the slice view into a temporary dataframe.
+<code>PipelineModule::Filter</code> then calls <code>LoadPipeline</code>.
+That decodes the blob, binds the dataframe to the scan, and lowers the plan to DataframeScan → Sort(ts).</p>
+<p>The sort is not skipped, because <code>DataframeAgg</code> builds with <code>analyze = false</code>: it does not inspect the columns it copies, so it marks none as sorted.
+Reading <code>__intrinsic_slice</code> directly would skip it, since its ts column is declared <code>SORTED</code> in
+<code>tables/slice_tables.py</code>.</p>
+
+<figure>
+<figcaption><b>Figure 18. All the work happens inside Filter. After that, each SQLite step just reads the next row.</b>
+The running example from SQLite's first call to the last row. Sort is a breaker, so it pulls every batch from the scan before it serves one.</figcaption>
+<svg viewBox="0 0 860 250" style="max-width:860px" role="img" aria-label="Sequence of calls when SQLite runs the generated statement">
+  <text x="70" y="18" class="th" text-anchor="middle">SQLite</text>
+  <text x="300" y="18" class="th" text-anchor="middle">PipelineModule</text>
+  <text x="530" y="18" class="th" text-anchor="middle">RowCursor + Sort</text>
+  <text x="760" y="18" class="th" text-anchor="middle">DataframeScan</text>
+  <line x1="70" y1="26" x2="70" y2="240" class="ln dash"/><line x1="300" y1="26" x2="300" y2="240" class="ln dash"/>
+  <line x1="530" y1="26" x2="530" y2="240" class="ln dash"/><line x1="760" y1="26" x2="760" y2="240" class="ln dash"/>
+  <rect x="10" y="34" width="250" height="26" rx="2" class="bw"/><text x="20" y="51" class="ts">1 · argument: DataframeAgg copies the view</text>
+  <path d="M70,76 L296,76" class="lna" marker-end="url(#aha)"/><text x="80" y="70" class="ts ta">2 · Filter</text>
+  <rect x="310" y="82" width="200" height="26" rx="2" class="ba"/><text x="320" y="99" class="ts">LoadPipeline: decode, bind, lower</text>
+  <path d="M300,124 L526,124" class="lna" marker-end="url(#aha)"/><text x="310" y="118" class="ts ta">3 · open cursor, pull first batch</text>
+  <path d="M530,144 L756,144" class="lnw" marker-end="url(#ahw)"/><text x="540" y="138" class="ts tw">4 · Sort pulls every batch</text>
+  <path d="M760,160 L534,160" class="lnw" marker-end="url(#ahw)"/><text x="600" y="174" class="ts tw">sorts all rows</text>
+  <path d="M530,188 L74,188" class="lng" marker-end="url(#ahg)"/><text x="310" y="182" class="ts tg">first sorted batch ready</text>
+  <path d="M70,214 L296,214" class="ln" marker-end="url(#ah)"/><text x="80" y="208" class="ts">5 · Next, Column, per row</text>
+  <text x="310" y="232" class="ts">one row per step; new batch when needed</text>
+</svg>
+</figure>
+
+<p>Still inside <code>Filter</code>, the <code>RowCursor</code> opens and pulls its first batch.
+Sort pulls every batch from the scan, sorts, and serves its first output batch. So the whole sort happens before SQLite sees row one.
+Each SQLite step then calls <code>PipelineModule::Next</code>, which moves the cursor one row and pulls a new batch when needed.
+<code>Column</code> reads the value of output column <code>cN</code> from the current batch.
+The outer <code>SELECT c0 AS "id", …</code> returns it to the caller as an ordinary result row.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Put ORDER BY where the data is already in that order, or last.
+Only a table read directly keeps its sort information. A view or subquery arrives unsorted, so ordering it costs a full sort.
+Put TREE ACCUMULATE stages of the same direction next to each other, so they share one numbering and one tree sort.
+Select only the columns you need, because pruning reaches all the way to the scan.
+</blockquote>
+
+<!-- ═════════════════════════ PART IV ═════════════════════════ -->
+<div class="part">Part IV · Extending</div>
+
+<h2 id="new-op"><span class="n">12</span>Adding a pipe operator takes seven steps, but only about five files need real work</h2>
+<p>Every stage touches the same layers: syntax, compilation, serialization, lowering, execution and tests.
+ORDER BY is the smallest stage that has all of them, so the recipe below follows how it is wired.
+TREE ACCUMULATE is the model for a stage that adds columns.</p>
+
+<figure>
+<figcaption><b>Figure 19. A new stage goes through seven steps, from the AST node to the tests.</b> Paths are relative to
+<code>src/perfetto_sql/</code> for rows 1 and 2, <code>src/trace_processor/perfetto_sql/pipeline/</code> for rows 3 to 5, and <code>src/trace_processor/</code> for row 6.</figcaption>
+<svg viewBox="0 0 1000 330" role="img" aria-label="Files touched by a new pipe operator">
+  <text x="10" y="18" class="th">layer</text><text x="190" y="18" class="th">file</text><text x="600" y="18" class="th">ORDER BY's version</text>
+  <line x1="10" y1="26" x2="990" y2="26" class="ln"/>
+  <rect x="10" y="36" width="160" height="34" rx="2" class="ba"/><text x="22" y="58" class="tb">1 · AST node</text>
+  <text x="190" y="58" class="tms">syntaqlite/perfetto.synq</text><text x="600" y="58" class="tms">node PerfettoPipeOrderBy; in abstract PerfettoPipeStage</text>
+  <rect x="10" y="78" width="160" height="34" rx="2" class="ba"/><text x="22" y="100" class="tb">2 · grammar</text>
+  <text x="190" y="100" class="tms">syntaqlite/perfetto.y (+ regenerate)</text><text x="600" y="100" class="tms">perfetto_pipe_stage ::= ORDER BY …</text>
+  <rect x="10" y="120" width="160" height="34" rx="2" class="bv"/><text x="22" y="142" class="tb">3 · plan operation</text>
+  <text x="190" y="142" class="tms">pipeline/operations/order_by.{h,cc}</text><text x="600" y="142" class="tms">class OrderBy : public PlanOperation</text>
+  <rect x="10" y="162" width="160" height="34" rx="2" class="bv"/><text x="22" y="184" class="tb">4 · registry</text>
+  <text x="190" y="184" class="tms">operation_registry.cc, operations/BUILD.gn</text><text x="600" y="184" class="tms">&amp;OrderBy::kRegistration, tag 4</text>
+  <rect x="10" y="204" width="160" height="34" rx="2" class="bw"/><text x="22" y="226" class="tb">5 · lowering</text>
+  <text x="190" y="226" class="tms">OrderBy::Lower → Lowering helpers</text><text x="600" y="226" class="tms">c-&gt;SortRows(keys_)</text>
+  <rect x="10" y="246" width="160" height="34" rx="2" class="bw"/><text x="22" y="268" class="tb">6 · executor</text>
+  <text x="190" y="268" class="tms">core/exec/&lt;op&gt;.{h,cc} (if new work)</text><text x="600" y="268" class="tms">reuses core::exec::Sort</text>
+  <rect x="10" y="288" width="160" height="34" rx="2" class="bg"/><text x="22" y="310" class="tb">7 · tests, docs</text>
+  <text x="190" y="310" class="tms">unittests, pipeline_tests.py, docs/analysis</text><text x="600" y="310" class="tms">LogicalPlanFormatter::OrderByString</text>
+</svg>
+</figure>
+
+<h3>1–2 · Syntax</h3>
+<p>Add a <code>node</code> to <code>perfetto.synq</code> with its fields and <code>fmt</code> block, and list it in <code>abstract PerfettoPipeStage</code>.
+In <code>perfetto.y</code>, add a <code>perfetto_pipe_stage(A) ::= …</code> rule that calls the generated <code>synq_parse_…</code> builder.
+Put any new keyword in the <code>%fallback ID …</code> line, so existing queries that use the word as a name keep parsing.
+Remember Section 4: a stage that ends in an expression must not let it swallow the next <code>|</code>.
+Then run <code>tools/gen_syntaqlite_parser</code> and commit the regenerated <code>syntaqlite_perfetto.{c,h}</code>.
+It needs the prebuilt tool from <code>tools/install-build-deps --syntaqlite</code>.</p>
+
+<h3>3 · The plan operation</h3>
+<p>Subclass <code>PlanOperation</code> and give it a static registration. The registration ties together the AST tag, the builder and the wire encoding:</p>
+<pre><code><span class="src">operations/order_by.cc (reflowed; comments added)</span><span class="k">const</span> OperationRegistration OrderBy::kRegistration{
+    SYNTAQLITE_NODE_PERFETTO_PIPE_ORDER_BY, &amp;BuildPlan,
+<span class="hw">    OperationRegistration::Encoding{4, /*is_source=*/false, &amp;DecodePlan}};</span>
+
+base::Status OrderBy::BuildPlan(Compiler* c, uint32_t stage) {
+  c-&gt;SetOperation("ORDER BY");                     <span class="c">// label for error messages</span>
+  <span class="k">const auto</span>* n = Node&lt;SyntaqlitePerfettoPipeOrderBy&gt;(c-&gt;parser(), stage);
+  <span class="k">const auto</span>* terms = Node&lt;SyntaqlitePerfettoPipeOrderTermList&gt;(c-&gt;parser(), n-&gt;terms);
+  OrderBy order;
+  <span class="k">for</span> (uint32_t i = 0; i &lt; syntaqlite_list_count(terms); ++i) {
+    <span class="k">const auto</span>* term = Node&lt;SyntaqlitePerfettoPipeOrderTerm&gt;(
+        c-&gt;parser(), syntaqlite_list_child_id(terms, i));
+    ASSIGN_OR_RETURN(ColumnId id, c-&gt;ResolveColumnExpr(term-&gt;expr));
+    <span class="k">const auto</span>&amp; type = c-&gt;plan().columns()[id].type;
+    <span class="k">if</span> (type &amp;&amp; type-&gt;Is&lt;core::String&gt;())
+      <span class="k">return</span> c-&gt;Unsupported(term-&gt;expr, "ordering by a string column");
+    order.keys_.push_back({id, term-&gt;sort_order == SYNTAQLITE_SORT_ORDER_DESC});
+  }
+  <span class="hg">c-&gt;AddNode(std::move(order), {c-&gt;plan().root()});   // new root, reads the old root</span>
+  <span class="k">return</span> base::OkStatus();
+}</code></pre>
+<p>A stage that produces values follows <code>TreeAccumulate::BuildPlan</code>, in this order:</p>
+<ol>
+  <li>Resolve all inputs against the incoming row.</li>
+  <li>Allocate each output with <code>c-&gt;AddColumn(name, type)</code>.</li>
+  <li>Add each output to the row with <code>c-&gt;Append(NamedColumn{name, id}, ast_node)</code>.</li>
+  <li>Only then call <code>AddNode</code>.</li>
+</ol>
+<p>Report problems with <code>c-&gt;Unsupported</code>, <code>c-&gt;Expected</code> or <code>c-&gt;Err</code>, so they carry a traceback to the AST node.
+The remaining virtual methods, as <code>OrderBy</code> implements them:</p>
+<table>
+  <thead><tr><th>Method</th><th>Contract (from logical_plan.h)</th><th>OrderBy</th></tr></thead>
+  <tbody>
+    <tr><td><code>Prune(needed)</code></td><td>Mark required inputs; return a child slot to be replaced by it, or <code>nullopt</code>. Do not recurse.</td><td>Marks every key column, returns <code>nullopt</code>. (<code>TreeAccumulate</code> returns 0 when no aggregate is needed.)</td></tr>
+    <tr><td><code>Write(PlanWriter*, node, Available*)</code></td><td>Write the payload and update the available column list.</td><td><code>Size(keys)</code>, then per key <code>Position(available, column)</code> and <code>U8(descending)</code>.</td></tr>
+    <tr><td><code>static DecodePlan(PlanReader*, Available*)</code></td><td>Read the payload, append nodes, update available columns; call <code>Fail()</code> on bad input.</td><td>Mirrors <code>Write</code>; fails on zero keys; ends with <code>AddNode</code>.</td></tr>
+    <tr><td><code>Lower(Lowering*, node)</code></td><td>Lower children first, then add executor steps and <code>Define</code> new columns.</td><td><code>c-&gt;LowerNode(node.children()[0]); c-&gt;SortRows(keys_);</code></td></tr>
+    <tr><td><code>Clone()</code></td><td>Deep-copy mutable payload so pruning a copy cannot change the original.</td><td><code>make_unique&lt;OrderBy&gt;(*this)</code></td></tr>
+    <tr><td><code>registration()</code></td><td>Return the static registration; <code>PlanNode::Is&lt;T&gt;()</code> compares its address.</td><td><code>return kRegistration;</code></td></tr>
+  </tbody>
+</table>
+<p>Sources also override <code>MoveSqlSourcesToDataframeArgs</code>, <code>ResolveDataframes</code> and <code>BindDataframeArgs</code>.
+Stages inherit defaults that do nothing.</p>
+
+<h3>4 · Registration and encoding</h3>
+<p>Add the files to <code>operations/BUILD.gn</code>, and add <code>&amp;MyOp::kRegistration</code> to <code>kOperations[]</code>.
+Pick an unused encoding tag (Section 8), because tags 0 to 4 are taken.
+The comment in <code>operation_registry.h</code> says the tag is "independent of registration order", so array order does not matter.
+But if two tags are equal, <code>FindOperationByTag</code> returns the first.
+A stage that only renames or drops columns needs no plan node and no encoding. Register it with <code>std::nullopt</code>, like <code>projection::kDrop</code>.</p>
+
+<blockquote class="warn"><span class="lbl">Land syntax and compiler together</span>
+A stage that parses but has no registration and no special case crashes Trace Processor, as Figure 20 shows.
+In this revision <code>PerfettoPipeAggregate</code> is in the grammar with neither a registration nor a special case.
+So a well-formed <code>|&gt; AGGREGATE …</code> reaches the fatal path.
+If the grammar lands first, add an <code>Unsupported</code> case next to the FILL GAPS one.
+</blockquote>
+
+<figure>
+<figcaption><b>Figure 20. A parsed stage with no registration and no special case hits a fatal error.</b>
+How <code>Compiler::BuildOperation</code> handles each stage's AST tag. The only special case is for <code>SYNTAQLITE_NODE_PERFETTO_INTERVAL_FILL_GAPS</code>.</figcaption>
+<svg viewBox="0 0 860 170" style="max-width:860px" role="img" aria-label="How the compiler handles a stage tag with and without a registration">
+  <rect x="10" y="20" width="190" height="50" rx="2" class="b0"/><text x="22" y="42" class="tb">stage AST tag</text><text x="22" y="60" class="tms">FindOperationBySyntax</text>
+  <path d="M200,45 L256,45" class="lng" marker-end="url(#ahg)"/><text x="206" y="37" class="ts tg">registered</text>
+  <rect x="260" y="20" width="590" height="50" rx="2" class="bg"/><text x="272" y="42" class="tb">registration's BuildPlan runs</text><text x="272" y="60" class="ts">ORDER BY, TREE ACCUMULATE, INTERVAL FLATTEN, projections</text>
+  <path d="M105,70 L105,96" class="ln" marker-end="url(#ah)"/><text x="113" y="88" class="ts">not registered</text>
+  <rect x="10" y="100" width="190" height="56" rx="2" class="b2"/><text x="22" y="122" class="tb">special case?</text><text x="22" y="140" class="ts">only FILL GAPS has one</text>
+  <path d="M200,114 L256,104" class="lnw" marker-end="url(#ahw)"/><text x="206" y="100" class="ts tw">yes</text>
+  <rect x="260" y="84" width="590" height="34" rx="2" class="bw"/><text x="272" y="106" class="ts">INTERVAL FILL GAPS: returns "not supported yet"</text>
+  <path d="M200,144 L256,144" class="lnr" marker-end="url(#ahr)"/><text x="206" y="160" class="ts tr">no</text>
+  <rect x="260" y="128" width="590" height="34" rx="2" class="br"/><text x="272" y="150" class="tms">PERFETTO_FATAL("Unknown pipeline stage"): AGGREGATE today</text>
+</svg>
+</figure>
+
+<h3>5–6 · Lowering and the executor</h3>
+<p>Reuse the <code>Lowering</code> helpers before writing an executor:</p>
+<ul>
+  <li><code>SortRows</code> for ordering.</li>
+  <li><code>PrepareGroups(keys, ascending)</code> for per-partition work, as <code>IntervalFlatten</code> does.</li>
+  <li><code>PrepareTree</code> for tree work, and <code>RequireInt64</code> for type checks.</li>
+</ul>
+<p>Then call <code>AddOperator(std::make_unique&lt;ex::MyStep&gt;(spec))</code> with batch positions from <code>Position(id)</code>.
+Call <code>Define(output_id)</code> for each appended column, in append order.
+If the step reorders or replaces rows, update what Lowering knows. Either call <code>SetOrder</code>, or call <code>ResetLayout</code>
+and re-<code>Define</code> the surviving columns, as <code>IntervalFlatten::Lower</code> does.</p>
+<p>A new executor goes in <code>src/trace_processor/core/exec/</code>. Pick the base class by how the step treats rows:</p>
+<table>
+  <thead><tr><th>Base class</th><th>Use when</th><th>Implement</th></tr></thead>
+  <tbody>
+    <tr><td><code>Transform</code></td><td>Each batch can be handled alone and in place</td><td><code>Process(RowBatch&amp;, OperatorState&amp;)</code></td></tr>
+    <tr><td><code>Operator</code></td><td>It holds rows back or emits several batches per input</td><td><code>Execute</code>, optionally <code>Finish</code></td></tr>
+    <tr><td><code>Breaker</code></td><td>It must see all input first</td><td>A subclass of <code>Operator</code> (<code>breaker.h</code>)</td></tr>
+  </tbody>
+</table>
+<p>Keep the node const, and put run state in an <code>OperatorState</code> from <code>MakeState()</code>.
+As <code>operator.h</code> says, "a plan can be run more than once or concurrently".</p>
+
+<h3>7 · Tests and docs</h3>
+<table>
+  <thead><tr><th>Where</th><th>What to cover</th></tr></thead>
+  <tbody>
+    <tr><td><code>parser/perfetto_sql_parser_unittest.cc</code></td><td>The syntax parses, keywords still work as names, bad forms are syntax errors.</td></tr>
+    <tr><td><code>pipeline/logical_plan_test_utils.cc</code></td><td>Add a branch to <code>LogicalPlanFormatter</code> (it is a friend of each operation) so plans print in tests.</td></tr>
+    <tr><td><code>pipeline/physical_plan_unittest.cc</code></td><td>Lowering emits only the needed steps (no redundant sort, reuse of tree columns).</td></tr>
+    <tr><td><code>pipeline/plan_serialization_unittest.cc</code></td><td><code>Write</code> and <code>DecodePlan</code> round-trip; malformed bytes fail cleanly.</td></tr>
+    <tr><td><code>core/exec/&lt;op&gt;_unittest.cc</code></td><td>The executor alone, including batch boundaries at 2048 rows.</td></tr>
+    <tr><td><code>engine/perfetto_sql_connection_unittest.cc</code></td><td>End to end through <code>Rows(…)</code>, including error messages.</td></tr>
+    <tr><td><code>test/trace_processor/diff_tests/syntax/pipeline_tests.py</code></td><td>SQL-level diff tests with expected CSV output (25 tests today).</td></tr>
+    <tr><td><code>docs/analysis/perfetto-sql-pipe-syntax.md</code>, <code>docs/design-docs/perfetto-sql-pipelines.md</code></td><td>User syntax reference and implementation notes.</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A new stage is about five files of real work: grammar, one operation class, one registry line, maybe one executor, and tests.
+Most of the subtlety is in <code>Prune</code> and <code>Lower</code>. Say exactly which columns you read.
+Tell <code>Lowering</code> what order your output is in, so later stages do not sort again.
+</blockquote>
+
+<h2 id="method">Numbers and method</h2>
+<p>All excerpts are from the upstream Perfetto repository, main as of late October 2026. Grammar and C++ are quoted from the files under Sources.
+Code marked <em>shape</em> is simplified. Each value below comes from the constant or file named next to it.</p>
+<table>
+  <thead><tr><th>Figure</th><th>Value</th><th>Where it comes from</th></tr></thead>
+  <tbody>
+    <tr><td>Token type of FROM</td><td>127</td><td><code>SYNTAQLITE_TK_FROM</code> in <code>syntaqlite_perfetto.h</code></td></tr>
+    <tr><td>Token type of ID</td><td>40</td><td><code>SYNTAQLITE_TK_ID</code> in <code>syntaqlite_perfetto.h</code></td></tr>
+    <tr><td>Token types (terminals), Perfetto dialect</td><td>207</td><td><code>YYNTOKEN</code> in <code>syntaqlite_perfetto.c</code></td></tr>
+    <tr><td>Token types (terminals), SQLite 3.50.6</td><td>187</td><td><code>YYNTOKEN</code> in stock SQLite 3.50.6 (<code>sqlite-autoconf-3500600</code>)</td></tr>
+    <tr><td>Parser states, SQLite / Perfetto</td><td>583 / 774</td><td><code>YYNSTATE</code></td></tr>
+    <tr><td>Grammar rules, SQLite / Perfetto</td><td>409 / 523</td><td><code>YYNRULE</code></td></tr>
+    <tr><td>Action table entries, Perfetto</td><td>2739</td><td><code>YY_ACTTAB_COUNT</code></td></tr>
+    <tr><td>Hand-written dialect files</td><td>573 and 611 lines</td><td><code>perfetto.synq</code>, <code>perfetto.y</code></td></tr>
+    <tr><td>Generated parser files</td><td>21,855 and 4,923 lines</td><td><code>syntaqlite_perfetto.c</code>, <code>syntaqlite_perfetto.h</code></td></tr>
+    <tr><td>Columns in the slice view</td><td>15</td><td><code>stdlib/prelude/after_eof/views.sql</code></td></tr>
+    <tr><td>Rows per executor batch</td><td>2048</td><td><code>kMaxBatchRows</code> in <code>core/exec/selection.h</code>. The design doc states 8192, which differs from the code.</td></tr>
+    <tr><td>Most columns a pipeline can output</td><td>256</td><td><code>kMaxPipelineColumns</code></td></tr>
+    <tr><td>Encoding tags in use</td><td>0 to 4</td><td><code>OperationRegistration::Encoding</code> in each operation</td></tr>
+    <tr><td>Pipeline diff tests</td><td>25</td><td><code>pipeline_tests.py</code></td></tr>
+  </tbody>
+</table>
+<p>The percentages in Figure 5 are computed from these counts: states 774 / 583, rules 523 / 409, token types 207 / 187.</p>
+
+<h2 id="sources">Sources</h2>
+<p class="m">Paths are in the Perfetto repository. Short paths such as <code>parser/</code>, <code>engine/</code>, <code>pipeline/</code> and <code>stdlib/</code> are under
+<code>src/trace_processor/perfetto_sql/</code>, and <code>core/</code> and <code>tables/</code> are under <code>src/trace_processor/</code>.
+The SQLite file is the amalgamation from stock SQLite 3.50.6 (<code>sqlite-autoconf-3500600</code>).</p>
+<ul>
+  <li><code>src/perfetto_sql/syntaqlite/perfetto.y</code>: fallback list, pipe rule, marker rules, every PerfettoSQL statement and stage production</li>
+  <li><code>src/perfetto_sql/syntaqlite/perfetto.synq</code>: node, list, enum and abstract declarations, fmt rules</li>
+  <li><code>src/perfetto_sql/syntaqlite/syntaqlite_perfetto.c</code>: Lemon constants and tables, driver, tokenizer <code>CC_PIPE</code> case</li>
+  <li><code>src/perfetto_sql/syntaqlite/syntaqlite_perfetto.h</code>: token and node constants, node structs, arena and macro APIs</li>
+  <li><code>src/perfetto_sql/syntaqlite/BUILD.gn</code> and <code>inline_dispatch.h</code>: build targets, formatter library, direct dispatch</li>
+  <li><code>tools/gen_syntaqlite_parser</code>: generation command and flags</li>
+  <li><code>src/perfetto_sql/intrinsic_macro_expansion.h</code>: intrinsic macros</li>
+  <li><code>src/trace_processor/perfetto_sql/parser/perfetto_sql_parser.cc</code>: <code>RewriteTree</code>, <code>ParseStatement</code>, <code>LookupMacro</code>, <code>Next</code>, pipeline gating</li>
+  <li><code>src/trace_processor/sqlite/sql_source.h</code>: <code>SqlSource</code>, <code>Rewriter</code>, tracebacks</li>
+  <li><code>src/trace_processor/perfetto_sql/engine/perfetto_sql_connection.cc</code>: <code>ProcessFrame</code>, <code>ResolveExtensionStatement</code>, statement handlers, <code>PreparePipeline</code>, <code>LoadPipeline</code>, <code>ExecutePragma</code></li>
+  <li><code>src/trace_processor/perfetto_sql/engine/pipeline_module.h</code> and <code>.cc</code>: <code>__intrinsic_pipeline</code>, <code>DataframeAgg</code>, pointer types, cursor</li>
+  <li><code>src/trace_processor/perfetto_sql/pipeline/compiler.h</code> and <code>compiler.cc</code>: <code>Compiler</code>, <code>Scope</code>, <code>RowColumn</code>, <code>BuildOperation</code>, <code>ResolveSum</code>, <code>Compile</code></li>
+  <li><code>pipeline/logical_plan.h</code>: <code>PlanOperation</code> contract, <code>PlanNode</code>, <code>LogicalPlan</code></li>
+  <li><code>pipeline/operation_registry.h</code> and <code>.cc</code>: registrations, encodings, <code>kOperations</code></li>
+  <li><code>pipeline/column_pruning.cc</code>: <code>PruneColumns</code></li>
+  <li><code>pipeline/pipeline_sql.cc</code>, <code>pipeline_sql.h</code>, <code>plan_serialization.h</code>: generated SQL, function names, <code>kMaxPipelineColumns</code>, plan encoding</li>
+  <li><code>pipeline/physical_plan.h</code> and <code>.cc</code>: <code>Lowering</code>, <code>Order</code>, <code>PrepareTree</code>, <code>SortRows</code>, <code>RequireInt64</code></li>
+  <li><code>pipeline/operations/order_by.cc</code>, <code>tree_accumulate.cc</code>, <code>scan.cc</code>, <code>projection.cc</code>, <code>interval_flatten.cc</code>: the operations quoted and described</li>
+  <li><code>src/trace_processor/core/exec/operator.h</code>, <code>pipeline.h</code>, <code>breaker.h</code>, <code>tree_accumulate.h</code>, <code>selection.h</code>: executor node kinds, segments, batch size</li>
+  <li><code>stdlib/prelude/after_eof/views.sql</code> and <code>tables/slice_tables.py</code>: <code>slice</code> is a view over <code>__intrinsic_slice</code>, whose <code>ts</code> is <code>SORTED</code></li>
+  <li><code>core/dataframe/adhoc_dataframe_builder.h</code> and <code>core/exec/row_cursor.h</code>: <code>analyze = false</code> marks nothing sorted; cursor pulls batches</li>
+  <li><code>stdlib/stacks/cpu_profiling.sql</code>: macro call as a pipeline source</li>
+  <li><code>stdlib/callstacks/stack_profile.sql</code>: definition of <code>_callstacks_for_callsites(samples TableOrSubquery)</code></li>
+  <li><code>test/trace_processor/diff_tests/syntax/pipeline_tests.py</code> and <code>perfetto_sql_connection_unittest.cc</code>: intersection example, <code>AliasNeedsAs</code>, FILL GAPS error</li>
+  <li><code>docs/design-docs/perfetto-sql-pipelines.md</code>: experimental status (its stated 8192-row batch differs from <code>kMaxBatchRows</code> = 2048 in code)</li>
+  <li><code>sqlite-autoconf-3500600/sqlite3.c</code>: stock SQLite 3.50.6 Lemon constants for comparison</li>
+</ul>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>

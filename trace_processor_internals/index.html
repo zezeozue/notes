@@ -1,0 +1,1260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>The life of a trace in trace processor</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="Sorter · trackers · dataframes · bytecode · SQLite">The life of a trace in trace processor</span>
+  <span class="tb-spacer"></span>
+  <a class="tb-x" href="../perfettosql_next/index.html">PerfettoSQL parsing</a>
+  <a class="tb-x" href="../trace_merging/index.html">Trace merging</a>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#glance">At a glance</a>
+  <a href="#overview">The sorter splits the pipeline</a>
+  <a href="#when" style="padding-left:18px">what each stage leaves</a>
+  <div class="ph">I · Ingestion</div>
+  <a href="#reader">1 · Readers find timestamps</a>
+  <a href="#sorter">2 · The sorter merges queues</a>
+  <a href="#sorter-layout" style="padding-left:18px">one queue per stream</a>
+  <a href="#sorter-extract" style="padding-left:18px">when events are released</a>
+  <a href="#trackers">3 · Trackers write rows</a>
+  <a href="#slices" style="padding-left:18px">slices: insert, then patch</a>
+  <a href="#ptt" style="padding-left:18px">stable thread and track ids</a>
+  <a href="#args">4 · Args are shared</a>
+  <div class="ph">II · Storage</div>
+  <a href="#rowcol">5 · Columns, not rows</a>
+  <a href="#column">6 · Column metadata</a>
+  <a href="#flags">7 · Python flags pick layouts</a>
+  <a href="#finalize">8 · Tables freeze at end of file</a>
+  <a href="#bounds" style="padding-left:18px">trace bounds</a>
+  <div class="ph">III · Queries</div>
+  <a href="#vtab">9 · SQLite and the vtab</a>
+  <a href="#bytecode">10 · The bytecode interpreter</a>
+  <a href="#indexes">11 · Indexes</a>
+  <a href="#pipes">12 · Pipe syntax</a>
+  <a href="#plugins">13 · Plugins</a>
+  <a href="#bottlenecks">14 · What still costs</a>
+  <a href="#method">15 · Numbers and method</a>
+  <a href="#sources">Sources</a>
+</nav>
+
+<main id="top">
+<h1>How trace processor turns an out-of-order trace file into fast SQL tables</h1>
+<p class="lead">A Perfetto trace file holds events out of time order. Trace processor sorts them, turns them into rows, and stores
+each table column by column. SQLite then answers queries by reading those columns through a thin adapter.
+Each stage explains why some tables and queries are cheap and others are not.</p>
+<p class="m">Code is from the upstream Perfetto repository, main as of late October 2026, and paths are relative to its root. Excerpts marked
+<em>shape</em> are simplified. The rest are quoted or closely paraphrased from the files under Sources.</p>
+
+<h2 id="glance">At a glance</h2>
+<ul>
+<li><b>What happens.</b> Readers cut the file into timestamped events, a sorter puts them in time order, and trackers turn them into table rows.</li>
+<li><b>The one rule.</b> Code before the sorter sees events in file order. Only code after it may depend on earlier events.</li>
+<li><b>Storage.</b> Every table keeps one array per column. Flags declared in Python decide how each column stores empty values and whether it is sorted.</li>
+<li><b>Queries.</b> SQLite parses and plans the SQL. Trace processor runs the filters on its own columns and hands rows back one at a time.</li>
+<li><b>What to do.</b> Record long traces in streaming mode (<code>write_into_file</code>, §2), filter with GLOB rather than LIKE, and join on ids or sorted columns.</li>
+</ul>
+<p><b>Terms.</b> <b>Trace processor</b> is Perfetto’s analysis engine: it loads a trace file and answers SQL queries about it.
+The <b>embedder</b> is the program that runs it, such as the Perfetto UI or the <code>trace_processor</code> shell.
+A <b>packet</b> is one timestamped protobuf message in the trace. A <b>sequence</b> is all the packets from one writer.
+A <b>slice</b> is an interval with a begin and an end, such as a function call or a frame.
+A <b>track</b> is the timeline a slice or counter value lives on, such as one thread, one CPU’s frequency or one async lane of an app.
+A <b>dataframe</b> is trace processor’s in-memory table, stored column by column.
+A <b>vtab</b>, or virtual table, is the adapter SQLite uses to read data it does not store itself.</p>
+
+<!-- ═════════════════════════ OVERVIEW ═════════════════════════ -->
+<h2 id="overview">The sorter splits the pipeline in two</h2>
+<p>Trace processor is built around one split. Code before the sorter sees events in file order. Code after it sees them in timestamp order.</p>
+<figure>
+<figcaption><b>Figure 1. The sorter is the dividing line.</b> Code left of the dashed line must cope with any order.
+Code right of it can assume timestamps never go backwards.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Pipeline overview">
+  <text x="10" y="18" class="th">file order</text>
+  <text x="430" y="18" class="th">timestamp order</text>
+  <line x1="410" y1="8" x2="410" y2="150" class="ln dash"/>
+  <rect x="10" y="30" width="180" height="70" rx="2" class="b2"/>
+  <text x="22" y="52" class="tb">ForwardingTraceParser</text>
+  <text x="22" y="70" class="ts">guesses the format, picks</text>
+  <text x="22" y="84" class="ts">a ChunkedTraceReader</text>
+  <path d="M190,65 L218,65" class="ln" marker-end="url(#ah)"/>
+  <rect x="220" y="30" width="170" height="70" rx="2" class="b"/>
+  <text x="232" y="52" class="tb">Tokenizer</text>
+  <text x="232" y="70" class="ts">frames packets, converts</text>
+  <text x="232" y="84" class="ts">clocks to trace time</text>
+  <path d="M390,65 L428,65" class="lnw" marker-end="url(#ahw)"/>
+  <rect x="430" y="30" width="150" height="70" rx="2" class="bw"/>
+  <text x="442" y="52" class="tb">TraceSorter</text>
+  <text x="442" y="70" class="ts">buffers, merges,</text>
+  <text x="442" y="84" class="ts">releases in ts order</text>
+  <path d="M580,65 L608,65" class="ln" marker-end="url(#ah)"/>
+  <rect x="610" y="30" width="170" height="70" rx="2" class="ba"/>
+  <text x="622" y="52" class="tb">Parsers + trackers</text>
+  <text x="622" y="70" class="ts">decode fields; pair begin</text>
+  <text x="622" y="84" class="ts">and end; intern ids</text>
+  <path d="M780,65 L808,65" class="lng" marker-end="url(#ahg)"/>
+  <rect x="810" y="30" width="180" height="70" rx="2" class="bg"/>
+  <text x="822" y="52" class="tb">Dataframes</text>
+  <text x="822" y="70" class="ts">one array per column,</text>
+  <text x="822" y="84" class="ts">finalized at end of file</text>
+  <text x="10" y="136" class="th">at query time</text>
+  <path d="M900,100 L900,140 L565,140" class="lng"/>
+  <path d="M565,140 L565,162" class="lng" marker-end="url(#ahg)"/>
+  <path d="M855,140 L855,162" class="lng" marker-end="url(#ahg)"/>
+  <rect x="430" y="164" width="270" height="70" rx="2" class="b0"/>
+  <text x="442" y="186" class="tb">SQLite + DataframeModule vtab</text>
+  <text x="442" y="204" class="ts">plan → bytecode over columns → row</text>
+  <text x="442" y="218" class="ts">indices stepped one row at a time</text>
+  <rect x="720" y="164" width="270" height="70" rx="2" class="bv"/>
+  <text x="732" y="186" class="tb">Pipe syntax (experimental)</text>
+  <text x="732" y="204" class="ts">plan → operators on columnar</text>
+  <text x="732" y="218" class="ts">batches, output via one vtab</text>
+  <text x="10" y="186" class="t">Both query paths start from the same</text>
+  <text x="10" y="204" class="t">finalized column storage.</text>
+</svg>
+</figure>
+<p>The file is out of order because many writers fill it. The kernel tracer, ftrace, fills one ring buffer per CPU.
+Each app or daemon writes into memory chunks it shares with the tracing service. The service copies each buffer into the file whenever it
+reads it out. So a packet near the end of the file can be older than one near the start.</p>
+<p>In the file, each packet is a length-prefixed <code>TracePacket</code> holding one event or a batch of events.
+Each sequence is tagged with a <code>trusted_packet_sequence_id</code>, and order and shared state are guaranteed only within a sequence.</p>
+<p>Most of what trace processor computes depends on order. A slice’s end has to meet its begin.
+A thread’s scheduling state depends on the previous context switch, the sched_switch event.
+So only code after the sorter may build state that depends on time.</p>
+<p>“Intern ids” in Figure 1 means replacing repeated strings and track descriptions with small integer ids (Sections 1 and 3).
+The repository’s own summary of this pipeline is in
+<code>docs/design-docs/trace-processor-architecture.md</code>.</p>
+
+<h3 id="when">Each stage leaves a known state behind</h3>
+<p>Stages overlap in time, but each event passes through them in the same order. Knowing the stage tells you what state exists.</p>
+<table>
+  <thead><tr><th>Stage</th><th>When it runs</th><th>What exists afterwards</th></tr></thead>
+  <tbody>
+    <tr><td>1. Tokenize</td><td>Inside each <code>Parse(chunk)</code> call, in file order</td><td>Framed packets with trace-time timestamps, buffered in the sorter. No rows yet.</td></tr>
+    <tr><td>2. Sort</td><td>Events are held until an extraction point (§2), then released oldest first</td><td>A timestamp-ordered stream; memory for released events is freed.</td></tr>
+    <tr><td>3. Parse</td><td>For each released event</td><td>Decoded fields, handed to trackers.</td></tr>
+    <tr><td>4. Track</td><td>Inside the parser’s calls</td><td>Rows inserted into tables; some cells (a slice’s <code>dur</code>, its <code>arg_set_id</code>) patched later.</td></tr>
+    <tr><td>5. Finalize</td><td>Once, in <code>NotifyEndOfFile</code> (§8)</td><td>Pending tracker state flushed (open slices keep <code>dur = -1</code>), trace bounds computed, columns shrunk and frozen, declared indexes built.</td></tr>
+    <tr><td>6. Query</td><td>Any SQL after that</td><td>Read-only tables reached through SQLite (Part III).</td></tr>
+  </tbody>
+</table>
+<p>An embedder can also call <code>Flush()</code> during import to make rows queryable early. It drains the sorter completely, with the same
+<code>ExtractEventsForced</code> call used at end of file, and refreshes the trace bounds. The cost is that any later event older than the last
+one released is dropped as out of order.</p>
+
+<!-- ═════════════════════════ PART I ═════════════════════════ -->
+<div class="part">Part I · Ingestion</div>
+
+<h2 id="reader"><span class="n">1</span>Readers cut bytes into timestamped events and stop there</h2>
+<p>Before sorting, a reader only finds each event and its timestamp. It builds no slices, threads or other state.</p>
+<figure>
+<figcaption><b>Figure 2. A reader frames events and converts their clocks, then hands them to the sorter.</b>
+If a clock cannot be converted yet, the reader tries to switch the whole import to sorting everything at the end.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 190" role="img" aria-label="Reader flow from byte chunks to the sorter, with a fallback to full sort">
+  <rect x="10" y="50" width="130" height="70" rx="2" class="b2"/>
+  <text x="22" y="74" class="tb">Byte chunks</text>
+  <text x="22" y="92" class="ts">any size, possibly</text>
+  <text x="22" y="106" class="ts">a streamed file</text>
+  <path d="M140,85 L158,85" class="ln" marker-end="url(#ah)"/>
+  <rect x="160" y="50" width="180" height="70" rx="2" class="b"/>
+  <text x="172" y="74" class="tb">ForwardingTraceParser</text>
+  <text x="172" y="92" class="ts">guesses the format from</text>
+  <text x="172" y="106" class="ts">the first bytes, picks a reader</text>
+  <path d="M340,85 L358,85" class="ln" marker-end="url(#ah)"/>
+  <rect x="360" y="50" width="160" height="70" rx="2" class="b"/>
+  <text x="372" y="74" class="tb">Tokenizer</text>
+  <text x="372" y="92" class="ts">frames packets, keeps</text>
+  <text x="372" y="106" class="ts">interned data per sequence</text>
+  <path d="M520,85 L538,85" class="ln" marker-end="url(#ah)"/>
+  <rect x="540" y="50" width="130" height="70" rx="2" class="ba"/>
+  <text x="552" y="74" class="tb">To trace time</text>
+  <text x="552" y="92" class="ts">one clock for</text>
+  <text x="552" y="106" class="ts">all tables</text>
+  <path d="M670,75 C685,75 685,35 698,35" class="lng" marker-end="url(#ahg)"/>
+  <path d="M670,95 C685,95 685,145 698,145" class="lnw" marker-end="url(#ahw)"/>
+  <rect x="700" y="10" width="150" height="56" rx="2" class="bg"/>
+  <text x="712" y="32" class="tb">Sorter stream</text>
+  <text x="712" y="50" class="ts">timestamp + payload</text>
+  <rect x="700" y="118" width="150" height="56" rx="2" class="bw"/>
+  <text x="712" y="140" class="tb">Clock not known yet</text>
+  <text x="712" y="158" class="ts">full sort, park to end</text>
+  <text x="10" y="180" class="ts">Normal path on top. The bottom path is taken when the clock snapshot that relates two clocks has not arrived yet.</text>
+</svg>
+</figure>
+<p>Trace processor accepts many formats, including Perfetto protobuf, JSON, perf and systrace text. It must accept them in pieces, because the
+embedder may be streaming a multi-gigabyte file. Bytes arrive through <code>TraceProcessorStorageImpl::Parse(TraceBlobView)</code> in chunks
+of any size the caller chooses. A TraceBlobView is a reference-counted view of a byte buffer.</p>
+<p>The first call creates a <code>ForwardingTraceParser</code>. It looks at the first bytes, guesses the format, and creates the matching reader
+from the <code>TraceReaderRegistry</code>. Every reader implements <code>ChunkedTraceReader</code>, so it must cope with a packet split across
+two chunks.</p>
+<p>The <b>tokenizer</b> is the part of a reader that runs before sorting. For Perfetto protobuf traces it is <code>ProtoTraceReader</code>.
+It splits the stream into packets and keeps each sequence’s interned data.</p>
+<p><b>Interning</b> is a size trick used by writers. A repeated string, such as an event name, is sent once with a small integer id.
+Later packets on the same sequence carry only the id. The tokenizer stores these tables per sequence so the parser can resolve ids later.</p>
+<p>The tokenizer also converts each timestamp into <b>trace time</b>, the single clock all tables use.
+<code>ClockTracker::ToTraceTime</code> does this with clock snapshots that the service writes into the trace. The snapshots relate clocks
+such as BOOTTIME and MONOTONIC. The tokenizer then pushes the timestamp and payload into a sorter stream.</p>
+<p>One missing clock snapshot can change the memory profile of a whole import. If the snapshot that relates two clocks has not been seen yet,
+conversion fails. Before end of file, the reader then tries to switch the sorter into <code>SortingMode::kFullSort</code> and parks the packet
+until the end. Full sort releases nothing until the end of the file. Ftrace events are the exception. They arrive in a bundle, one packet
+holding a batch of events from one CPU, and the ftrace tokenizer converts them one by one and drops any it cannot convert instead
+(<a href="../trace_merging/index.html#sec-early">Trace merging §9</a>).</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+If you write an importer, the tokenizer is where you extract a timestamp and stop. Anything that depends on the previous event
+belongs in the parser, after the sorter.
+</blockquote>
+
+<!-- ───────────── Sorter ───────────── -->
+<h2 id="sorter"><span class="n">2</span>The sorter merges nearly sorted queues instead of sorting everything</h2>
+<p>The sorter builds one time-ordered stream from many inputs while holding as little as possible in memory.
+It relies on two facts noted at the top of <code>src/trace_processor/sorter/trace_sorter.h</code>.
+Most events come from ftrace, and ftrace events from one CPU are almost always in order already.</p>
+
+<h3 id="sorter-layout">Each stream gets its own queue of small 16-byte entries</h3>
+<p>Each importer asks the sorter for typed <b>streams</b>. A stream is one input lane of the sorter, and its events share one payload type.
+Its <b>sink</b> is the object that gets them back, in order, after sorting. Each <code>CreateStream(sink)</code> call appends a new
+<code>Queue</code> and returns a <code>Stream&lt;T&gt;</code> bound to it.</p>
+<p><code>ProtoTraceReader</code> creates one stream for generic trace packets and one for track events. It also has factories that create ftrace, ETW and
+inline sched_switch/sched_waking streams lazily, one per CPU. So a typical Android trace has a queue per CPU per ftrace encoding, plus a few
+shared queues. The header comment still describes the original fixed “N+1 queues” layout, but the code now has a queue per stream.</p>
+<p>The queue holds only a small pointer to each event, not the event itself. When a tokenizer calls <code>Stream::Push(ts, data)</code>,
+the payload goes into a <code>TraceTokenBuffer</code>. This is a bump allocator: it hands out memory by advancing a pointer through 64 KB
+chunks, and frees whole chunks at once. The queue receives only a 16-byte <code>TimestampedEvent</code> that points at the payload.
+Negative timestamps are dropped here and counted in the <code>trace_sorter_negative_timestamp_dropped</code> stat.</p>
+
+<figure>
+<figcaption><b>Figure 3. Each queue entry is a timestamp plus a pointer into the token buffer.</b> Four entries fit in one cache line,
+which keeps sorting and merging cheap. The exact bit widths are in Numbers and method.</figcaption>
+<svg viewBox="0 0 1000 200" role="img" aria-label="TimestampedEvent layout">
+  <text x="150" y="20" class="tms">0</text><text x="566" y="20" class="tms">8</text><text x="960" y="20" class="tms">16 B</text>
+  <line x1="150" y1="26" x2="990" y2="26" class="ln"/>
+  <text x="10" y="56" class="tb">TimestampedEvent</text>
+  <text x="10" y="72" class="tms">static_assert == 16</text>
+  <rect x="150" y="38" width="420" height="40" class="ba"/><text x="162" y="62" class="tm">int64_t ts</text>
+  <rect x="570" y="38" width="276" height="40" class="b2"/><text x="580" y="62" class="tms">chunk_index : 42</text>
+  <rect x="846" y="38" width="105" height="40" class="bw"/><text x="854" y="62" class="tms">offset:16</text>
+  <rect x="951" y="38" width="9" height="40" class="bv"/>
+  <rect x="960" y="38" width="30" height="40" fill="url(#hatch)" class="hatch-l"/>
+  <text x="836" y="96" class="tms">is_json:1 · 5 spare</text>
+  <path d="M708,78 C708,110 808,110 808,126" class="ln dash" marker-end="url(#ah)"/>
+  <text x="10" y="140" class="tb">BumpAllocator</text>
+  <text x="10" y="156" class="tms">AllocId (58 bits)</text>
+  <rect x="150" y="122" width="200" height="40" class="b2"/><text x="160" y="146" class="tms">chunk 0 · 64 KB</text>
+  <rect x="356" y="122" width="200" height="40" class="b2"/><text x="366" y="146" class="tms">chunk 1 · 64 KB</text>
+  <rect x="562" y="122" width="300" height="40" class="b2"/><text x="572" y="146" class="tms">chunk k</text>
+  <rect x="760" y="128" width="96" height="28" class="ba"/><text x="768" y="146" class="tms">payload</text>
+  <text x="150" y="188" class="ts">The queue entry carries the timestamp plus an allocation id (chunk index, offset in chunk). The packet bytes stay in the token buffer.</text>
+</svg>
+</figure>
+
+<p>A queue sorts only the part that arrived late. It remembers its largest timestamp so far. The first time an older one arrives, it marks
+where order broke and starts tracking the oldest late timestamp. The code below shows the fields.</p>
+
+<pre><code><span class="src">trace_sorter.h · Queue::Append</span><span class="k">if</span> (PERFETTO_LIKELY(ts &gt; max_ts_ || (!use_slow_sorting &amp;&amp; ts == max_ts_))) {
+  max_ts_ = ts;                         <span class="c">// common case: still in order</span>
+} <span class="k">else</span> {
+<span class="hw">  if (sort_start_idx_ == 0) {           // first out-of-order event</span>
+    sort_start_idx_ = events_.size() - 1;
+    sort_min_ts_ = ts;
+  } <span class="k">else</span> {
+    sort_min_ts_ = std::min(sort_min_ts_, ts);
+  }
+}</code></pre>
+
+<p>When the queue is needed, <code>Queue::Sort</code> binary-searches the sorted prefix for <code>sort_min_ts_</code> with std::lower_bound.
+It then runs std::sort only from there to the end. A queue that never went out of order is never sorted at all.</p>
+
+<h3 id="sorter-extract">Events are released in time order, one flush window behind the newest data</h3>
+<p>Extraction merges queues that are each already sorted. <code>SortAndExtractEventsUntilAllocId</code> finds the queue with the oldest head,
+and the second-oldest head among the others. It drains the first queue until its next event is newer than that second head, then looks again.
+A comment in <code>trace_sorter.cc</code>
+puts this loop at a few percent of CPU time. That is why it rescans the queue heads directly rather than keeping them in a heap
+(a priority queue), which would add bookkeeping to every event.</p>
+
+<figure>
+<figcaption><b>Figure 4. The merge drains the queue with the oldest head until another queue’s head is older.</b>
+Only a queue with a late tail is ever sorted.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Queues and merge">
+  <text x="10" y="18" class="th">queues (one per stream)</text>
+  <text x="10" y="50" class="tms">trace packets</text>
+  <rect x="150" y="34" width="300" height="26" class="bg"/><text x="160" y="51" class="tms">sorted prefix</text>
+  <rect x="450" y="34" width="150" height="26" class="bw"/><text x="460" y="51" class="tms">late tail</text>
+  <text x="10" y="86" class="tms">track events</text>
+  <rect x="150" y="70" width="420" height="26" class="bg"/><text x="160" y="87" class="tms">sorted: Sort() never runs</text>
+  <text x="10" y="122" class="tms">ftrace cpu0</text>
+  <rect x="150" y="106" width="380" height="26" class="bg"/><text x="160" y="123" class="tms">sorted</text>
+  <text x="10" y="158" class="tms">ftrace cpu1</text>
+  <rect x="150" y="142" width="450" height="26" class="bg"/><text x="160" y="159" class="tms">sorted</text>
+  <text x="10" y="194" class="tms">ftrace cpu7 …</text>
+  <rect x="150" y="178" width="340" height="26" class="bg"/><text x="160" y="195" class="tms">sorted</text>
+  <path d="M600,47 C640,47 650,118 678,118" class="ln" marker-end="url(#ah)"/>
+  <path d="M570,83 C620,83 640,118 678,118" class="ln" marker-end="url(#ah)"/>
+  <path d="M530,119 L678,119" class="ln" marker-end="url(#ah)"/>
+  <path d="M600,155 C640,155 650,120 678,120" class="ln" marker-end="url(#ah)"/>
+  <path d="M490,191 C620,191 650,122 678,122" class="ln" marker-end="url(#ah)"/>
+  <rect x="680" y="70" width="310" height="100" rx="2" class="ba"/>
+  <text x="692" y="92" class="tb">merge-extract</text>
+  <text x="692" y="110" class="ts">1. pick queue with oldest head</text>
+  <text x="692" y="126" class="ts">2. sort its late tail if it has one</text>
+  <text x="692" y="142" class="ts">3. drain until past 2nd-oldest head</text>
+  <text x="692" y="158" class="ts">   or past the alloc-id limit</text>
+  <path d="M835,170 L835,206" class="lna" marker-end="url(#aha)"/>
+  <text x="692" y="226" class="ts">sink-&gt;OnSortedEvent(ts, id) → parser</text>
+</svg>
+</figure>
+<p>An event older than the last one already released to the parser can no longer be placed. It is discarded at extraction and counted in
+<code>sorter_push_event_out_of_order</code>. A non-zero count means the window described next was too small for that trace.</p>
+
+<p>In streaming mode, the sorter must decide when no future packet can be older than what it holds. It measures <b>arrival order</b> for this,
+not timestamps. Its yardstick is the token-buffer allocation id, which only grows as packets arrive. The signal comes from the tracing service. Every so often the service asks every data
+source to <b>flush</b>, that is, to write out whatever it has buffered. Then it reads its buffers into the file. It records both events in
+<code>TracingServiceEvent</code> packets, which call into the sorter:</p>
+<table>
+  <thead><tr><th>Service event</th><th>Sorter call</th></tr></thead>
+  <tbody>
+    <tr><td><code>all_data_sources_flushed</code></td><td><code>NotifyFlushEvent()</code></td></tr>
+    <tr><td><code>read_tracing_buffers_completed</code></td><td><code>NotifyReadBufferEvent()</code></td></tr>
+  </tbody>
+</table>
+
+<pre><code><span class="src">trace_sorter.h · NotifyReadBufferEvent</span><span class="k">if</span> (sorting_mode_ == SortingMode::kFullSort || flushes_since_extraction_ &lt; 2)
+  <span class="k">return</span>;
+SortAndExtractEventsUntilAllocId(alloc_id_for_extraction_);  <span class="c">// up to the previous mark</span>
+alloc_id_for_extraction_ = token_buffer_.PastTheEndAllocId(); <span class="c">// new mark</span>
+flushes_since_extraction_ = 0;</code></pre>
+
+<figure>
+<figcaption><b>Figure 5. A buffer read releases only what arrived before the previous mark.</b> Two full flushes since the last extraction
+give every producer a chance to write out data older than that mark. Everything after the mark stays in memory.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 200" role="img" aria-label="Extraction window: events before the previous mark are released at a buffer read, later ones are held">
+  <text x="10" y="18" class="th">service events, in arrival order</text>
+  <line x1="20" y1="70" x2="840" y2="70" class="ln" marker-end="url(#ah)"/>
+  <line x1="200" y1="30" x2="200" y2="150" class="ln dash"/>
+  <text x="206" y="42" class="tb">previous mark</text>
+  <line x1="390" y1="56" x2="390" y2="84" class="ln"/>
+  <text x="372" y="50" class="ts">flush</text>
+  <line x1="510" y1="56" x2="510" y2="84" class="ln"/>
+  <text x="492" y="50" class="ts">flush</text>
+  <line x1="640" y1="30" x2="640" y2="150" class="lna"/>
+  <text x="646" y="42" class="tb">buffer read: new mark</text>
+  <text x="10" y="100" class="th">token buffer</text>
+  <rect x="20" y="110" width="180" height="30" class="bg"/>
+  <text x="30" y="130" class="ts">released in ts order</text>
+  <rect x="200" y="110" width="440" height="30" class="bw"/>
+  <text x="210" y="130" class="ts">held until the next qualifying read, then released up to the new mark</text>
+  <text x="10" y="176" class="ts">After each release the sorter frees token-buffer memory. A ring-buffer trace has one read, at the end, so nothing is released early.</text>
+</svg>
+</figure>
+
+<p>So at each qualifying read the sorter releases events in timestamp order until the oldest remaining one arrived after the previous mark.
+It keeps the rest. After each drain it calls <code>token_buffer_.FreeMemory()</code>.</p>
+<p>The header notes that the window only helps traces recorded with write_into_file, where the service streams buffers into the file throughout the session.
+A <b>ring-buffer trace</b> keeps its buffers in memory, overwriting the oldest data, and writes them out once when tracing stops.
+It has a single read at the end, so it is sorted entirely in memory.</p>
+<p>The window is a protobuf feature. Most other formats, and TAR and ZIP archives, declare <code>TraceSortPolicy::kFullSort</code> in their
+descriptor. <code>ForwardingTraceParser::Init</code> then switches the sorter to full sort before parsing. So a merged archive is always sorted
+in memory as a whole (<a href="../trace_merging/index.html#archive">Trace merging §6</a>). At end of file, <code>ExtractEventsForced()</code>
+drains everything.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Peak import memory is roughly everything between two extraction points. For ring-buffer traces and full-sort imports, that is the whole trace.
+If <code>sorter_push_event_out_of_order</code> is non-zero, events were lost to ordering, not by the producer.
+</blockquote>
+
+<!-- ───────────── Trackers ───────────── -->
+<h2 id="trackers"><span class="n">3</span>Parsers decode events, and trackers keep the state and write rows</h2>
+<p>After sorting, parsers decode each event and trackers turn it into rows. Each event reaches its stream’s sink, which calls the format’s
+<b>parser</b>. A parser knows one encoding, such as how a sched_switch or a TrackEvent is laid out. TrackEvent is the protobuf event that apps
+emit through the Perfetto SDK.</p>
+<p>Parsers keep no state across events. They call <b>trackers</b>, which are format-agnostic state machines that each own one concept and
+write rows. Because of this split, a slice from a JSON trace and a slice from a protobuf trace pass through the same <code>SliceTracker</code>.
+They end up identical in the table.</p>
+
+<table>
+  <thead><tr><th>Layer</th><th>Examples</th><th>Order it sees</th><th>Job</th></tr></thead>
+  <tbody>
+    <tr><td>Tokenizer</td><td><code>ProtoTraceReader</code>, <code>JsonTraceTokenizer</code>, <code>PerfDataTokenizer</code></td><td class="warn">file order</td><td>Frame packets, resolve timestamps, push to a stream.</td></tr>
+    <tr><td>Parser</td><td><code>ProtoTraceParserImpl</code>, <code>JsonTraceParser</code></td><td class="good">timestamp order</td><td>Decode one event and call trackers.</td></tr>
+    <tr><td>Tracker</td><td><code>SliceTracker</code>, <code>ProcessTracker</code>, <code>TrackTracker</code>, <code>ArgsTracker</code></td><td class="good">timestamp order</td><td>Hold state across events; insert and patch rows.</td></tr>
+    <tr><td>Table</td><td><code>tables::SliceTable</code> over <code>dataframe::Dataframe</code></td><td>—</td><td>Columnar storage; knows types and sort state, nothing about tracing.</td></tr>
+  </tbody>
+</table>
+
+<h3 id="slices">A slice row is written at its begin and patched at its end</h3>
+<p>Writing each row at begin time keeps the slice table sorted by start time. The ts column is declared <code>ColumnFlag.SORTED</code>.
+That is a promise to the storage layer that values never decrease, which lets queries binary-search it (Section 7).
+Children start after their parent. If rows were written at the end event, a child that ended first would land before its parent and break the order.</p>
+<p>So <code>SliceTracker::Begin</code> inserts the row at once, with the duration set to <code>kPendingDuration</code> (−1).
+It sets the depth to the stack size and the parent to the top of the stack. Events arrive in timestamp order, so rows are appended in start order.
+Stacks are kept per track, and nesting deeper than <code>kMaxDepth</code> (512) is dropped with an import log.</p>
+
+<figure>
+<figcaption><b>Figure 6. Rows go in at begin time, and the duration is filled in at end time.</b> A slice still open at end of file keeps a
+duration of −1, so the UI can show it as incomplete.</figcaption>
+<svg viewBox="0 0 1000 260" role="img" aria-label="SliceTracker begin and end">
+  <text x="10" y="18" class="th">events on one track</text>
+  <line x1="40" y1="44" x2="980" y2="44" class="ln"/>
+  <rect x="100" y="52" width="760" height="20" class="ba"/><text x="110" y="66" class="tms">doFrame</text>
+  <rect x="260" y="76" width="200" height="20" class="bv"/><text x="270" y="90" class="tms">measure</text>
+  <text x="96" y="38" class="tms">B @1000</text><text x="252" y="38" class="tms">B @1100</text><text x="430" y="38" class="tms">E @1200</text><text x="820" y="38" class="tms">E @1600</text>
+  <text x="10" y="128" class="th">slice table after each event</text>
+  <rect x="10" y="138" width="300" height="110" rx="2" class="b0"/>
+  <text x="22" y="158" class="tb">B doFrame @1000</text>
+  <text x="22" y="180" class="tms">row 0  ts=1000 dur=-1 depth=0</text>
+  <text x="22" y="200" class="ts">stack: [row 0]</text>
+  <rect x="340" y="138" width="300" height="110" rx="2" class="b0"/>
+  <text x="352" y="158" class="tb">B/E measure @1100..1200</text>
+  <text x="352" y="180" class="tms">row 0  ts=1000 dur=-1 depth=0</text>
+  <text x="352" y="198" class="tms tv">row 1  ts=1100 dur=100 depth=1</text>
+  <text x="352" y="216" class="tms tv">       parent_id=0</text>
+  <text x="352" y="236" class="ts">stack after pop: [row 0]</text>
+  <rect x="670" y="138" width="320" height="110" rx="2" class="b0"/>
+  <text x="682" y="158" class="tb">E doFrame @1600</text>
+  <text x="682" y="180" class="tms tg">row 0  ts=1000 dur=600 depth=0</text>
+  <text x="682" y="198" class="tms">row 1  ts=1100 dur=100 depth=1</text>
+  <text x="682" y="220" class="ts">set_dur in place; pop commits row 0’s</text>
+  <text x="682" y="236" class="ts">args as one arg set</text>
+</svg>
+</figure>
+
+<p><code>End</code> searches the stack from the top for the first open slice whose name and category match. A null name or category matches
+anything. It calls <code>set_dur(ts - start)</code> on that row, runs the end-event args callback, and pops the entry if it was on top.
+An end with no matching open slice is ignored, for example when its begin came before tracing started.</p>
+<p>Begin args and end args land in the same <b>arg set</b>, the group of key/value pairs attached to one row (Section 4). They collect in the
+slice’s stack entry and are written when the slice is popped. At end of file, open slices get their args written but stay open.
+The holder and flush function names are in Numbers and method.</p>
+
+<h3 id="ptt">Threads, processes and tracks get stable ids</h3>
+<p><b>ProcessTracker</b> maps kernel thread and process ids to stable rows. The kernel reuses a tid or pid once its owner exits, so tables
+cannot be keyed by them. They are keyed by <code>UniqueTid</code>/<code>UniquePid</code> instead, shortened to utid and upid. These are row
+numbers in the thread and process tables. The main entry points:</p>
+<ul>
+  <li><code>GetOrCreateThread(tid)</code> finds or creates the current thread for a tid.</li>
+  <li><code>StartNewThread</code>, called on task_newtask, forces a new utid so a recycled tid does not merge with its predecessor.</li>
+  <li><code>UpdateThread(tid, pid)</code> attaches a thread to its process.</li>
+  <li><code>UpdateThreadName</code> only replaces a name with one of higher priority.</li>
+</ul>
+<p><b>TrackTracker</b> creates each track row once and finds it again cheaply. Every slice and counter value lives on a track, and thousands of
+events name the same one, so tracks are interned. A caller first describes a track type once, as a constexpr <b>blueprint</b>. A blueprint is
+the track’s kind plus the names of its <b>dimensions</b>, such as utid or cpu, which tell its instances apart. The caller then interns a track
+with concrete dimension values:</p>
+<pre><code><span class="src">track_tracker.h (shape)</span>tracks::SliceBlueprint(<span class="k">"type"</span>, tracks::DimensionBlueprints(...))   <span class="c">// once, constexpr</span>
+InternTrack(blueprint, tracks::Dimensions(...))                    <span class="c">// returns a TrackId</span></code></pre>
+<p>The first <code>InternTrack</code> call for a set of values creates a row in the track table. Later calls return the same
+<code>TrackId</code>, which slices and counters then reference. The intern map belongs to one trace file. When an archive holds several files,
+each has its own TrackTracker, so the same thread can get two tracks
+(<a href="../trace_merging/index.html#tracks">Trace merging §11</a>).</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+<code>dur = -1</code> means the slice never ended in this trace. It is not a parse error. Join threads and processes on utid and upid, never on raw tid or pid.
+</blockquote>
+
+<!-- ───────────── Args ───────────── -->
+<h2 id="args"><span class="n">4</span>Args live in one shared table, deduplicated and written once per row</h2>
+<p>Events carry open-ended key/value data, such as debug annotations, proto extensions and ftrace fields. A column per key would mean thousands
+of mostly empty columns. Instead, most tables have an arg_set_id column that points into one shared key/value table,
+<code>__intrinsic_args</code>, exposed as the args view.</p>
+
+<h3>Args are buffered in memory, then committed in one step</h3>
+<p>An inserter collects a row’s args and writes them only when it goes away. A tracker asks for an <b>ArgsInserter</b> bound to one row’s
+arg_set_id cell. Adding an arg only appends to a pooled buffer. A repeated key either keeps its first value or takes the last, as the caller
+chooses. Duplicate detection is a linear scan until the buffer reaches 32 args, then a hash map.</p>
+<p>When the inserter is destroyed, <code>Commit()</code> runs:</p>
+
+<pre><code><span class="src">global_args_tracker.h · AddArgSet (shape, simplified)</span>digest   = murmur(key, type, value for each arg);
+<span class="k">uint32_t</span> arg_set_id = arg_table.row_count();       <span class="c">// next free row</span>
+<span class="hg">if (!arg_row_for_hash_.Insert(digest, arg_set_id).inserted)</span>
+<span class="hg">  return existing id;                             // identical set seen before</span>
+<span class="k">for</span> (arg : args) arg_table.Insert({arg_set_id, arg.key, ...});  <span class="c">// contiguous rows</span>
+<span class="k">return</span> arg_set_id;
+<span class="c">// then ArgsInserter::Commit writes arg_set_id into (dataframe, col, row)</span>
+<span class="c">// Before this: ArgsTracker(context).AddArgsTo(id) returned the ArgsInserter</span>
+<span class="c">// (ArgsTracker::BoundInserter is now an alias). It borrowed an ArgsBuffer from a</span>
+<span class="c">// pool in GlobalArgsTracker, and AddArg appended to it. Repeated keys:</span>
+<span class="c">// kSkipIfExists keeps the first value, kAddOrUpdate keeps the last.</span></code></pre>
+
+<p>Two properties follow. Identical arg sets are stored once and shared, keyed by a hash of their contents. And every new set starts at the
+current row count and is written contiguously. So the first row whose arg_set_id is <i>k</i> is row <i>k</i>.</p>
+
+<figure>
+<figcaption><b>Figure 7. A new arg set starts at its own row number, and identical sets are shared.</b> The commit can come long after the row
+was inserted. A slice’s args commit when the slice is popped.</figcaption>
+<svg viewBox="0 0 1000 230" role="img" aria-label="Args commit and SetIdSorted">
+  <text x="10" y="18" class="th">inserter for slice 42</text>
+  <rect x="10" y="30" width="260" height="96" rx="2" class="bv"/>
+  <text x="22" y="52" class="tms">cookie = 99</text>
+  <text x="22" y="70" class="tms">layer  = "Surface"</text>
+  <text x="22" y="88" class="tms">frame  = 10821</text>
+  <text x="22" y="112" class="ts">buffered until the inserter dies</text>
+  <path d="M270,78 L318,78" class="lnv" marker-end="url(#ahv)"/>
+  <text x="330" y="18" class="th">__intrinsic_args</text>
+  <text x="330" y="44" class="tms">row</text><text x="400" y="44" class="tms">arg_set_id</text><text x="490" y="44" class="tms">key</text>
+  <rect x="330" y="52" width="320" height="22" class="b0"/><text x="340" y="67" class="tms">1039</text><text x="400" y="67" class="tms">1037</text><text x="490" y="67" class="tms">…</text>
+  <rect x="330" y="74" width="320" height="22" class="bg"/><text x="340" y="89" class="tms">1040</text><text x="400" y="89" class="tms">1040</text><text x="490" y="89" class="tms">cookie</text>
+  <rect x="330" y="96" width="320" height="22" class="bg"/><text x="340" y="111" class="tms">1041</text><text x="400" y="111" class="tms">1040</text><text x="490" y="111" class="tms">layer</text>
+  <rect x="330" y="118" width="320" height="22" class="bg"/><text x="340" y="133" class="tms">1042</text><text x="400" y="133" class="tms">1040</text><text x="490" y="133" class="tms">frame</text>
+  <rect x="330" y="140" width="320" height="22" class="b0"/><text x="340" y="155" class="tms">1043</text><text x="400" y="155" class="tms">1043</text><text x="490" y="155" class="tms">…</text>
+  <path d="M650,85 L698,85" class="lna" marker-end="url(#aha)"/>
+  <text x="710" y="18" class="th">slice.arg_set_id</text>
+  <rect x="710" y="52" width="280" height="22" class="b0"/><text x="720" y="67" class="tms">row 41  NULL</text>
+  <rect x="710" y="74" width="280" height="22" class="ba"/><text x="720" y="89" class="tms">row 42  1040  (written at commit)</text>
+  <rect x="710" y="96" width="280" height="22" class="b0"/><text x="720" y="111" class="tms">row 43  1040  (same args: shared)</text>
+  <text x="330" y="192" class="ts">Values only ever start at their own row index: [.., 1037, 1040, 1040, 1040, 1043, ..]. This is SetIdSorted.</text>
+  <text x="330" y="210" class="ts">A lookup for k starts at row k and scans forward while the value is still k; no binary search.</text>
+</svg>
+</figure>
+
+<p>This layout makes looking up an arg set a jump, not a search. The args table declares arg_set_id as
+<code>ColumnFlag.SORTED | ColumnFlag.SET_ID</code>, which the generator turns into the <code>SetIdSorted</code> sort state.
+The query interpreter (Section 10) has a dedicated instruction for equality on it, <code>Uint32SetIdSortedEq</code>.
+It jumps to row k, clamped into the current row range, and scans forward while the value equals k.
+An arg set is a handful of rows, so this is a jump plus a few comparisons in one or two cache lines.</p>
+<p>How cheap the commit is depends on the target column’s null layout (Section 6). The commit turns a NULL cell into a value, and
+<code>ArgsInserter::Commit</code> handles every layout: NonNull, DenseNull or either sparse layout with popcount.
+Six tables declare arg_set_id as <code>CppAccess.READ_AND_HIGH_PERF_WRITE</code>: slice, thread, process, cpu, gpu and the generic
+__intrinsic_state table. That makes the column DenseNull, so the write takes constant time.</p>
+<p>Most other tables, including counter, use <code>READ_AND_LOW_PERF_WRITE</code>. There the column is sparse with a popcount, and each
+commit is a memmove whose cost grows with the column (Section 7).</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+<code>EXTRACT_ARG(arg_set_id, 'key')</code> and joins on args.arg_set_id are cheap. Equal arg_set_ids on two rows mean equal args, not the same event.
+During import, an arg set exists only once its inserter goes out of scope. That is usually the end of the parser call that created the row.
+For a slice it is when the slice is popped, at its end event or at end of file. Tracker code that reads arg_set_id earlier sees NULL.
+</blockquote>
+
+<!-- ═════════════════════════ PART II ═════════════════════════ -->
+<div class="part">Part II · Storage</div>
+
+<h2 id="rowcol"><span class="n">5</span>Storing columns instead of rows makes scans cheap</h2>
+<p>Trace queries read a few columns of many rows, such as “all slices longer than 16 ms” or “total duration per track”.
+In a <b>row layout</b>, which SQLite’s own tables use, each row’s fields sit together. Scanning durations then drags every other field through
+the cache too. In <b>column storage</b> each column is its own array, so a cache line holds consecutive durations and nothing else.</p>
+
+<figure>
+<figcaption><b>Figure 8. A duration scan needs only the highlighted cells.</b> In the row layout (red) each cache line fetched is mostly other
+fields. In the column layout (green) one 64-byte line delivers eight int64 durations and nothing else.</figcaption>
+<svg viewBox="0 0 1000 200" role="img" aria-label="Row vs column layout">
+  <text x="10" y="18" class="th">row layout: scanning dur touches every field</text>
+  <g>
+    <rect x="10" y="28" width="60" height="28" class="b0"/><text x="20" y="46" class="tms">ts</text>
+    <rect x="70" y="28" width="60" height="28" class="br"/><text x="80" y="46" class="tms">dur</text>
+    <rect x="130" y="28" width="60" height="28" class="b0"/><text x="140" y="46" class="tms">track</text>
+    <rect x="190" y="28" width="60" height="28" class="b0"/><text x="200" y="46" class="tms">name</text>
+    <rect x="250" y="28" width="60" height="28" class="b0"/><text x="260" y="46" class="tms">depth</text>
+    <rect x="310" y="28" width="60" height="28" class="b0"/><text x="320" y="46" class="tms">…</text>
+    <rect x="370" y="28" width="60" height="28" class="b0"/><text x="380" y="46" class="tms">ts</text>
+    <rect x="430" y="28" width="60" height="28" class="br"/><text x="440" y="46" class="tms">dur</text>
+    <rect x="490" y="28" width="60" height="28" class="b0"/><text x="500" y="46" class="tms">track</text>
+    <rect x="550" y="28" width="60" height="28" class="b0"/><text x="560" y="46" class="tms">name</text>
+    <rect x="610" y="28" width="60" height="28" class="b0"/><text x="620" y="46" class="tms">depth</text>
+    <rect x="670" y="28" width="60" height="28" class="b0"/><text x="680" y="46" class="tms">…</text>
+  </g>
+  <text x="750" y="46" class="ts tr">bytes read ≈ N × whole row</text>
+  <text x="10" y="92" class="th">column layout: dur is one contiguous array</text>
+  <g>
+    <rect x="10" y="102" width="90" height="28" class="bg"/><text x="20" y="120" class="tms">dur[0]</text>
+    <rect x="100" y="102" width="90" height="28" class="bg"/><text x="110" y="120" class="tms">dur[1]</text>
+    <rect x="190" y="102" width="90" height="28" class="bg"/><text x="200" y="120" class="tms">dur[2]</text>
+    <rect x="280" y="102" width="90" height="28" class="bg"/><text x="290" y="120" class="tms">dur[3]</text>
+    <rect x="370" y="102" width="90" height="28" class="bg"/><text x="380" y="120" class="tms">dur[4]</text>
+    <rect x="460" y="102" width="90" height="28" class="bg"/><text x="470" y="120" class="tms">dur[5]</text>
+    <rect x="550" y="102" width="90" height="28" class="bg"/><text x="560" y="120" class="tms">dur[6]</text>
+    <rect x="640" y="102" width="90" height="28" class="bg"/><text x="650" y="120" class="tms">dur[7]</text>
+  </g>
+  <text x="750" y="120" class="ts tg">bytes read = N × 8</text>
+  <path d="M10,140 L730,140" class="ln"/><text x="300" y="156" class="tms">one 64-byte cache line</text>
+  <text x="10" y="186" class="ts">The trade-off runs the other way for producing a whole row: a column store does one load per column. That cost shows up at the SQLite boundary (§9).</text>
+</svg>
+</figure>
+
+<p>Columns also allow metadata per column. If a column is known to be sorted, a range filter becomes two binary searches. If it is the
+implicit id, the value is the row number and needs no storage at all. The rest of this part covers that metadata and what it costs to keep.</p>
+
+<!-- ───────────── Column ───────────── -->
+<h2 id="column"><span class="n">6</span>Each column carries metadata the planner can rely on</h2>
+<p>Every column records its type, NULL layout and sort order in typed fields that the planner reads. A table is a
+<code>dataframe::Dataframe</code>: column names, a vector of shared columns, and a row count. Each column has five parts
+(<code>src/trace_processor/core/dataframe/types.h</code>):</p>
+
+<table>
+  <thead><tr><th>Field</th><th>Values</th><th>What it buys</th></tr></thead>
+  <tbody>
+    <tr><td><code>storage</code></td><td><code>Id</code>, <code>Uint32</code>, <code>Int32</code>, <code>Int64</code>, <code>Double</code>, <code>String</code></td><td>One <code>FlexVector&lt;T&gt;</code> (a growable array) per column. <code>Id</code> stores only a size: value = row index. Strings are 32-bit <code>StringPool::Id</code>s, interned once per trace.</td></tr>
+    <tr><td><code>null_storage</code></td><td><code>NonNull</code>, <code>SparseNull</code>, <code>SparseNullWithPopcountAlways</code>, <code>SparseNullWithPopcountUntilFinalization</code>, <code>DenseNull</code></td><td>How NULLs are represented (below).</td></tr>
+    <tr><td><code>sort_state</code></td><td><code>IdSorted</code>, <code>SetIdSorted</code>, <code>Sorted</code>, <code>Unsorted</code></td><td>Which filters can binary-search or jump.</td></tr>
+    <tr><td style="white-space:nowrap"><code>duplicate_state</code></td><td><code>NoDuplicates</code>, <code>HasDuplicates</code></td><td>Whether equality can return at most one row.</td></tr>
+    <tr><td style="white-space:nowrap"><code>specialized_storage</code></td><td>none or <code>SmallValueEq</code></td><td>An O(1) equality lookup for some sorted unique columns (§11).</td></tr>
+  </tbody>
+</table>
+
+<h3>Five NULL layouts trade memory against write speed</h3>
+<p>Many trace columns are mostly NULL, and the layout decides what that costs. Top-level slices have no parent, and events without args have no
+arg set. Storing a full value slot for every NULL row wastes memory. Not storing it makes row <i>r</i>’s value hard to find.</p>
+<p>A nullable column has a <b>null bitmap</b>, with one bit per row that is set when the row has a value. A <b>dense</b> layout also keeps a
+value slot for every row, so row <i>r</i>’s value is at index <i>r</i>. A <b>sparse</b> layout packs only the non-NULL values. Row <i>r</i>’s
+value is then at the index equal to the number of set bits before <i>r</i>.</p>
+<p>Counting set bits is called <b>popcount</b>, one CPU instruction per 64-bit word. To make that lookup constant-time instead of a scan, a
+layout can add a prefix-popcount array: the running count of set bits at the start of each 64-row word.</p>
+
+<figure>
+<figcaption><b>Figure 9. Sparse layouts save memory but make NULL-to-value writes slow or impossible. DenseNull makes every write fast but pays a slot per NULL.</b>
+The example column has two values in six rows.</figcaption>
+<svg viewBox="0 0 1000 330" role="img" aria-label="Null storage layouts">
+  <text x="10" y="18" class="th">logical column: [NULL, 50, NULL, NULL, 90, NULL]</text>
+  <text x="10" y="54" class="tb">NonNull</text>
+  <text x="10" y="70" class="tms">no NULLs allowed</text>
+  <g>
+    <rect x="250" y="38" width="60" height="28" class="ba"/><rect x="310" y="38" width="60" height="28" class="ba"/><rect x="370" y="38" width="60" height="28" class="ba"/>
+    <rect x="430" y="38" width="60" height="28" class="ba"/><rect x="490" y="38" width="60" height="28" class="ba"/><rect x="550" y="38" width="60" height="28" class="ba"/>
+  </g>
+  <text x="630" y="56" class="ts">value[row]; get and set O(1)</text>
+
+  <text x="10" y="116" class="tb">SparseNull</text>
+  <text x="10" y="132" class="tms">bits + packed values</text>
+  <g><text x="276" y="104" class="tms">0</text><text x="336" y="104" class="tms">1</text><text x="396" y="104" class="tms">0</text><text x="456" y="104" class="tms">0</text><text x="516" y="104" class="tms">1</text><text x="576" y="104" class="tms">0</text></g>
+  <rect x="250" y="112" width="60" height="28" class="bg"/><text x="262" y="130" class="tms">50</text>
+  <rect x="310" y="112" width="60" height="28" class="bg"/><text x="322" y="130" class="tms">90</text>
+  <text x="630" y="122" class="ts">smallest; scan-only, no C++ GetCell</text>
+  <text x="630" y="138" class="ts">or SetCell (static_assert)</text>
+
+  <text x="10" y="190" class="tb">SparseNull + popcount</text>
+  <text x="10" y="206" class="tms">Always / UntilFinalization</text>
+  <g><text x="276" y="178" class="tms">0</text><text x="336" y="178" class="tms">1</text><text x="396" y="178" class="tms">0</text><text x="456" y="178" class="tms">0</text><text x="516" y="178" class="tms">1</text><text x="576" y="178" class="tms">0</text></g>
+  <rect x="250" y="186" width="60" height="28" class="bg"/><text x="262" y="204" class="tms">50</text>
+  <rect x="310" y="186" width="60" height="28" class="bg"/><text x="322" y="204" class="tms">90</text>
+  <rect x="400" y="186" width="150" height="28" class="bw"/><text x="410" y="204" class="tms">u32 per 64 rows</text>
+  <text x="630" y="196" class="ts">get O(1): popcount[row/64] + bits before row</text>
+  <text x="630" y="212" class="ts tw">NULL ↔ value set: memmove + popcount fix-up, O(n)</text>
+
+  <text x="10" y="266" class="tb">DenseNull</text>
+  <text x="10" y="282" class="tms">bits + slot per row</text>
+  <g><text x="276" y="254" class="tms">0</text><text x="336" y="254" class="tms">1</text><text x="396" y="254" class="tms">0</text><text x="456" y="254" class="tms">0</text><text x="516" y="254" class="tms">1</text><text x="576" y="254" class="tms">0</text></g>
+  <g>
+    <rect x="250" y="262" width="60" height="28" fill="url(#hatch)" class="hatch-l"/>
+    <rect x="310" y="262" width="60" height="28" class="ba"/><text x="322" y="280" class="tms">50</text>
+    <rect x="370" y="262" width="60" height="28" fill="url(#hatch)" class="hatch-l"/>
+    <rect x="430" y="262" width="60" height="28" fill="url(#hatch)" class="hatch-l"/>
+    <rect x="490" y="262" width="60" height="28" class="ba"/><text x="502" y="280" class="tms">90</text>
+    <rect x="550" y="262" width="60" height="28" fill="url(#hatch)" class="hatch-l"/>
+  </g>
+  <text x="630" y="272" class="ts">get and set O(1), including NULL → value;</text>
+  <text x="630" y="288" class="ts">pays a full slot for every NULL row</text>
+  <text x="10" y="320" class="ts">Hatched slots hold unspecified values. Every SetCell variant DCHECKs that the dataframe is not finalized: writes happen only during import.</text>
+</svg>
+</figure>
+<p>The layouts are the <code>NullStorage</code> variants in types.h, and the writes are in <code>Dataframe::SetCellUncheckedInternal</code> in
+<code>dataframe.h</code>.
+A comment on <code>prefix_popcount_for_cell_get</code> says the popcount exists only to serve single-cell reads (GetCell) on sparse columns.
+Columns that need writes should use DenseNull.</p>
+
+<!-- ───────────── Flags ───────────── -->
+<h2 id="flags"><span class="n">7</span>Python flags declare intent, and a generator picks the layout</h2>
+<p>Table authors say how a column will be used, and a generator chooses its layout. Each layout trades memory against write speed, and there
+are over a hundred tables. So instead of choosing layouts by hand in C++, authors declare tables in Python under <code>src/trace_processor/tables/*.py</code>
+with a few intent-level knobs.</p>
+<p>The generator in
+<code>python/generators/trace_processor_table/serialize.py</code>
+turns each column into a <code>dataframe::ColumnSpec</code>: storage type, nullability, sort state and duplicate state. It also generates typed
+row references, cursors and setters. A column declaration looks like this:</p>
+
+<pre><code><span class="src">src/trace_processor/tables/slice_tables.py · SLICE_TABLE</span>C(<span class="k">'ts'</span>, CppInt64(), flags=ColumnFlag.SORTED,
+  cpp_access=CppAccess.READ,
+  cpp_access_duration=CppAccessDuration.POST_FINALIZATION),
+C(<span class="k">'parent_id'</span>, CppOptional(CppSelfTableId()),
+  sql_access=SqlAccess.HIGH_PERF,
+  cpp_access=CppAccess.READ_AND_HIGH_PERF_WRITE,
+  cpp_access_duration=CppAccessDuration.POST_FINALIZATION),
+C(<span class="k">'arg_set_id'</span>, CppOptional(CppUint32()),
+  cpp_access=CppAccess.READ_AND_HIGH_PERF_WRITE,
+  cpp_access_duration=CppAccessDuration.POST_FINALIZATION),</code></pre>
+
+<p>Besides <code>flags</code>, three knobs drive the choice:</p>
+<ul>
+  <li><code>cpp_access</code>: whether C++ code may read or write the column through generated row references and cursors, and whether writes
+    are on a hot path. The levels are NONE (the default, SQL only), READ, READ_AND_LOW_PERF_WRITE and READ_AND_HIGH_PERF_WRITE.</li>
+  <li><code>cpp_access_duration</code>: whether that C++ access is needed only during import (PRE_FINALIZATION_ONLY, the default) or also
+    after the tables are frozen at end of file (POST_FINALIZATION). Finalization is covered in Section 8.</li>
+  <li><code>sql_access</code>: HIGH_PERF asks for the layout that is fastest to filter from SQL, at the cost of memory.</li>
+</ul>
+
+<h3>The first matching rule picks the NULL layout</h3>
+<p>Nullability is decided only for columns that are optional <b>or strings</b>. Strings always count as nullable. Before dataframes, a NULL
+string was <code>StringPool::Id::Null()</code>, id 0, and code still depends on that. The rules in <code>_get_nullability_tag</code> apply in order:</p>
+
+<table>
+  <thead><tr><th>Condition (first match wins)</th><th>Layout</th></tr></thead>
+  <tbody>
+    <tr><td>Not optional and not a string</td><td><code>NonNull</code></td></tr>
+    <tr><td>Table is a static table function output (a built-in function that returns a table, such as <code>ancestor_slice</code>)</td><td><code>DenseNull</code></td></tr>
+    <tr><td><code>sql_access=SqlAccess.HIGH_PERF</code></td><td><code>DenseNull</code></td></tr>
+    <tr><td><code>cpp_access=CppAccess.NONE</code> (the default)</td><td><code>SparseNull</code></td></tr>
+    <tr><td><code>CppAccess.READ_AND_HIGH_PERF_WRITE</code></td><td><code>DenseNull</code></td></tr>
+    <tr><td>String with <code>CppAccess.READ_AND_LOW_PERF_WRITE</code></td><td><code>DenseNull</code></td></tr>
+    <tr><td><code>READ</code> / <code>READ_AND_LOW_PERF_WRITE</code> + <code>PRE_FINALIZATION_ONLY</code> (default)</td><td><code>SparseNullWithPopcountUntilFinalization</code></td></tr>
+    <tr><td><code>READ</code> / <code>READ_AND_LOW_PERF_WRITE</code> + <code>POST_FINALIZATION</code></td><td><code>SparseNullWithPopcountAlways</code></td></tr>
+  </tbody>
+</table>
+
+<h3>What each declaration costs</h3>
+<table>
+  <thead><tr><th>Declaration</th><th>Becomes</th><th>Write cost (import)</th><th>Read cost (query) and memory</th></tr></thead>
+  <tbody>
+    <tr><td>implicit <code>id</code></td><td><code>Id</code>, <code>NonNull</code>, <code>IdSorted</code>, <code>NoDuplicates</code></td><td class="good">none: the row count is the column</td><td class="good">0 bytes; <code>id = k</code> is the top filter preference</td></tr>
+    <tr><td><code>ColumnFlag.SORTED</code></td><td><code>Sorted</code></td><td>a promise: rows must be appended in order</td><td class="good">binary search for =, &lt;, ≤, &gt;, ≥ (NonNull columns only)</td></tr>
+    <tr><td><code>SORTED | SET_ID</code></td><td><code>SetIdSorted</code> (Uint32)</td><td>first row of value <i>k</i> must be row <i>k</i></td><td class="good">equality by jump + short scan</td></tr>
+    <tr><td><code>ColumnFlag.HIDDEN</code></td><td>no change to the spec</td><td>—</td><td>Only drops the column from generated docs (<code>tools/gen_tp_table_docs.py</code>). Still in <code>SELECT *</code>.</td></tr>
+    <tr><td><code>ColumnFlag.DENSE</code></td><td>no change to the spec</td><td>—</td><td>Declared in <code>public.py</code> and used in <code>profiler_tables.py</code>, but <code>serialize.py</code> never reads it.</td></tr>
+    <tr><td>non-optional numeric</td><td><code>NonNull</code></td><td class="good">O(1) append and set</td><td class="good">plain array</td></tr>
+    <tr><td>optional, <code>CppAccess.NONE</code></td><td><code>SparseNull</code></td><td>O(1) append; no C++ get/set generated</td><td class="good">smallest; SQL filters translate indices through the bit vector</td></tr>
+    <tr><td>optional, <code>READ</code>/<code>LOW_PERF_WRITE</code></td><td><code>SparseNullWithPopcount…</code></td><td class="warn">append maintains popcount; NULL↔value set is O(n)</td><td>+4 bytes per 64 rows while the popcount lives</td></tr>
+    <tr><td>optional, <code>HIGH_PERF_WRITE</code> or <code>SqlAccess.HIGH_PERF</code></td><td><code>DenseNull</code></td><td class="good">O(1) set, including NULL → value</td><td class="warn">one slot per row even when NULL</td></tr>
+    <tr><td>duration <code>POST_FINALIZATION</code></td><td><code>…Always</code> instead of <code>…UntilFinalization</code></td><td>—</td><td>keeps the popcount array after finalization so C++ can still read cells</td></tr>
+  </tbody>
+</table>
+<p>Two details are easy to miss. Only id is ever marked NoDuplicates, because the generator has no flag for uniqueness.
+And <code>CppAccess</code> also controls code generation: row-reference setters are emitted only for the two WRITE levels.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+When adding a column, pick the weakest access level that works. If a tracker fills an optional column after insert, as with arg_set_id or
+parent_id, make it <code>READ_AND_HIGH_PERF_WRITE</code>. A sparse layout turns each such write into a memmove of the rest of the column.
+</blockquote>
+
+<!-- ───────────── Finalize ───────────── -->
+<h2 id="finalize"><span class="n">8</span>At end of file the tables are shrunk and frozen</h2>
+<p>Finalization is a one-way switch from tables that are cheap to change to tables that are compact and read-only. During import, tables must
+be cheap to append to and patch. During queries, they should be compact and must not change under a running query.
+At end of file, <code>TraceProcessorImpl::NotifyEndOfFile</code> runs four stages, numbered so in its comments.</p>
+
+<figure>
+<figcaption><b>Figure 10. End of file runs four stages, and the tables are read-only from stage 3 on.</b>
+Stage 3 destroys the parsing context but keeps the tables themselves.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 120" role="img" aria-label="Four end-of-file stages: drain the sorter, finish trackers, freeze tables, run the SQL prelude">
+  <rect x="10" y="10" width="196" height="84" rx="2" class="b2"/>
+  <text x="22" y="32" class="tb">1. Drain the sorter</text>
+  <text x="22" y="52" class="ts">push all remaining data</text>
+  <text x="22" y="68" class="ts">through, in time order</text>
+  <text x="22" y="84" class="tms">ExtractEventsForced</text>
+  <path d="M206,52 L222,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="224" y="10" width="196" height="84" rx="2" class="ba"/>
+  <text x="236" y="32" class="tb">2. Finish trackers</text>
+  <text x="236" y="52" class="ts">pending slices and events,</text>
+  <text x="236" y="68" class="ts">process bookkeeping, then</text>
+  <text x="236" y="84" class="ts">compute trace bounds</text>
+  <path d="M420,52 L436,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="438" y="10" width="196" height="84" rx="2" class="bg"/>
+  <text x="450" y="32" class="tb">3. Freeze tables</text>
+  <text x="450" y="52" class="ts">drop sorter, most trackers</text>
+  <text x="450" y="68" class="ts">and per-sequence state;</text>
+  <text x="450" y="84" class="ts">finalize, build indexes</text>
+  <path d="M634,52 L650,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="652" y="10" width="198" height="84" rx="2" class="b"/>
+  <text x="664" y="32" class="tb">4. Run SQL prelude</text>
+  <text x="664" y="52" class="ts">after-EOF part of the</text>
+  <text x="664" y="68" class="ts">standard library, for SQL</text>
+  <text x="664" y="84" class="ts">that needs complete tables</text>
+  <text x="10" y="114" class="ts">Stage 2 calls FlushPendingSlices. Stage 3 finalizes every registered dataframe, then builds the declared indexes.</text>
+</svg>
+</figure>
+
+<p><code>Dataframe::Finalize</code> does four things:</p>
+<ul>
+  <li>It shrinks every value array and bit vector to fit.</li>
+  <li>It frees the popcount array of SparseNullWithPopcountUntilFinalization columns, which then become scan-only like SparseNull.</li>
+  <li>It estimates the number of distinct values of each HasDuplicates integer or string column, into <code>estimated_distinct</code>.
+    The planner uses it to estimate equality selectivity as roughly rows divided by distinct values.</li>
+  <li>It bumps the table’s mutation counter, a count of changes, so cursors holding raw pointers into the columns know to refresh them.</li>
+</ul>
+<p>Indexes declared for a table at registration time are built right after, with <code>BuildIndex</code> and <code>AddIndex</code>.
+From then on the tables are read-only. <code>AddIndex</code> returns a new Dataframe that shares the columns rather than changing the old one.</p>
+
+<h3 id="bounds">Trace bounds come from the data, not from trace metadata</h3>
+<p>Trace processor works out the start and end of the trace from the rows it imported. Many queries need them, for example to clip slices
+that never ended or to express a duration as a share of the trace. Each plugin may report <code>GetTimestampBounds()</code>.
+<code>AggregatePluginTimestampBounds</code> takes the earliest start and the latest end over all plugins. It returns <code>(0, 0)</code> when no
+plugin has data, and widens a zero-length interval to one nanosecond.</p>
+<p>Most of the bounds come from the storage_tables plugin. It scans ts in a fixed list of tables: ftrace events, sched, counters, slices,
+thread state, logs, heap profiles and graphs, smaps, profiler samples and __intrinsic_state. For interval tables it uses
+<code>ts + max(dur, 0)</code> as the end. So a slice left open with <code>dur = -1</code> contributes only its start.</p>
+<p>The result becomes the trace_bounds view and the <code>trace_start()</code>, <code>trace_end()</code> and <code>trace_dur()</code> functions.</p>
+<p>The bounds are cached and recomputed only when some table has changed, because the scan is not free.
+<code>CacheBoundsAndBuildTable</code> sums the tables’ mutation counters, as reported by each plugin, and recomputes only if the sum changed.
+It runs at end of file, in the tracker stage, and on every Flush(). Before either, trace_bounds is <code>(0, 0)</code>.</p>
+<pre><code><span class="c">// CacheBoundsAndBuildTable: sum of GetBoundsMutationCount() changed?</span>
+<span class="c">//   -&gt; AggregatePluginTimestampBounds -&gt; BuildBoundsTable writes _trace_bounds</span>
+<span class="c">//   -&gt; prelude exposes the trace_bounds view and trace_start/end/dur()</span></code></pre>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Use <code>trace_start()</code> and <code>trace_end()</code> rather than <code>MIN(ts)</code> over one table, because they cover all the main event tables at once.
+If you add a table whose timestamps should extend the trace, add it to both GetTimestampBounds and GetBoundsMutationCount in its plugin.
+The code comment insists the two lists match.
+</blockquote>
+
+<!-- ═════════════════════════ PART III ═════════════════════════ -->
+<div class="part">Part III · Queries</div>
+
+<h2 id="vtab"><span class="n">9</span>SQLite plans the query and reads the columns through a virtual table</h2>
+<p>Trace processor reuses SQLite’s parser and planner, but not its storage. SQLite stores tables as row-oriented B-trees, which would give up the
+column layout and metadata of Part II. For foreign data SQLite offers the <b>virtual table</b>: a module registers a set of callbacks, and
+SQLite calls them instead of reading its own storage. Every finalized table is exposed through <code>DataframeModule</code>
+(<code>src/trace_processor/perfetto_sql/engine/dataframe_module.cc</code>). The callbacks that matter:</p>
+<ul>
+  <li><b>xBestIndex</b>, at prepare time. SQLite lists the WHERE constraints on this table, the ORDER BY and the columns used. It asks which
+    ones the table can handle itself, and at what cost. Taking a filter here is <b>constraint push-down</b>: the filter runs inside the table,
+    on columns, instead of in SQLite on every row.</li>
+  <li><b>xFilter</b>, at execution: start a scan with the chosen plan and the actual constraint values.</li>
+  <li><b>xNext</b> / <b>xEof</b>: advance to the next result row, or report the end.</li>
+  <li><b>xColumn</b>: hand SQLite the value of one column of the current row.</li>
+</ul>
+
+<figure>
+<figcaption><b>Figure 11. Planning is paid once per statement. The per-row cost is the bottom-right box.</b>
+LogicalPlanner and BytecodeLowering are the two planning stages described in Section 10.</figcaption>
+<svg viewBox="0 0 1000 270" role="img" aria-label="vtab call sequence">
+  <text x="10" y="18" class="th">prepare (once per statement)</text>
+  <rect x="10" y="30" width="170" height="56" rx="2" class="b2"/>
+  <text x="22" y="52" class="tb">SQLite planner</text><text x="22" y="70" class="ts">constraints, ORDER BY, colUsed</text>
+  <path d="M180,58 L208,58" class="ln" marker-end="url(#ah)"/>
+  <rect x="210" y="30" width="170" height="56" rx="2" class="ba"/>
+  <text x="222" y="52" class="tb">xBestIndex</text><text x="222" y="70" class="ts">→ Filter/Sort/Limit specs</text>
+  <path d="M380,58 L408,58" class="lna" marker-end="url(#aha)"/>
+  <rect x="410" y="30" width="170" height="56" rx="2" class="ba"/>
+  <text x="422" y="52" class="tb">LogicalPlanner</text><text x="422" y="70" class="ts">order filters, pick strategy</text>
+  <path d="M580,58 L608,58" class="lna" marker-end="url(#aha)"/>
+  <rect x="610" y="30" width="170" height="56" rx="2" class="ba"/>
+  <text x="622" y="52" class="tb">BytecodeLowering</text><text x="622" y="70" class="ts">registers + instructions</text>
+  <path d="M780,58 L808,58" class="lna" marker-end="url(#aha)"/>
+  <rect x="810" y="30" width="180" height="56" rx="2" class="b0"/>
+  <text x="822" y="52" class="tb">idxStr</text><text x="822" y="70" class="ts">serialized plan + cost, rows</text>
+  <text x="10" y="128" class="th">execute (per scan of the table)</text>
+  <rect x="10" y="140" width="250" height="56" rx="2" class="bg"/>
+  <text x="22" y="162" class="tb">xFilter(idxStr, argv)</text><text x="22" y="180" class="ts">deserialize if idxStr changed; Execute</text>
+  <path d="M260,168 L288,168" class="lng" marker-end="url(#ahg)"/>
+  <rect x="290" y="140" width="250" height="56" rx="2" class="bg"/>
+  <text x="302" y="162" class="tb">bytecode over columns</text><text x="302" y="180" class="ts">leaves a span of row indices</text>
+  <path d="M540,168 L568,168" class="ln" marker-end="url(#ah)"/>
+  <rect x="570" y="140" width="420" height="56" rx="2" class="bw"/>
+  <text x="582" y="162" class="tb">xNext / xEof / xColumn, one row at a time</text>
+  <text x="582" y="180" class="ts">pos_ += stride; cell = storage[pos_[col]] → sqlite3_result_*</text>
+  <text x="10" y="232" class="t">The plan is built once at prepare time and travels to xFilter as a string. Constraint values arrive in argv, so the</text>
+  <text x="10" y="250" class="t">same plan serves every execution, including each outer row of a nested-loop join.</text>
+</svg>
+</figure>
+
+<h3>xBestIndex takes every filter the table understands and leaves the rest to SQLite</h3>
+<p><code>DataframeModule::BestIndex</code> walks aConstraint, SQLite’s array of constraints, and maps SQLite operators to dataframe operators.
+Figure 12 shows which operators are taken. An equality that SQLite can pass as a whole list, through <code>sqlite3_vtab_in</code>, becomes In.
+Constant LIMIT and OFFSET are taken too, unless some other constraint was not understood.</p>
+
+<figure>
+<figcaption><b>Figure 12. Comparisons, GLOB and NULL checks run inside the dataframe. LIKE, REGEXP and functions run in SQLite on every returned row.</b>
+Every constraint on the left is marked omit, so SQLite does not check it again.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 200" role="img" aria-label="Which constraints are pushed down into the dataframe and which stay in SQLite">
+  <text x="10" y="18" class="th">pushed down: runs on columns</text>
+  <rect x="10" y="28" width="410" height="132" rx="2" class="bg"/>
+  <text x="24" y="52" class="tm">=  !=  &lt;  &lt;=  &gt;  &gt;=</text>
+  <text x="24" y="74" class="tm">GLOB   IS NULL   IS NOT NULL</text>
+  <text x="24" y="96" class="tm">IN list (sqlite3_vtab_in)</text>
+  <text x="24" y="118" class="tm">constant LIMIT, OFFSET</text>
+  <text x="24" y="140" class="ts">ORDER BY is always consumed; DISTINCT is pushed down too</text>
+  <text x="440" y="18" class="th">stays in SQLite: runs per row</text>
+  <rect x="440" y="28" width="410" height="132" rx="2" class="br"/>
+  <text x="454" y="52" class="tm">LIKE   REGEXP</text>
+  <text x="454" y="74" class="tm">function calls</text>
+  <text x="454" y="96" class="ts">anything else SQLite passes in</text>
+  <text x="454" y="118" class="ts">LIMIT / OFFSET when another constraint</text>
+  <text x="454" y="134" class="ts">was not understood</text>
+  <text x="10" y="186" class="ts">So name GLOB 'foo*' is filtered on the column, while name LIKE 'foo%' is checked by SQLite on each row the table returns.</text>
+</svg>
+</figure>
+
+<p>The rest of the plan is reported back to SQLite:</p>
+<ul>
+  <li>SQLite does not recheck what the table handles, including ORDER BY (<code>omit</code>, <code>orderByConsumed</code>).
+    The dataframe either sorts itself or knows it is already sorted.</li>
+  <li>DISTINCT is pushed down for the columns the query reads (<code>colUsed</code>).</li>
+  <li>The plan’s estimated cost and row count go back to SQLite. A plan that returns at most one row says so
+    (<code>SQLITE_INDEX_SCAN_UNIQUE</code>).</li>
+  <li>The chosen plan travels to xFilter as a string stored with the prepared statement (<code>idxStr</code>).</li>
+</ul>
+
+<h3>xFilter runs the plan, and xNext and xColumn hand rows over one at a time</h3>
+<p><code>Filter</code> deserializes the plan only when idxStr differs from the last one this cursor saw. It copies the argv pointers into a
+value fetcher and runs the bytecode. The result is a span of row indices. <code>Next</code> advances a pointer and <code>Eof</code> compares two
+pointers. <code>Column</code> reads one cell and hands it to SQLite with the matching <code>sqlite3_result_*</code> call.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Filters in the supported list run in the dataframe. Others run in SQLite on every returned row. <code>name GLOB 'foo*'</code> is pushed down,
+and <code>name LIKE 'foo%'</code> is not.
+</blockquote>
+
+<!-- ───────────── Bytecode ───────────── -->
+<h2 id="bytecode"><span class="n">10</span>A small bytecode interpreter runs each filter over many rows at once</h2>
+<p>Trace processor compiles each query into a few specialized instructions, so it never branches on type or operator per row.
+A generic filter loop would check the column’s type, whether it is nullable and which operator to apply, for every row. Those branches would
+cost more than the comparison itself.</p>
+<p>Instead, a small <b>bytecode interpreter</b> runs a short list of instructions. Each is specialized for one column type, null layout and
+operator, and each processes a whole range or list of rows. Dispatch, one switch per instruction in <code>Interpreter::Execute</code>, is paid
+once per instruction, not once per row.</p>
+<p>It is a <b>register</b> interpreter: instructions read and write numbered slots that hold intermediate results, rather than pushing them on
+a stack. Registers hold a Range (a begin and end pair), a span of row indices, slabs, cast filter values, or storage pointers. A slab is an owned
+scratch buffer that spans point into.</p>
+<p>Planning has two stages. <code>LogicalPlanner::Plan</code>
+(<code>core/dataframe/logical_plan.cc</code>)
+decides <em>what</em> to do. It picks the filter order and a strategy for each filter: binary search, set-id search, small-value lookup, range
+scan or index-list scan. It also decides whether an index helps and whether a sort can be skipped.</p>
+<p><code>BytecodeLowering::Lower</code> decides <em>how</em>. It assigns registers and emits instructions specialized for each column’s storage
+type, nullability and sort state. Each instruction is a small, fixed-size, trivially copyable <code>Bytecode</code>
+(<code>core/interpreter/bytecode_core.h</code>).
+Its exact size is in Numbers and method.</p>
+
+<h3>Cheap filters run first, while the candidate rows are still one range</h3>
+<p>Filters are ordered so the cheapest ones run while the candidates are still a contiguous range. The order comes from
+<code>FilterPreference</code>: id equality, then set-id equality, id inequality, sorted numeric equality and inequality, sorted string equality
+and inequality, then everything else. The sorted cases require a NonNull column.</p>
+<p>While only these have run, the candidates are a Range, which is two integers and costs nothing to represent. The first filter that cannot keep a
+range forces the rows to be listed. <code>AllocateIndices</code> plus <code>Iota</code> writes the surviving row numbers into a slab, and the
+remaining filters compact that list in place.</p>
+
+<figure>
+<figcaption><b>Figure 13. Two binary searches shrink the range, and only then are rows listed and filtered.</b>
+The instruction sequence has the shape the bytecode unit tests check
+(<code>core/dataframe/dataframe_unittest.cc</code>), with register numbers omitted.
+A first equality on an unsorted column can use LinearFilterEq, which scans a range without listing it first.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Range then span narrowing">
+  <text x="10" y="18" class="th">WHERE ts &gt;= a AND ts &lt; b AND dur &gt; c   (slice.ts is Sorted, NonNull)</text>
+  <text x="10" y="54" class="tms">InitRange</text>
+  <rect x="200" y="40" width="790" height="22" class="b0"/><text x="210" y="56" class="tms">[0, N)  · two integers, no allocation</text>
+  <text x="10" y="90" class="tms">SortedFilter&lt;Int64,</text><text x="10" y="104" class="tms">  LowerBound / …&gt;</text>
+  <rect x="200" y="76" width="790" height="22" fill="url(#hatch)" class="hatch-l"/>
+  <rect x="470" y="76" width="210" height="22" class="ba"/><text x="480" y="92" class="tms">[lo, hi)  2 × O(log N)</text>
+  <text x="10" y="136" class="tms">AllocateIndices + Iota</text>
+  <rect x="470" y="122" width="210" height="22" class="bw"/><text x="480" y="138" class="tms">lo, lo+1, …, hi-1</text>
+  <text x="10" y="172" class="tms">NonStringFilter</text><text x="10" y="186" class="tms">  &lt;Int64, Gt&gt;</text>
+  <g>
+    <rect x="470" y="158" width="26" height="22" class="bg"/><rect x="520" y="158" width="26" height="22" class="bg"/>
+    <rect x="560" y="158" width="26" height="22" class="bg"/><rect x="640" y="158" width="26" height="22" class="bg"/>
+  </g>
+  <text x="700" y="174" class="ts">compacted in place: only candidate dur values read</text>
+  <path d="M575,98 L575,120" class="lna" marker-end="url(#aha)"/>
+  <path d="M575,144 L575,156" class="lnw" marker-end="url(#ahw)"/>
+  <text x="10" y="222" class="ts">Each filter value first passes through CastFilterValue&lt;T&gt;, which converts the SQLite value to the column type and can prove the result empty.</text>
+  <text x="10" y="238" class="ts">An index on the column turns equality into IndexedFilterEq over the index’s permutation vector instead.</text>
+</svg>
+</figure>
+
+<p>Ordering, distinct and limit are bytecode too. ORDER BY on a column already sorted in the requested direction costs nothing, or a
+<code>Reverse</code>. Otherwise the interpreter copies the sort keys into a row-layout buffer and runs a stable sort, using
+<code>AllocateRowLayoutBuffer</code>, <code>CopyToRowLayout</code> and <code>SortRowLayout</code>. DISTINCT uses the same buffer.
+An <code>ORDER BY x LIMIT 1</code> becomes <code>FindMinMaxIndex</code>.</p>
+<p>The costs each instruction reports to SQLite are rough rankings, not measurements. <code>FixedCost</code>, <code>LogPerRowCost</code> and
+<code>LinearPerRowCost</code> carry a TODO in bytecode_instructions.h saying they are not yet backed by benchmarks. They rank “binary search”
+against “scan” well, and should not be read as more than that.</p>
+
+<!-- ───────────── Indexes ───────────── -->
+<h2 id="indexes"><span class="n">11</span>Indexes speed up equality on columns that are not sorted</h2>
+<p>An <b>index</b> is a permutation vector: the table’s row numbers in the order of one or more columns (<code>dataframe::Index</code>).
+With it, equality on an unsorted column becomes a binary search over the permutation. The planner uses an index for a run of = or IN
+filters that match the index’s leading columns. An IN ends the run, because its output is no longer contiguous in the index.</p>
+<p>Only tables created from SQL can get an index from SQL. <code>CREATE PERFETTO INDEX</code> works only on tables the SQL engine owns, that
+is, <code>CREATE PERFETTO TABLE</code> results. On a built-in table it fails with “indexes on intrinsic table … must be declared at compile
+time, not via SQL”. Those indexes are attached at registration and built after finalization (Section 8).</p>
+<p><b>SmallValueEq</b> gives constant-time equality on some sorted, unique, non-null Uint32 columns. It is a bit vector indexed by value plus a
+prefix popcount, so <code>col = k</code> is one bit test and one popcount.</p>
+<p>Finalize does not build it. <code>AdhocDataframeBuilder</code> does, which backs tables created at runtime from SQL results and several table
+functions. The builder adds it when the maximum value is below 16 times the row count, and the column is not already IdSorted or SetIdSorted.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+When you materialize an intermediate result with <code>CREATE PERFETTO TABLE</code>, the builder infers sort state and may add SmallValueEq.
+If you then join on a column that is neither sorted nor SmallValueEq, add <code>CREATE PERFETTO INDEX</code> on it.
+</blockquote>
+
+<!-- ───────────── Pipes ───────────── -->
+<h2 id="pipes"><span class="n">12</span>Pipe syntax keeps multi-stage interval work out of SQLite</h2>
+<p>The experimental pipe syntax runs whole multi-stage queries on columns, and crosses into SQLite only at the end. On the vtab path, only the
+filters run on columns. Joins, GROUP BY and window functions run in SQLite’s own row-at-a-time bytecode engine, the <b>VDBE</b>, and every
+intermediate row crosses the vtab boundary.</p>
+<p>Trace analysis is full of multi-stage interval work, such as intersecting two sets of intervals, flattening nested slices or accumulating
+over a tree. That work pays the crossing cost at every stage.</p>
+<p>PerfettoSQL’s pipe syntax is documented in
+<code>docs/analysis/perfetto-sql-pipe-syntax.md</code>.
+A query starts from a source and chains stages with <code>|&gt;</code>. Each stage consumes the table produced by the previous one.
+<code>PERFETTO PRAGMA pipelines = 1</code> switches it on. The implementation notes open with a warning that syntax and execution behaviour may
+change without notice. It runs on a separate engine.</p>
+<pre><code><span class="src">docs/analysis/perfetto-sql-pipe-getting-started.md (PRAGMA line from its intro)</span>PERFETTO PRAGMA pipelines = 1;
+FROM (SELECT ts, dur, track_id FROM slice WHERE dur &gt; 0)
+|&gt; INTERVAL FLATTEN PER track_id AGGREGATE COUNT(*) AS active;</code></pre>
+<p>A pipe query compiles to a plan of columnar operations, which runs inside one table function. The compiler
+(<code>perfetto_sql/pipeline/compiler.h</code>)
+produces a pipeline logical plan of operations: scan, order_by, interval_intersect, interval_flatten and tree_accumulate, found in
+perfetto_sql/pipeline/operations/. Projection stages such as SELECT, DROP and RENAME only rename or drop columns, and add no plan node.</p>
+<p>The plan is serialized into ordinary SQL that calls a table function, <code>__intrinsic_pipeline(X'…')</code>, implemented by
+<code>PipelineModule</code>. A table function is a vtab used like a function in FROM. Relations the pipeline reads from SQL, such as views and
+subqueries, are first built into dataframes by <code>__intrinsic_dataframe_agg</code> and passed in as arguments.</p>
+
+<figure>
+<figcaption><b>Figure 14. On the pipe path, intermediate stages never become SQLite rows.</b> A finalized dataframe source is read directly by
+DataframeScan: “the batches point straight at the dataframe’s own storage”, and only columns needed downstream are read.
+Batch sizes are in Numbers and method.</figcaption>
+<svg viewBox="0 0 1000 210" role="img" aria-label="vtab path vs pipeline path">
+  <text x="10" y="18" class="th">vtab path</text>
+  <rect x="10" y="28" width="140" height="44" rx="2" class="bg"/><text x="22" y="54" class="tms">dataframe</text>
+  <path d="M150,50 L178,50" class="ln" marker-end="url(#ah)"/>
+  <rect x="180" y="28" width="170" height="44" rx="2" class="ba"/><text x="192" y="54" class="tms">bytecode filter</text>
+  <path d="M350,50 L378,50" class="lnw" marker-end="url(#ahw)"/>
+  <rect x="380" y="28" width="300" height="44" rx="2" class="bw"/><text x="392" y="48" class="tms">rows into SQLite VDBE: joins,</text><text x="392" y="64" class="tms">GROUP BY, window fns, row by row</text>
+  <path d="M680,50 L708,50" class="ln" marker-end="url(#ah)"/>
+  <rect x="710" y="28" width="280" height="44" rx="2" class="b0"/><text x="722" y="54" class="tms">result rows</text>
+  <text x="10" y="108" class="th">pipe path</text>
+  <rect x="10" y="118" width="140" height="44" rx="2" class="bg"/><text x="22" y="144" class="tms">dataframe</text>
+  <path d="M150,140 L178,140" class="lnv" marker-end="url(#ahv)"/>
+  <rect x="180" y="118" width="500" height="44" rx="2" class="bv"/><text x="192" y="138" class="tms">scan → interval_intersect → tree_accumulate …</text><text x="192" y="154" class="tms">columnar batches of ≤ 2048 rows, pointing at storage</text>
+  <path d="M680,140 L708,140" class="lnw" marker-end="url(#ahw)"/>
+  <rect x="710" y="118" width="280" height="44" rx="2" class="bw"/><text x="722" y="138" class="tms">PipelineModule vtab:</text><text x="722" y="154" class="tms">rows to SQLite only at end</text>
+  <text x="10" y="196" class="ts">Intermediate stages never become SQLite rows. Only the final output crosses the vtab boundary, and SQL-sourced inputs still go through SQLite first.</text>
+</svg>
+</figure>
+
+<p>The operators are written for trace-shaped work. <code>INTERVAL INTERSECTION OF</code>, for example, partitions each operand by its PER
+columns and sorts the intervals in each partition. When no operand has overlaps it takes a single multi-way sweep. Otherwise it falls back to
+pairwise narrowing with a linear sweep, binary search or interval tree
+(<code>docs/design-docs/perfetto-sql-pipelines.md</code>).</p>
+<p>Before running, a backward liveness pass drops unused columns. It walks from the last stage to the first and keeps only columns that some
+later stage reads. It can also remove a whole TREE ACCUMULATE stage whose output is never read.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Pipe stages pay off for multi-stage interval work over large tables. Where you can, start a pipeline from a table rather than a view or subquery.
+A finalized dataframe has its columns shared in place (<code>Scan::FindDirectDataframe</code>). A SQL source is first run through SQLite and
+copied into a new dataframe.
+</blockquote>
+
+<!-- ───────────── Plugins ───────────── -->
+<h2 id="plugins"><span class="n">13</span>Plugins package each feature and declare what it depends on</h2>
+<p>Each trace processor feature is a plugin that declares its dependencies, so the framework can create them in a valid order. Trace processor
+has dozens of features. Each registers some mix of importers, tables and SQL functions, and some depend on others. For example, the descendant
+table functions below build on ancestor. A <b>plugin</b> is a class that contributes through a fixed set of hooks.</p>
+<p>Several dozen live under src/trace_processor/plugins/, from span_join_operator and interval_intersect to storage_tables, which registers
+many of the built-in tables. The mechanism is in
+<code>src/trace_processor/core/plugin/plugin.h</code>.</p>
+
+<figure>
+<figcaption><b>Figure 15. Plugins are registered, sorted by dependency once, then created in that order.</b>
+Importer and dataframe hooks run at startup. SQL hooks run each time a connection is set up.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 130" role="img" aria-label="Plugin lifecycle: register, topological sort, instantiate, startup hooks, per-connection SQL hooks">
+  <rect x="10" y="10" width="154" height="84" rx="2" class="b2"/>
+  <text x="22" y="32" class="tb">Register</text>
+  <text x="22" y="52" class="ts">constructor calls</text>
+  <text x="22" y="68" class="ts">each plugin’s</text>
+  <text x="22" y="84" class="tms">RegisterPlugin()</text>
+  <path d="M164,52 L180,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="182" y="10" width="154" height="84" rx="2" class="ba"/>
+  <text x="194" y="32" class="tb">Sort once</text>
+  <text x="194" y="52" class="ts">topological sort; fails</text>
+  <text x="194" y="68" class="ts">on a missing dependency</text>
+  <text x="194" y="84" class="ts">or a cycle</text>
+  <path d="M336,52 L352,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="354" y="10" width="154" height="84" rx="2" class="b"/>
+  <text x="366" y="32" class="tb">Create in order</text>
+  <text x="366" y="52" class="ts">instantiate every</text>
+  <text x="366" y="68" class="ts">plugin, wire up its</text>
+  <text x="366" y="84" class="ts">dependencies</text>
+  <path d="M508,52 L524,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="526" y="10" width="154" height="84" rx="2" class="bg"/>
+  <text x="538" y="32" class="tb">Startup hooks</text>
+  <text x="538" y="52" class="ts">importers, then</text>
+  <text x="538" y="68" class="ts">dataframes (finalized</text>
+  <text x="538" y="84" class="ts">at end of file)</text>
+  <path d="M680,52 L696,52" class="ln" marker-end="url(#ah)"/>
+  <rect x="698" y="10" width="152" height="84" rx="2" class="bv"/>
+  <text x="710" y="32" class="tb">SQL hooks</text>
+  <text x="710" y="52" class="ts">functions, table</text>
+  <text x="710" y="68" class="ts">functions, modules,</text>
+  <text x="710" y="84" class="ts">per connection</text>
+  <text x="10" y="120" class="ts">GetPluginSet() runs Kahn’s topological sort and caches the result. TraceProcessorImpl does the creating and calls the hooks.</text>
+</svg>
+</figure>
+
+<div class="two">
+<div>
+<pre><code><span class="src">plugins/descendant/descendant.cc (shape)</span><span class="k">class</span> DescendantPlugin
+    : <span class="k">public</span> Plugin&lt;DescendantPlugin, ancestor::AncestorPlugin&gt; {
+  <span class="c">// override only the hooks you need, e.g.</span>
+  <span class="k">void</span> RegisterStaticTableFunctions(
+      PerfettoSqlConnection*,
+      std::vector&lt;std::unique_ptr&lt;StaticTableFunction&gt;&gt;&amp;) override;
+};
+<span class="k">void</span> RegisterPlugin() {                <span class="c">// called from TraceProcessorImpl</span>
+  <span class="k">static</span> PluginRegistration reg(
+      [] { <span class="k">return</span> std::make_unique&lt;DescendantPlugin&gt;(); },
+      DescendantPlugin::kPluginId, DescendantPlugin::kDepIds.data(),
+      DescendantPlugin::kDepIds.size());
+}</code></pre>
+</div>
+<div>
+<ul>
+  <li><b>Identity</b>: <code>Plugin&lt;Self, Deps...&gt;</code> uses <b>CRTP</b>, the curiously recurring template pattern. A class passes itself
+    as a template argument to its base, so the base can generate per-class code at compile time. The base gives each class a unique id, the
+    address of a per-type static, plus the ids of its dependencies.</li>
+  <li><b>Registration</b>: a <code>PluginRegistration</code> links itself into a global list. The intended form is the
+    <code>PERFETTO_TP_REGISTER_PLUGIN</code> macro, a global constructor. A TODO in the TraceProcessorImpl constructor says that is disabled for
+    build reasons. So each plugin exposes RegisterPlugin() with a function-local static, and the constructor calls them all before
+    <code>GetPluginSet()</code>. The call count is in Numbers and method.</li>
+  <li><b>Order</b>: GetPluginSet() runs Kahn’s topological sort once, which orders the plugins so each comes after everything it depends on.
+    It CHECK-fails on a missing dependency or a cycle, and caches the result.</li>
+  <li><b>Access</b>: <code>dependency&lt;T&gt;()</code> indexes a vector of resolved dependency pointers by T’s position in Deps....</li>
+</ul>
+</div>
+</div>
+
+<p>Every hook on <code>PluginBase</code> defaults to a no-op, so a plugin overrides only what it needs:</p>
+<table>
+  <thead><tr><th>Hooks</th><th>When they run</th></tr></thead>
+  <tbody>
+    <tr><td><code>RegisterImporters</code>, <code>RegisterProtoImporterModules</code>, <code>RegisterTrackEventExtensions</code></td><td>At startup, after every plugin is created</td></tr>
+    <tr><td><code>RegisterDataframes</code>, <code>OnDataframesRegistered</code></td><td>At startup</td></tr>
+    <tr><td><code>RegisterStaticTableFunctions</code>, <code>RegisterSqliteModules</code>, <code>RegisterFunctions</code>, <code>RegisterAggregateFunctions</code>, <code>RegisterWindowFunctions</code></td><td>When a connection is set up</td></tr>
+    <tr><td>Two hooks for trace bounds</td><td>At end of file and on Flush (Section 8)</td></tr>
+  </tbody>
+</table>
+<p>The header explains why Deps... is a template pack. Including the dependency’s header forces the dependency in GN, Perfetto’s build system.
+A missing dependency fails the link, and the runtime sort verifies the rest.</p>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+New tables and SQL functions live in a plugin. Return your dataframes from <code>RegisterDataframes</code>, and they will be finalized and
+indexed at end of file. Declare dependencies in Deps.... Until static registration is restored, you also add one RegisterPlugin() call to the
+TraceProcessorImpl constructor.
+</blockquote>
+
+<!-- ───────────── Bottlenecks ───────────── -->
+<h2 id="bottlenecks"><span class="n">14</span>What is already cheap, and what still costs</h2>
+<p>Each trick in this note removes one cost. Here they are in one place:</p>
+<table>
+  <thead><tr><th>Trick</th><th>Where</th><th>What it saves</th></tr></thead>
+  <tbody>
+    <tr><td>Sort only the late tail of each queue; merge queues by rescanning heads</td><td>§2</td><td>Full sorts of data that is already almost in order</td></tr>
+    <tr><td>16-byte queue entries pointing into 64 KB bump-allocated chunks</td><td>§2</td><td>Moving packet bytes while sorting; per-packet allocation</td></tr>
+    <tr><td>Insert slices at begin, patch <code>dur</code> at end</td><td>§3</td><td>Re-sorting <code>slice.ts</code></td></tr>
+    <tr><td>Hash-deduplicated, contiguous arg sets</td><td>§4</td><td>Storing identical args twice; binary search on <code>arg_set_id</code></td></tr>
+    <tr><td>Column storage; <code>Id</code> columns with no storage; 32-bit interned string ids</td><td>§5–6</td><td>Cache traffic on scans; memory</td></tr>
+    <tr><td>Null layout chosen per column from declared access</td><td>§6–7</td><td>Memory for mostly-NULL columns, without slow writes where writes matter</td></tr>
+    <tr><td>Shrink and drop popcounts at finalization</td><td>§8</td><td>Import-only memory kept for the whole session</td></tr>
+    <tr><td>Plan once per statement, carried in <code>idxStr</code></td><td>§9</td><td>Re-planning for each execution and each join row</td></tr>
+    <tr><td>Specialized instructions over ranges, then compacted index lists</td><td>§10</td><td>Per-row type and operator branches; allocating row lists early</td></tr>
+    <tr><td>Columnar batches across pipe stages</td><td>§12</td><td>Crossing into SQLite between stages</td></tr>
+  </tbody>
+</table>
+<p>Five costs remain, each with something that helps:</p>
+<table>
+  <thead><tr><th>Where</th><th>Why it costs</th><th>What helps</th></tr></thead>
+  <tbody>
+    <tr><td>Sorter memory</td><td>Everything since the last extraction point is held; ring-buffer and full-sort imports hold the whole trace until EOF (§2).</td><td>Long traces recorded with <code>write_into_file</code>; fix clock snapshots that force full sort.</td></tr>
+    <tr><td>Sparse-null writes</td><td>NULL → value on a popcount column is a memmove of the tail plus a popcount fix-up (§6).</td><td><code>READ_AND_HIGH_PERF_WRITE</code> on columns patched after insert.</td></tr>
+    <tr><td>Joins</td><td>SQLite joins by nested loops. With a dataframe on the inner side, each outer row is one <code>xFilter</code> with the join key in <code>argv</code>. The plan is reused, but if the inner column is unsorted each call scans.</td><td>Join on <code>id</code>, sorted or set-id columns; <code>CREATE PERFETTO TABLE</code> then <code>CREATE PERFETTO INDEX</code>.</td></tr>
+    <tr><td>Row boundary</td><td>Every row SQLite consumes is an <code>xNext</code> plus one <code>xColumn</code> per used column, each boxing a value with <code>sqlite3_result_*</code>.</td><td>Select only needed columns; filter in pushable operators; aggregate in fewer rows.</td></tr>
+    <tr><td>Non-pushed filters</td><td><code>LIKE</code>, <code>REGEXP</code> and function predicates are evaluated by SQLite on every returned row.</td><td><code>GLOB</code> instead of <code>LIKE</code>; combine with a pushed filter that narrows first.</td></tr>
+  </tbody>
+</table>
+<p>Two directions are visible in the code. The pipe engine keeps whole multi-stage computations in columnar batches and crosses into SQLite
+only at the end (Section 12). And the dataframe planner was split so that its <code>LogicalPlan</code> refers to no interpreter details.
+Its header says a backend that wants the planner’s access-path choice reads the strategy, and one that picks its own reads only the predicate.
+Beyond that, this page does not speculate.</p>
+
+<!-- ───────────── Method ───────────── -->
+<h2 id="method"><span class="n">15</span>Numbers and method</h2>
+<p>This note explains code. It measures nothing. Every figure below is a constant, a static_assert or a code comment in the upstream Perfetto
+repository, main as of late October 2026, read from the files under Sources. The timestamps in Figure 6 and the row numbers in Figure 7 are made-up examples.</p>
+<table>
+  <thead><tr><th>Item</th><th>Exact value</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Queue entry (<code>TimestampedEvent</code>)</td><td>16 bytes, enforced by a static_assert. Four fit in a 64-byte cache line.</td><td>trace_sorter.h</td></tr>
+    <tr><td>Allocation id (<code>AllocId</code>)</td><td>58 bits: chunk index 42 bits (<code>BumpAllocator::kChunkIndexAllocIdBits</code>, 58 − 16) and offset 16 bits (<code>kChunkOffsetAllocIdBits</code>, log2 of the 64 KB chunk). The order of bit fields inside the second word is up to the compiler. Only the widths and the 16-byte total are fixed. The rest of the word holds is_json (1 bit) and 5 spare bits.</td><td>bump_allocator.h, trace_sorter.h</td></tr>
+    <tr><td>Token buffer chunk</td><td>64 KB</td><td>bump_allocator.h</td></tr>
+    <tr><td>Merge loop cost</td><td>About 1–3% of CPU time on 8-CPU Android traces, as reported by a code comment</td><td>trace_sorter.cc</td></tr>
+    <tr><td>Extraction window</td><td>Extraction runs at a read-buffer event only after at least 2 flushes since the last extraction (<code>flushes_since_extraction_ &lt; 2</code> returns early)</td><td>trace_sorter.h</td></tr>
+    <tr><td>Pending slice duration</td><td><code>kPendingDuration</code> = −1</td><td>slice_tracker.h</td></tr>
+    <tr><td>Maximum slice depth</td><td><code>kMaxDepth</code> = 512. Stacks are kept per track in a <code>FlatHashMap&lt;TrackId, TrackInfo&gt;</code>.</td><td>slice_tracker.h, slice_tracker.cc</td></tr>
+    <tr><td>Slice args holder</td><td>An <code>std::optional&lt;ArgsInserter&gt;</code> in the stack entry, created on first use. At end of file <code>FlushPendingSlices</code> commits the args of open slices but does not close them.</td><td>slice_tracker.h, slice_tracker.cc</td></tr>
+    <tr><td>Args duplicate detection</td><td>Linear scan up to 32 args in the buffer, then a hash map</td><td>args_tracker.h, global_args_tracker.h</td></tr>
+    <tr><td>Arg set deduplication key</td><td>64-bit hash (murmur) over key, type and value of every arg</td><td>global_args_tracker.h</td></tr>
+    <tr><td>Tables whose arg_set_id is DenseNull</td><td>6: slice, thread, process, cpu, gpu, __intrinsic_state (<code>CppAccess.READ_AND_HIGH_PERF_WRITE</code>)</td><td>tables/*.py</td></tr>
+    <tr><td>Prefix popcount</td><td>One 32-bit count per 64 rows, that is +4 bytes per 64 rows while it lives</td><td>Section 6, flag table in Section 7</td></tr>
+    <tr><td>Bytecode instruction</td><td>32-bit opcode plus a 36-byte argument buffer, at most 40 bytes, trivially copyable. Index registers hold a <code>Span&lt;uint32_t&gt;</code>.</td><td>bytecode_core.h</td></tr>
+    <tr><td>SmallValueEq rule</td><td>Added when the maximum value is below 16 × the row count</td><td>adhoc_dataframe_builder.cc</td></tr>
+    <tr><td>Pipe batch size</td><td><code>kMaxBatchRows = 2048</code> in the code. The design doc says batches are up to 8192 rows.</td><td><code>core/exec/selection.h</code></td></tr>
+    <tr><td>Plugin registrations</td><td>66 RegisterPlugin() calls in the TraceProcessorImpl constructor, 4 of them behind the Winscope build flag</td><td>trace_processor_impl.cc</td></tr>
+    <tr><td>Trace bounds with no data</td><td>(0, 0). A zero-length interval is widened to 1 ns.</td><td><code>AggregatePluginTimestampBounds</code> (Section 8)</td></tr>
+  </tbody>
+</table>
+<p>Where the design docs and the code disagree, as with the pipe batch size, both are given.</p>
+
+<!-- ───────────── Sources ───────────── -->
+<h2 id="sources">Sources</h2>
+<p class="m">Paths are in the upstream Perfetto repository. Short paths such as <code>importers/</code>, <code>sorter/</code>, <code>util/</code>, <code>core/</code>,
+<code>tables/</code>, <code>plugins/</code> and <code>perfetto_sql/</code> are under <code>src/trace_processor/</code>, and <code>pipeline/</code> and
+<code>stdlib/</code> are under <code>src/trace_processor/perfetto_sql/</code>.</p>
+<ul>
+  <li><code>docs/design-docs/trace-processor-architecture.md</code>: overall pipeline, ForwardingTraceParser, ChunkedTraceReader</li>
+  <li><code>src/trace_processor/trace_processor_storage_impl.cc</code>: <code>Parse</code>, <code>OnPushDataToSorter</code>, <code>OnEventsFullyExtracted</code></li>
+  <li><code>src/trace_processor/trace_processor_impl.cc</code>: plugin instantiation, <code>NotifyEndOfFile</code> stages, finalization and declared indexes, <code>CacheBoundsAndBuildTable</code>, <code>Flush</code></li>
+  <li><code>importers/proto/proto_trace_reader.cc</code>: stream creation, clock conversion, deferral to full sort</li>
+  <li><code>importers/proto/tracing_service_module.cc</code>: flush and read-buffer notifications</li>
+  <li><code>sorter/trace_sorter.h</code> and <code>trace_sorter.cc</code>: <code>TimestampedEvent</code>, <code>Queue</code>, <code>CreateStream</code>, merge-extract, window</li>
+  <li><code>util/bump_allocator.h</code>: 64 KB chunks, 42/16-bit <code>AllocId</code></li>
+  <li><code>importers/common/slice_tracker.h</code> and <code>slice_tracker.cc</code>: <code>kPendingDuration</code>, <code>kMaxDepth</code>, stacks, args lifetime</li>
+  <li><code>importers/common/process_tracker.h</code>, <code>track_tracker.h</code>: utid/upid, blueprints, <code>InternTrack</code></li>
+  <li><code>importers/common/args_tracker.h</code>, <code>args_tracker.cc</code>, <code>global_args_tracker.h</code>: <code>ArgsInserter</code>, buffer pool, dedup, <code>AddArgSet</code></li>
+  <li><code>tables/metadata_tables.py</code>, <code>tables/slice_tables.py</code>: <code>ARG_TABLE</code>, <code>SLICE_TABLE</code> declarations</li>
+  <li><code>python/generators/trace_processor_table/public.py</code> and <code>serialize.py</code>: flag enums, <code>_get_nullability_tag</code>, sort and duplicate tags, setters</li>
+  <li><code>tools/gen_tp_table_docs.py</code>: the only consumer of <code>HIDDEN</code></li>
+  <li><code>core/dataframe/types.h</code>, <code>core/common/null_types.h</code>, <code>sort_types.h</code>, <code>storage_types.h</code>: column anatomy</li>
+  <li><code>core/dataframe/dataframe.h</code> and <code>dataframe.cc</code>: <code>SetCellUncheckedInternal</code>, <code>Finalize</code>, <code>BuildIndex</code>, <code>PlanQuery</code></li>
+  <li><code>core/dataframe/logical_plan.h</code>, <code>logical_plan.cc</code>: strategies, <code>FilterPreference</code>, index selection</li>
+  <li><code>core/dataframe/adhoc_dataframe_builder.cc</code>: <code>GetSpecializedStorage</code>, the 16× rule</li>
+  <li><code>core/interpreter/bytecode_core.h</code>, <code>bytecode_instructions.h</code>, <code>bytecode_interpreter_impl.h</code>: instruction format, opcode list, <code>Uint32SetIdSortedEq</code></li>
+  <li><code>core/dataframe/dataframe_unittest.cc</code>: expected bytecode sequences</li>
+  <li><code>perfetto_sql/engine/dataframe_module.cc</code>: <code>BestIndex</code>, <code>Filter</code>, <code>Next</code>, <code>Column</code></li>
+  <li><code>perfetto_sql/engine/perfetto_sql_connection.cc</code>: <code>CREATE PERFETTO INDEX</code> restriction</li>
+  <li><code>perfetto_sql/engine/pipeline_module.h</code>, <code>pipeline/pipeline_sql.h</code>, <code>core/exec/dataframe_scan.h</code>, <code>selection.h</code>: pipe execution</li>
+  <li><code>docs/design-docs/perfetto-sql-pipelines.md</code>, <code>docs/analysis/perfetto-sql-syntax.md</code>: pipe operator notes, <code>CREATE PERFETTO INDEX</code></li>
+  <li><code>core/plugin/plugin.h</code>, <code>plugin.cc</code>, <code>plugins/storage_tables/storage_tables.cc</code>: plugin API, registration, topological sort, <code>GetTimestampBounds</code>/<code>GetBoundsMutationCount</code></li>
+  <li><code>stdlib/prelude/before_eof/trace_bounds.sql</code>, <code>after_eof/core.sql</code>: <code>_trace_bounds</code>, <code>trace_bounds</code> view, <code>trace_start()</code>/<code>trace_end()</code>/<code>trace_dur()</code></li>
+  <li><code>trace_processor_context.cc</code>: <code>DestroyParsingState</code>, what survives end of file</li>
+  <li><code>include/perfetto/trace_processor/trace_blob_view.h</code>: refcounted byte views</li>
+  <li><code>pipeline/operations/scan.cc</code>, <code>docs/analysis/perfetto-sql-pipe-getting-started.md</code>: direct dataframe sources vs SQL sources; pipe example</li>
+</ul>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>
