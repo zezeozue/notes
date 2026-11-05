@@ -1,0 +1,1441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>How Android decides which processes to kill, slow down or freeze</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="oom_score_adj · procState · sched groups · freezer · Perfetto">OomAdjuster Internals</span>
+  <span class="tb-spacer"></span>
+  <a class="tb-x" href="../native_memory_elf_malloc/index.html">ELF, linker64 &amp; malloc</a>
+  <a class="tb-x" href="../parcel_native_memory/index.html">Parcel &amp; Native Memory</a>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#glance">At a glance</a>
+  <div class="ph">I · What it decides</div>
+  <a href="#problem">1 · Four numbers per process</a>
+  <a href="#scales">2 · The scales</a>
+  <a href="#triggers">3 · When updates run</a>
+  <div class="ph">II · How scores are computed</div>
+  <a href="#pipeline">4 · Five ordered steps</a>
+  <a href="#method-names" style="padding-left:18px">reading the method names</a>
+  <a href="#propagation" style="padding-left:18px">scores flow along bindings</a>
+  <a href="#state-matrix">5 · Several copies of each score</a>
+  <a href="#name-decoder" style="padding-left:18px">name decoder</a>
+  <a href="#why-two-set" style="padding-left:18px">why setAdj and setRawAdj</a>
+  <a href="#why-max-cached" style="padding-left:18px">why max and cached</a>
+  <a href="#walkthrough" style="padding-left:18px">one host through three passes</a>
+  <a href="#stage-evolution" style="padding-left:18px">the copies in code</a>
+  <a href="#divergences">6 · Four cases where copies differ</a>
+  <a href="#div-bind-above" style="padding-left:18px">binding above the client</a>
+  <a href="#div-vis-ladder" style="padding-left:18px">visible ladder</a>
+  <a href="#div-exec-svc" style="padding-left:18px">service callbacks</a>
+  <a href="#div-skip" style="padding-left:18px">skipping updates</a>
+  <div class="ph">III · Applying the results</div>
+  <a href="#apply">7 · Sent only when changed</a>
+  <a href="#sched-vs-proc">8 · Its own CPU-group scale</a>
+  <a href="#sched-ordering" style="padding-left:18px">kernel IDs are not ranks</a>
+  <a href="#sched-top-bound" style="padding-left:18px">top app vs top-app bound</a>
+  <a href="#sched-outside">9 · Other CPU-group writers</a>
+  <div class="ph">IV · Process freezer</div>
+  <a href="#freezer-inside">10 · When a process is frozen</a>
+  <a href="#freezer-outside">11 · Thaws that bypass it</a>
+  <div class="ph">V · Observing &amp; reference</div>
+  <a href="#perfetto">12 · Seeing it in Perfetto</a>
+  <a href="#cheatsheet">13 · Cheat sheet</a>
+  <a href="#method">Numbers and method</a>
+  <a href="#sources">Sources</a>
+</nav>
+
+<main id="top">
+<h1>How Android decides which processes to kill, slow down or freeze</h1>
+<p class="lead">Android keeps the apps you have left in memory so that switching back is fast. Memory and CPU are limited, so
+something has to rank every process. In <code>system_server</code> that is <code>OomAdjuster</code>. After every activity change,
+binding or broadcast it re-ranks the affected processes and updates the low-memory killer, the kernel and the app.
+This note explains how it computes those ranks, how the results are applied, and how to read every transition in a Perfetto trace.</p>
+<p class="m">Checked against AOSP as of Android 17 (<code>frameworks/base</code>, <code>system/memory/lmkd</code>, <code>system/core/libprocessgroup</code>, <code>external/perfetto</code>).</p>
+
+<h2 id="glance">At a glance</h2>
+<ul>
+  <li><b>What it decides.</b> Four outputs per process: how soon it may be killed (<code>oom_score_adj</code>), what lifecycle role it is in (<code>procState</code>), how much CPU it gets (<code>schedGroup</code>), and which capabilities it holds, including whether it may be frozen.</li>
+  <li><b>How it decides.</b> A process is at least as important as the most important client bound to it, so importance flows along service bindings and content-provider connections.</li>
+  <li><b>Why kill-order scores move when nothing visible changes.</b> Each output is kept in raw, effective, committed and reported copies. Local adjustments for recency ladders and short service callbacks can move <code>oom_score_adj</code> without changing <code>procState</code> or CPU group.</li>
+  <li><b>It is not the only writer.</b> Zygote at fork, <code>SchedulingPolicyService</code> for media threads, and <code>CachedAppOptimizer</code>'s direct thaw paths change CPU groups and freeze state outside <code>OomAdjuster</code>.</li>
+  <li><b>How to observe it.</b> A Perfetto trace records every <code>oom_score_adj</code> write, the <code>updateOomAdj_*</code> slice that caused it, and every freeze and thaw interval with its unfreeze reason.</li>
+</ul>
+
+<p><b>Terms.</b></p>
+<ul>
+  <li><b>Client and host</b>: a process that binds to a service or queries a content provider is the <b>client</b>; the process providing that service or content provider is the <b>host</b>.</li>
+  <li><b>Cached process</b>: a live background app process with no visible UI or active components, kept in RAM so a later launch skips cold startup.</li>
+  <li><b>LRU list</b>: the least-recently-used list of running app processes kept by <code>ActivityManagerService</code> (AMS), ordered from least to most recently active.</li>
+  <li><b>Pass</b>: one execution of <code>OomAdjuster</code> (a full update across the LRU list or a partial update over a subgraph) that recomputes and commits process state.</li>
+  <li><b><code>adj</code> (<code>oom_score_adj</code>)</b>: the per-process kill-order score (<code>-1000</code> to <code>1000</code>), where higher scores are killed earlier by <code>lmkd</code> (the user-space low-memory killer daemon).</li>
+  <li><b>cgroup and cpuset</b>: Linux control groups that cap which CPU cores a task may run on (<code>cpuset</code>), its scheduler weight, and whether its threads are frozen.</li>
+  <li><b>Frozen process and thaw</b>: a process placed into the cgroup v2 freezer (<code>cgroup.freeze = 1</code>) so its threads receive no CPU time, and the unfreeze (<b>thaw</b>) that lets it run again.</li>
+</ul>
+
+<div class="part">Part I · What it decides</div>
+
+<h2 id="problem"><span class="n">1</span>OomAdjuster turns what each app is doing into four numbers</h2>
+<p>A phone runs far more processes than it has RAM to keep forever, so something must decide which processes to reclaim first.
+Android does not exit an app's process when you leave its screen: the process stays cached so returning to it skips cold startup.
+When free memory drops, killing the wrong process is immediately noticeable — background music stops, or the input method restarts.</p>
+<p>The process that sees every app's components is <code>system_server</code>, through <code>ActivityManagerService</code> (AMS) and its
+<code>com.android.server.am.psc</code> (<code>ProcessStateController</code>) package. AMS tracks which activity is on screen, which process runs a
+foreground service, which is receiving a broadcast, and which processes are connected through bindings or content providers.
+<code>OomAdjuster</code> turns that component graph into per-process numbers that daemons and the kernel enforce. Its name comes from
+the Linux out-of-memory (OOM) killer, whose <code>/proc/&lt;pid&gt;/oom_score_adj</code> knob it originally drove.</p>
+<p>Each managed process receives four outputs, whose scales are detailed in <a href="#scales">§2</a>:</p>
+<table>
+  <thead><tr><th>Output</th><th>What it is</th><th>Who acts on it</th></tr></thead>
+  <tbody>
+    <tr><td style="white-space:nowrap"><code>oom_score_adj</code></td><td>An integer from <code>-1000</code> to <code>1000</code>, where higher means killed earlier. Called <b>adj</b> in AMS code.</td><td><code>lmkd</code>, the user-space low-memory killer daemon, which receives it over a control socket, writes <code>/proc/&lt;pid&gt;/oom_score_adj</code>, and kills from the highest score down under memory pressure. The kernel OOM killer reads the same file as a last resort.</td></tr>
+    <tr><td style="white-space:nowrap"><code>procState</code></td><td>One of the <code>ActivityManager.PROCESS_STATE_*</code> lifecycle states (<code>0</code> to <code>20</code>), where lower is more important.</td><td>The app itself (via <code>IApplicationThread.setProcessState</code>), per-UID state published to system services (<code>UidRecord</code>), and the capability rules below.</td></tr>
+    <tr><td style="white-space:nowrap"><code>schedGroup</code></td><td>A CPU scheduling class: background, restricted, default, top app, top-app bound, or foreground window.</td><td>The kernel, through cgroups and task profiles applied by <code>Process.setProcessGroup</code>, plus UI and <code>RenderThread</code> priority boosts for the top app.</td></tr>
+    <tr><td style="white-space:nowrap"><code>capability</code></td><td>A bitmask of <code>ActivityManager.PROCESS_CAPABILITY_*</code> flags: foreground location, camera, microphone, network access, background foreground-service launch (<code>BFSL</code>), and CPU time.</td><td>Permission and network policy checks, plus the cached-app freezer, which checks the two CPU-time bits to decide whether a process may be frozen.</td></tr>
+  </tbody>
+</table>
+<p>Importance is not a property of one process in isolation. When the top app binds to a service in another process or queries a content provider,
+the host process must stay alive and scheduled too, or the top app stalls waiting on Binder. <code>OomAdjuster</code> therefore computes all four
+outputs over a directed graph of processes, with an edge from each client to each host, including graphs with cycles.</p>
+<figure>
+<figcaption><b>Figure 1. A process inherits importance from the clients connected to it.</b> The service host is protected only because
+the top app binds it. An ordinary service binding caps the host at the visible band (<code>100</code>), whereas a content-provider connection can pass on the client's foreground score.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 160" role="img" aria-label="Top app binds a service host, which uses a provider host; an unbound cached app is ranked last">
+  <text x="10" y="18" class="th">importance flows from client to host</text>
+  <rect x="10" y="40" width="180" height="62" rx="3" class="bg"/>
+  <text x="22" y="64" class="tb">Top app</text>
+  <text x="22" y="84" class="ts">on screen · adj 0</text>
+  <line x1="192" y1="71" x2="246" y2="71" class="ln" marker-end="url(#ah)"/>
+  <text x="196" y="62" class="ts">binds</text>
+  <rect x="248" y="40" width="200" height="62" rx="3" class="ba"/>
+  <text x="260" y="64" class="tb">Service host</text>
+  <text x="260" y="84" class="ts">no screen of its own · adj 100</text>
+  <line x1="450" y1="71" x2="504" y2="71" class="ln" marker-end="url(#ah)"/>
+  <text x="454" y="62" class="ts">uses</text>
+  <rect x="506" y="40" width="190" height="62" rx="3" class="ba"/>
+  <text x="518" y="64" class="tb">Provider host</text>
+  <text x="518" y="84" class="ts">inherits client's · adj 100</text>
+  <rect x="720" y="40" width="130" height="62" rx="3" class="br"/>
+  <text x="732" y="64" class="tb">Cached app</text>
+  <text x="732" y="84" class="ts">nothing bound · 900+</text>
+  <text x="10" y="132" class="ts">A plain service binding floors the host at 100. A provider connection passes on the client's score (floored at 0).</text>
+  <text x="10" y="150" class="ts">The cached app has no client, so it keeps its own score and is reclaimed first.</text>
+</svg>
+</figure>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+When a process stays unexpectedly protected or gets killed or frozen, look at the connection graph: who was bound to it, with which
+<code>BIND_*</code> flags, and what those clients' own scores were at that moment.
+</blockquote>
+
+<h2 id="scales"><span class="n">2</span>Each output has its own scale</h2>
+<p>On the kill-order and lifecycle scales, a lower number means more protected. The <code>adj</code> constants live in
+<code>psc/Constants.java</code> and are re-exported on <code>ProcessList</code>. The constants define bands rather than unique ranks:
+many processes share a band, and several bands spread members across a numeric range so <code>lmkd</code> reclaims older processes before newer ones.</p>
+<table>
+  <thead><tr><th>adj</th><th>Constant</th><th>Typical holder</th></tr></thead>
+  <tbody>
+    <tr><td>-1000</td><td><code>NATIVE_ADJ</code></td><td>Native daemons not managed by AMS</td></tr>
+    <tr><td>-900</td><td><code>SYSTEM_ADJ</code></td><td><code>system_server</code></td></tr>
+    <tr><td>-800</td><td><code>PERSISTENT_PROC_ADJ</code></td><td>Persistent system apps such as telephony</td></tr>
+    <tr><td>-700</td><td><code>PERSISTENT_SERVICE_ADJ</code></td><td>Processes bound by the system or a persistent process and marked important, or system-started isolated processes</td></tr>
+    <tr><td>0</td><td><code>FOREGROUND_APP_ADJ</code></td><td>The top activity, or a process receiving a broadcast, running a service lifecycle callback, or under instrumentation</td></tr>
+    <tr><td>50</td><td><code>PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ</code></td><td>Was top a moment ago and transitioned into a foreground service (grace window)</td></tr>
+    <tr><td style="white-space:nowrap">100–199</td><td><code>VISIBLE_APP_ADJ</code> … <code>VISIBLE_APP_MAX_ADJ</code></td><td>Visible activities and hosts bound to them. Spread in LRU order across <code>100–199</code> when both <code>oomadjuster_vis_laddering</code> and <code>remove_lru_spam_prevention</code> are enabled; otherwise visible activities add window <code>taskLayer</code> (up to <code>+99</code>) in step 1 while headless bound hosts share <code>100</code>.</td></tr>
+    <tr><td>200</td><td><code>PERCEPTIBLE_APP_ADJ</code></td><td>Perceptible background work such as audio playback or a foreground service</td></tr>
+    <tr><td style="white-space:nowrap">225 / 250</td><td><code>PERCEPTIBLE_MEDIUM_APP_ADJ</code> / <code>PERCEPTIBLE_LOW_APP_ADJ</code></td><td>Hosts bound with perceptible or almost-perceptible flags</td></tr>
+    <tr><td style="white-space:nowrap">300 / 400</td><td><code>BACKUP_APP_ADJ</code> / <code>HEAVY_WEIGHT_APP_ADJ</code></td><td>Running a backup / heavy-weight background app</td></tr>
+    <tr><td style="white-space:nowrap">500 / 600</td><td><code>SERVICE_ADJ</code> / <code>HOME_APP_ADJ</code></td><td>Started background services (A-list) / the home launcher</td></tr>
+    <tr><td style="white-space:nowrap">700–799</td><td><code>PREVIOUS_APP_ADJ</code> … <code>PREVIOUS_APP_MAX_ADJ</code></td><td>The user's previous app (and recently disconnected content providers), spread across the range when <code>oomadjuster_prev_laddering</code> is enabled</td></tr>
+    <tr><td>800</td><td><code>SERVICE_B_ADJ</code></td><td>Older started services demoted from the <code>500</code> band</td></tr>
+    <tr><td style="white-space:nowrap">900–999</td><td><code>CACHED_APP_MIN_ADJ</code> … <code>CACHED_APP_MAX_ADJ</code></td><td>Cached and empty processes. <code>lmkd</code> kills these first (<code>950</code> is <code>CACHED_APP_LMK_FIRST_ADJ</code>).</td></tr>
+    <tr><td>1001</td><td><code>UNKNOWN_ADJ</code></td><td>In-pass placeholder meaning "cached, slot not assigned yet". Never sent to <code>lmkd</code>.</td></tr>
+  </tbody>
+</table>
+<figure>
+<figcaption><b>Figure 2. Cached apps sit at the high end of the scale, so <code>lmkd</code> kills them first.</b> Grey bands hold fixed system
+processes, green and blue hold work the user can see or perceive, amber holds recent background state, and red holds cached processes.
+Ladders spread processes inside the visible, previous and cached ranges by recency.</figcaption>
+<svg viewBox="0 0 1000 140" role="img" aria-label="The oom_score_adj bands from most protected to killed first">
+  <text x="10" y="18" class="th">oom_score_adj bands · most protected on the left, killed first on the right (not to scale)</text>
+  <rect x="10"  y="32" width="75"  height="52" rx="2" class="b2"/><text x="18"  y="52" class="tm">-1000</text><text x="18"  y="70" class="ts">native</text>
+  <rect x="85"  y="32" width="75"  height="52" rx="2" class="b2"/><text x="93"  y="52" class="tm">-900</text><text x="93"  y="70" class="ts">system</text>
+  <rect x="160" y="32" width="75"  height="52" rx="2" class="b2"/><text x="168" y="52" class="tm">-800</text><text x="168" y="70" class="ts">persistent</text>
+  <rect x="235" y="32" width="75"  height="52" rx="2" class="b2"/><text x="243" y="52" class="tm">-700</text><text x="243" y="70" class="ts">persist. svc</text>
+  <rect x="310" y="32" width="75"  height="52" rx="2" class="bg"/><text x="318" y="52" class="tm">0</text><text x="318" y="70" class="ts">foreground</text>
+  <rect x="385" y="32" width="75"  height="52" rx="2" class="bg"/><text x="393" y="52" class="tm">50</text><text x="393" y="70" class="ts">recent FG</text>
+  <rect x="460" y="32" width="95"  height="52" rx="2" class="ba"/><text x="468" y="52" class="tm">100–199</text><text x="468" y="70" class="ts">visible</text>
+  <rect x="555" y="32" width="85"  height="52" rx="2" class="ba"/><text x="563" y="52" class="tm">200–250</text><text x="563" y="70" class="ts">perceptible</text>
+  <rect x="640" y="32" width="95"  height="52" rx="2" class="b"/><text x="648" y="52" class="tm">300–600</text><text x="648" y="70" class="ts">backup…home</text>
+  <rect x="735" y="32" width="85"  height="52" rx="2" class="bw"/><text x="743" y="52" class="tm">700–799</text><text x="743" y="70" class="ts">previous</text>
+  <rect x="820" y="32" width="65"  height="52" rx="2" class="bw"/><text x="828" y="52" class="tm">800</text><text x="828" y="70" class="ts">service B</text>
+  <rect x="885" y="32" width="105" height="52" rx="2" class="br"/><text x="893" y="52" class="tm">900–999</text><text x="893" y="70" class="ts">cached</text>
+  <text x="10" y="112" class="ts">Never killed by lmkd in practice</text>
+  <path d="M560,108 L985,108" class="lnr" marker-end="url(#ahr)"/>
+  <text x="560" y="128" class="ts">lmkd picks victims from the high end first, so cached processes go first</text>
+</svg>
+</figure>
+<p>The lifecycle state, <code>procState</code>, is coarser and describes what role the process plays. Policy code throughout the framework
+queries <code>procState</code> ("is this UID running a foreground service?"), whereas <code>adj</code> orders memory reclamation. Its values
+are defined in <code>ProcessStateEnum.aidl</code> and <code>ActivityManager.java</code>:</p>
+<table>
+  <thead><tr><th>procState</th><th>Names</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>0–1</td><td><code>PERSISTENT</code>, <code>PERSISTENT_UI</code></td><td>Persistent system processes</td></tr>
+    <tr><td>2–3</td><td><code>TOP</code>, <code>BOUND_TOP</code></td><td>The top activity, and processes bound by the top app</td></tr>
+    <tr><td>4–5</td><td><code>FOREGROUND_SERVICE</code>, <code>BOUND_FOREGROUND_SERVICE</code></td><td>Running, or bound by, a foreground service</td></tr>
+    <tr><td>6–8</td><td><code>IMPORTANT_FOREGROUND</code>, <code>IMPORTANT_BACKGROUND</code>, <code>TRANSIENT_BACKGROUND</code></td><td>Important to the user, but not on screen</td></tr>
+    <tr><td>9–14</td><td><code>BACKUP</code>, <code>SERVICE</code>, <code>RECEIVER</code>, <code>TOP_SLEEPING</code>, <code>HEAVY_WEIGHT</code>, <code>HOME</code></td><td>Background work of a specific kind</td></tr>
+    <tr><td>15–19</td><td><code>LAST_ACTIVITY</code>, <code>CACHED_ACTIVITY</code>, <code>CACHED_ACTIVITY_CLIENT</code>, <code>CACHED_RECENT</code>, <code>CACHED_EMPTY</code></td><td>Cached</td></tr>
+    <tr><td>20</td><td><code>NONEXISTENT</code></td><td>No running process</td></tr>
+  </tbody>
+</table>
+<p>The CPU group runs in the opposite direction: larger numbers grant more CPU, starting at background and rising to top app and top-app bound.
+It uses <code>OomAdjuster</code>'s own <code>SCHED_GROUP_*</code> constants rather than kernel thread-group IDs; <a href="#sched-vs-proc">§8</a>
+explains how the two scales map.</p>
+<p>Capability bits are defined on <code>ActivityManager</code>. Two bits govern the freezer: <code>PROCESS_CAPABILITY_CPU_TIME</code> means
+the process has an explicit reason to execute and must not be frozen, while <code>PROCESS_CAPABILITY_IMPLICIT_CPU_TIME</code> keeps a process
+unfrozen because its <code>adj</code> sits below the freezer cutoff. A third bit, <code>PROCESS_CAPABILITY_BFSL</code>, permits starting a
+foreground service from the background.</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Read <code>adj</code> for "who dies first" and <code>procState</code> for "what the framework thinks the process is doing". A process in the
+visible <code>adj</code> band with <code>procState</code> <code>BOUND_FOREGROUND_SERVICE</code> is protected because of a binding, not because it owns a visible window.
+</blockquote>
+
+<h2 id="triggers"><span class="n">3</span>Updates run on specific events and touch only what can change</h2>
+<p>Recomputing every running process is expensive, so AMS triggers an update only at component transitions and scopes each pass to the
+processes whose scores can move. Every pass runs in <code>system_server</code> under the AMS lock, and an app switch fires many transitions
+in quick succession. Running too broadly wastes CPU under lock; running too rarely leaves stale scores in <code>lmkd</code>.</p>
+<p>Callers enter through <code>ProcessStateController</code>, or through <code>ActivityManagerService.updateOomAdjLocked</code>, which delegates
+to the same <code>OomAdjuster</code> instance. Every call passes an <code>OOM_ADJ_REASON_*</code> code from <code>ActivityManagerInternal.java</code>
+identifying the trigger — such as an activity visibility change, broadcast delivery, service bind, content-provider acquisition, process death, or a
+timed follow-up (<a href="#method">Numbers and method</a>).</p>
+<ul>
+  <li><b>Full update</b> (<code>runFullUpdate</code> → <code>fullUpdateLSP</code>): recomputes every process on the AMS LRU list.</li>
+  <li><b>Partial update</b> (<code>runUpdate(proc)</code>, or <code>enqueueUpdateTarget</code> followed by <code>runPendingUpdate</code> → <code>partialUpdateLSP</code>): recomputes only the target processes and every host reachable from them along outgoing service and provider connections. Unreached clients keep their committed values and act as fixed inputs.</li>
+  <li><b>Follow-up update</b> (<code>OOM_ADJ_REASON_FOLLOW_UP</code>): scheduled on <code>mUpdateHandler</code> via <code>maybeSetProcessFollowUpUpdateLocked</code> when a timed state expires — such as the content-provider retention window, the top-to-foreground-service grace period, or the previous-app timeout.</li>
+</ul>
+<figure>
+<figcaption><b>Figure 3. A partial update recomputes only the targets and the hosts reachable from them.</b> Edges point from client to
+host. An unreached client that also binds into the reached set is not recomputed; its existing score acts as a fixed input.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 230" role="img" aria-label="Partial update: the target and its reachable hosts are recomputed, other processes are fixed inputs">
+  <text x="10" y="18" class="th">one partial update</text>
+  <rect x="10" y="40" width="170" height="60" rx="3" class="bw"/>
+  <text x="22" y="64" class="tb">Target</text>
+  <text x="22" y="84" class="ts">its state just changed</text>
+  <line x1="182" y1="70" x2="226" y2="70" class="ln" marker-end="url(#ah)"/>
+  <rect x="228" y="40" width="170" height="60" rx="3" class="ba"/>
+  <text x="240" y="64" class="tb">Host A</text>
+  <text x="240" y="84" class="ts">reachable: recomputed</text>
+  <line x1="400" y1="70" x2="444" y2="70" class="ln" marker-end="url(#ah)"/>
+  <rect x="446" y="40" width="170" height="60" rx="3" class="ba"/>
+  <text x="458" y="64" class="tb">Host B</text>
+  <text x="458" y="84" class="ts">reachable: recomputed</text>
+  <rect x="228" y="140" width="170" height="60" rx="3" fill="url(#hatch)" class="hatch-l"/>
+  <text x="240" y="164" class="tb">Client C</text>
+  <text x="240" y="184" class="ts">not reachable: fixed input</text>
+  <line x1="313" y1="138" x2="313" y2="102" class="ln" marker-end="url(#ah)"/>
+  <rect x="660" y="40" width="190" height="60" rx="3" fill="url(#hatch)" class="hatch-l"/>
+  <text x="672" y="64" class="tb">Other processes</text>
+  <text x="672" y="84" class="ts">not touched</text>
+  <text x="446" y="164" class="ts">A full update recomputes every process</text>
+  <text x="446" y="182" class="ts">on the LRU list instead.</text>
+  <text x="10" y="222" class="ts">Blue and amber boxes are recomputed in this pass. Hatched boxes keep the values from the last pass.</text>
+</svg>
+</figure>
+<p>An update requested re-entrantly while a pass is already running does not nest. Instead, <code>OomAdjuster</code> marks
+<code>mPendingFullOomAdjUpdate</code> or adds targets to <code>mPendingProcessSet</code> and drains them when the active pass finishes.
+Batch sessions on <code>ProcessStateController</code> similarly coalesce multiple component edits into a single pass at session close, and
+single connection changes run a fast pre-check before starting a pass at all (<a href="#div-skip">§6, Case 4</a>).</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Each pass emits an atrace slice named <code>updateOomAdj_&lt;reason&gt;</code> on a <code>system_server</code> thread
+(from <code>oomAdjReasonToString</code>). The suffix tells you which AMS event triggered a score transition (<a href="#perfetto">§12</a>).
+</blockquote>
+
+<div class="part">Part II · How scores are computed</div>
+
+<h2 id="pipeline"><span class="n">4</span>Each update runs in five ordered steps</h2>
+<p>A single linear scan over running processes cannot score them accurately, so each pass divides the work into five ordered steps.
+Two dependencies force that structure: a host's score depends on clients that may sit anywhere in the graph (including cycles), and recency
+ladders depend on each process's final band across the whole LRU list. Applying LRU offsets during graph propagation would compound the offset
+at every hop along a binding chain.</p>
+<p><code>OomAdjusterImpl</code> orchestrates the pass across every process in <code>fullUpdateLSP</code>, or across the target subgraph in
+<code>partialUpdateLSP</code>. The <code>LSP</code> suffix indicates that the caller holds both <code>mServiceLock</code> and <code>mProcLock</code>.</p>
+
+<figure>
+<figcaption><b>Figure 4. Scores are derived from components and bindings first, laddered by recency, and then committed.</b> Blue steps
+compute intrinsic and propagated scores. The white step runs shadow graph controllers when their flags are enabled. Amber assigns LRU ladder
+positions and cached slots. Green writes changes out to <code>lmkd</code>, cgroups, the freezer and the app.</figcaption>
+<svg viewBox="0 0 1000 350" role="img" aria-label="Five steps of an OomAdjuster update pass">
+  <text x="10" y="18" class="th">per process and along bindings · each write sets curRaw* and then cur*</text>
+
+  <rect x="10" y="30" width="305" height="122" rx="2" class="ba"/>
+  <text x="22" y="50" class="tb ta">1 · Intrinsic state</text>
+  <text x="22" y="68" class="tm">computeOomAdjLSP(app, topApp, …)</text>
+  <text x="22" y="88" class="ts">Own components only: top activity, receiver,</text>
+  <text x="22" y="103" class="ts">service callback, FGS, visible activities.</text>
+  <text x="22" y="122" class="tms">Writes curRaw*, then cur* via</text>
+  <text x="22" y="137" class="tms">setIntermediate*LSP(); queues app</text>
+
+  <path d="M315,91 L345,91" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="347" y="30" width="305" height="122" rx="2" class="ba"/>
+  <text x="359" y="50" class="tb ta">2 · Propagate along bindings</text>
+  <text x="359" y="68" class="tm">computeConnectionsLSP()</text>
+  <text x="359" y="88" class="ts">Pass 1 pops by curProcState, pass 2 by</text>
+  <text x="359" y="103" class="ts">curRawAdj. Hosts read client.getCurRaw*().</text>
+  <text x="359" y="122" class="tms">Improved host: curRaw* and cur*</text>
+  <text x="359" y="137" class="tms">updated, host queued again</text>
+
+  <path d="M652,91 L682,91" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="684" y="30" width="306" height="122" rx="2" class="b"/>
+  <text x="696" y="50" class="tb">3 · Shadow graph controllers</text>
+  <text x="696" y="68" class="tm">ProcState / CapabilityController</text>
+  <text x="696" y="88" class="ts">Optional ProcessNode / GraphEdge passes</text>
+  <text x="696" y="103" class="ts">behind rollout flags; compute in shadow</text>
+  <text x="696" y="122" class="tms">without replacing the live</text>
+  <text x="696" y="137" class="tms">step 1–2 outputs</text>
+
+  <text x="10" y="176" class="th">whole lru list, then commit</text>
+  <path d="M837,152 L837,190 L250,190 L250,212" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="10" y="214" width="480" height="122" rx="2" class="bw"/>
+  <text x="22" y="234" class="tb tw">4 · LRU post-pass</text>
+  <text x="22" y="252" class="tm">applyLruAdjust(lruList)</text>
+  <text x="22" y="272" class="ts">Ladders the visible (100–199) and previous (700–799) bands in</text>
+  <text x="22" y="287" class="ts">LRU order by writing curAdj only. Gives each process still at</text>
+  <text x="22" y="302" class="ts">UNKNOWN_ADJ a cached slot in 900–999, written to curRawAdj</text>
+  <text x="22" y="317" class="ts">and curAdj.</text>
+
+  <path d="M490,275 L508,275" class="lng" marker-end="url(#ahg)"/>
+
+  <rect x="510" y="214" width="480" height="122" rx="2" class="bg"/>
+  <text x="522" y="234" class="tb tg">5 · Apply and commit</text>
+  <text x="522" y="252" class="tm">updateAndTrimProcessLSP → applyResultsLSP</text>
+  <text x="522" y="272" class="ts">Compares cur* with set* and rep*: lmkd score, cgroup, thread</text>
+  <text x="522" y="287" class="ts">priority, freezer, procState for the app. Copies cur* into</text>
+  <text x="522" y="302" class="ts">set*. Kills cached and empty processes beyond the configured</text>
+  <text x="522" y="317" class="ts">limits.</text>
+</svg>
+</figure>
+
+<p>Step by step, as <code>fullUpdateLSP</code> and <code>partialUpdateLSP</code> run them:</p>
+<ol>
+  <li><b>Intrinsic state.</b> Step 1 clears per-pass activity memos (<code>resetCachedInfo()</code>) and scores each process from its own components alone (<code>computeOomAdjLSP</code>). A process with nothing active receives <code>UNKNOWN_ADJ</code> and <code>PROCESS_STATE_CACHED_EMPTY</code> as placeholders, stores its raw and intermediate values (<a href="#state-matrix">§5</a>), and enters the propagation queues.</li>
+  <li><b>Propagation.</b> <code>computeConnectionsLSP</code> drains two priority queues so client scores propagate along service and provider bindings.</li>
+  <li><b>Shadow graph controllers.</b> Behind <code>enable_procstate_controller_computation</code> and <code>enable_capability_controller_computation</code>, <code>ProcStateController</code> and <code>CapabilityController</code> evaluate explicit <code>ProcessNode</code> and <code>GraphEdge</code> objects (via <code>partialUpdateProcessGraphLSP</code> on partial passes). In Android 17 both run computation-only without overwriting the live outputs from steps 1 and 2.</li>
+  <li><b>LRU post-pass.</b> <code>applyLruAdjust</code> walks the LRU list from most to least recent (skipped on a partial update when no reached process requires laddering or a cached slot). Processes in the visible and previous bands receive consecutive scores, and processes still at <code>UNKNOWN_ADJ</code> receive cached or empty slots across <code>900–999</code>.</li>
+  <li><b>Apply and trim.</b> <code>postUpdateOomAdjInnerLSP</code> calls <code>updateAndTrimProcessLSP</code>, which invokes <code>applyResultsLSP</code> per process (Part III) and trims cached and empty processes when their counts exceed configured limits.</li>
+</ol>
+
+<h3 id="method-names">Reading the method names</h3>
+<p>Method names in <code>OomAdjuster</code> reflect lock discipline or historical structure rather than pipeline stage. Three naming conventions explain almost all of them:</p>
+<ul>
+  <li><b>Suffixes name locks, not stages.</b> <code>…Locked</code> requires <code>mServiceLock</code>, and <code>…LSP</code> requires both <code>mServiceLock</code> and <code>mProcLock</code>, matching <code>@GuardedBy({"mServiceLock", "mProcLock"})</code>.</li>
+  <li><b>"Compute" means intrinsic or single-edge scoring.</b> <code>computeOomAdjLSP</code> scores only a process's own components in step 1; the score is not final until propagation and <code>applyLruAdjust</code> finish.</li>
+  <li><b>"Apply" is used for both step 4 and step 5.</b> <code>applyLruAdjust</code> mutates in-flight scores in step 4, whereas <code>applyOomAdjLSP</code> and <code>applyResultsLSP</code> publish committed changes in step 5.</li>
+</ul>
+<table>
+  <thead><tr><th>Step</th><th>Method</th><th>What it does, in plain words</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>computeOomAdjLSP</code></td><td>Scores a process from its own components, before inspecting any clients bound to it.</td></tr>
+    <tr><td>1, 2</td><td><code>setIntermediateAdjLSP</code></td><td>Writes a new raw score and derives <code>curAdj</code> by applying local per-process adjustments.</td></tr>
+    <tr><td>2</td><td><code>computeConnectionsLSP</code></td><td>Propagates scores from clients to hosts across service and provider connections.</td></tr>
+    <tr><td>3</td><td><code>partialUpdateProcessGraphLSP</code></td><td>Runs the flag-guarded shadow graph controllers for <code>procState</code> and capabilities.</td></tr>
+    <tr><td>4</td><td><code>applyLruAdjust</code></td><td>Spreads processes within visible, previous and cached bands by LRU recency.</td></tr>
+    <tr><td>5</td><td><code>applyResultsLSP</code>, <code>applyOomAdjLSP</code></td><td>Diffs in-flight values against committed values and sends only what changed.</td></tr>
+  </tbody>
+</table>
+
+<h3 id="propagation">Scores flow from clients to hosts, most important first</h3>
+<p>Step 2 always pops the most important pending process next, allowing a host's propagated score to settle without redundant relaxation.
+Outgoing edges come from <code>forEachConnectionLSP</code>: active <code>bindService</code> connections, SDK-sandbox bindings, and content-provider
+connections into other processes. For each edge, <code>computeServiceHostOomAdjLSP</code> or <code>computeProviderHostOomAdjLSP</code> evaluates
+the host from the client's <b>raw</b> fields, <code>getCurRawAdj()</code> and <code>getCurRawProcState()</code>.</p>
+<p>The two priority queues are bucketed linked lists: <code>mProcessRecordProcStateNodes</code> indexed by <code>curProcState</code>, and
+<code>mProcessRecordAdjNodes</code> indexed by <code>curRawAdj</code>. Popping the best bucket first mirrors Dijkstra's order — once a process is
+popped, no worse-scored node remaining in the queue can improve it further.</p>
+<ul>
+  <li><b>Pass 1</b> pops every queued process in <code>curProcState</code> order and evaluates all of its outgoing connections. Any host whose <code>curProcState</code> or <code>curRawAdj</code> improves is re-queued.</li>
+  <li><b>Pass 2</b> pops, in <code>curRawAdj</code> order, only processes whose raw <code>adj</code> improved during pass 1 and re-evaluates their outgoing edges until no host improves.</li>
+</ul>
+<figure>
+<figcaption><b>Figure 5. Two bucketed priority-queue sweeps propagate importance across bindings.</b> Pass 1 settles <code>procState</code>
+first because a host's <code>procState</code> can unlock CPU-group and capability rules on downstream edges.</figcaption>
+<svg viewBox="0 0 1000 150" role="img" aria-label="The two priority-queue passes of computeConnectionsLSP">
+  <text x="10" y="18" class="th">computeConnectionsLSP · two passes, each always popping the most important pending process</text>
+  <rect x="10" y="32" width="430" height="100" rx="2" class="ba"/>
+  <text x="22" y="52" class="tb ta">Pass 1 · by procState</text>
+  <text x="22" y="70" class="tm">mProcessRecordProcStateNodes</text>
+  <text x="22" y="90" class="ts">Pops every process, lowest curProcState first, and evaluates all</text>
+  <text x="22" y="105" class="ts">its outgoing edges. A host that improves is queued again.</text>
+  <text x="22" y="122" class="tms">records which processes' raw adj changed</text>
+  <path d="M440,82 L548,82" class="lna" marker-end="url(#aha)"/>
+  <text x="452" y="74" class="tms">then</text>
+  <rect x="550" y="32" width="440" height="100" rx="2" class="ba"/>
+  <text x="562" y="52" class="tb ta">Pass 2 · by raw adj</text>
+  <text x="562" y="70" class="tm">mProcessRecordAdjNodes</text>
+  <text x="562" y="90" class="ts">Pops only the processes whose raw adj changed in pass 1, lowest</text>
+  <text x="562" y="105" class="ts">curRawAdj first, and evaluates their edges again.</text>
+  <text x="562" y="122" class="tms">improved host → queued again until nothing improves</text>
+</svg>
+</figure>
+<p>Binding cycles terminate cleanly because a host re-enters a queue only when one of its values strictly improves, and every scale has a fixed
+ceiling of importance. A cycle can never lift any member above the best external score entering the cycle.</p>
+<p>How much importance a service host inherits depends on the flags passed to <code>bindService</code> in <code>computeServiceHostOomAdjLSP</code>:</p>
+<table>
+  <thead><tr><th>Binding</th><th>Effect on the host</th></tr></thead>
+  <tbody>
+    <tr><td>Plain binding</td><td><code>adj</code> becomes <code>max(clientAdj, VISIBLE_APP_ADJ)</code>: an ordinary binding never lifts a host better than <code>100</code>, even from the top app. A <code>TOP</code> client grants <code>BOUND_TOP</code>, and a persistent client grants <code>IMPORTANT_FOREGROUND</code> or a foreground-service state. If the client's CPU group is higher, the host rises to <code>SCHED_GROUP_DEFAULT</code>.</td></tr>
+    <tr><td><code>BIND_ABOVE_CLIENT</code> or <code>BIND_IMPORTANT</code></td><td><code>adj</code> may equal the client's raw score. A persistent or system client lifts the host to <code>PERSISTENT_SERVICE_ADJ</code> (<code>-700</code>). <code>BIND_IMPORTANT</code> also passes on the client's <code>schedGroup</code> unchanged.</td></tr>
+    <tr><td><code>BIND_NOT_VISIBLE</code>, <code>BIND_NOT_PERCEPTIBLE</code>, <code>BIND_ALMOST_PERCEPTIBLE</code></td><td>Floors the host's <code>adj</code> at <code>200</code>, <code>250</code>, or <code>201</code> / <code>227</code> (used for user-initiated and expedited jobs).</td></tr>
+    <tr><td><code>BIND_NOT_FOREGROUND</code></td><td>Suppresses the CPU-group boost and caps propagated <code>procState</code> at <code>TRANSIENT_BACKGROUND</code> or worse.</td></tr>
+    <tr><td><code>BIND_WAIVE_PRIORITY</code></td><td>Skips <code>adj</code> and <code>procState</code> propagation altogether, forwarding only eligible capabilities.</td></tr>
+    <tr><td><code>BIND_SCHEDULE_LIKE_TOP_APP</code> (system client)</td><td>Grants the host <code>SCHED_GROUP_TOP_APP</code>.</td></tr>
+  </tbody>
+</table>
+<p>Content-provider connections are simpler: <code>computeProviderHostOomAdjLSP</code> gives the host <code>max(clientAdj, FOREGROUND_APP_ADJ)</code>,
+so a foreground client lifts the provider host all the way to <code>0</code>. A <code>TOP</code> client grants <code>BOUND_TOP</code>, and other clients at or
+above <code>FOREGROUND_SERVICE</code> grant <code>BOUND_FOREGROUND_SERVICE</code>.</p>
+<p>Once the last client disconnects from a content provider, how quickly the host drops back to its own score depends on how the provider was acquired (Figure 6).
+A standard <code>ContentProviderConnection</code> (<code>getContentProvider</code>) stamps <code>lastProviderTime</code> on release; step 1 then holds
+the host at <code>PREVIOUS_APP_ADJ</code> (<code>adjType = "recent-provider"</code>) for <code>mContentProviderRetainTime</code> and schedules a follow-up update.
+An external provider handle (<code>getContentProviderExternal</code>, tracked via <code>hasExternalProcessHandles</code>) lifts the host to
+<code>FOREGROUND_APP_ADJ</code> (<code>adjType = "ext-provider"</code>) while open, but records no retention timestamp when closed.</p>
+<figure>
+<figcaption><b>Figure 6. Normal provider clients keep the host at <code>PREVIOUS_APP_ADJ</code> (<code>700</code>) for 20 seconds after disconnect, whereas external handles release immediately.</b>
+During the retention window the host appears in <code>dumpsys activity oom</code> with <code>adjType = "recent-provider"</code>.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 160" role="img" aria-label="Timeline: normal provider client holds host at adj 700 for 20 s after disconnect; external handle drops at once">
+  <text x="10" y="18" class="th">provider host score after the last client disconnects</text>
+  <text x="10" y="50" class="tb">Normal client</text>
+  <text x="10" y="66" class="ts">getContentProvider</text>
+  <rect x="200" y="36" width="69" height="34" rx="2" class="bg"/>
+  <text x="208" y="57" class="ts">query</text>
+  <rect x="269" y="36" width="457" height="34" rx="2" class="ba"/>
+  <text x="279" y="57" class="ts">held at adj 700 for 20 s (recent-provider)</text>
+  <rect x="726" y="36" width="114" height="34" rx="2" fill="url(#hatch)" class="hatch-l"/>
+  <text x="734" y="57" class="ts">own score again</text>
+  <text x="10" y="100" class="tb">External handle</text>
+  <text x="10" y="116" class="ts">getContentProviderExternal</text>
+  <rect x="200" y="86" width="69" height="34" rx="2" class="bg"/>
+  <text x="208" y="107" class="ts">query</text>
+  <rect x="269" y="86" width="571" height="34" rx="2" fill="url(#hatch)" class="hatch-l"/>
+  <text x="279" y="107" class="ts">own score again at once: no hold</text>
+  <line x1="200" y1="132" x2="840" y2="132" class="ln"/>
+  <line x1="269" y1="128" x2="269" y2="136" class="ln"/><text x="262" y="150" class="ts">0 s</text>
+  <line x1="497" y1="128" x2="497" y2="136" class="ln"/><text x="487" y="150" class="ts">10 s</text>
+  <line x1="726" y1="128" x2="726" y2="136" class="ln"/><text x="716" y="150" class="ts">20 s</text>
+  <text x="760" y="150" class="ts">after disconnect</text>
+</svg>
+</figure>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+To inspect why a live process holds a given score, run <code>adb shell dumpsys activity oom</code>. Each entry prints <code>adjType</code>
+(the rule that won, such as <code>top-activity</code>, <code>service</code> or <code>provider</code>) and, for propagated scores, the exact
+<code>adjTarget</code> component and <code>adjSource</code> client process.
+</blockquote>
+
+<h2 id="state-matrix"><span class="n">5</span>Each score is kept in several copies, one per stage</h2>
+<p>Different steps of the pipeline need different views of the same process, so <code>ProcessRecordInternal</code> stores multiple copies of
+each output. Propagation needs a client's score before local per-process penalties are applied; the LRU post-pass needs to ladder scores without
+feeding those offsets back into bindings; and commit needs the previously sent values so it writes out only changes. Field names combine two
+axes: <b>version</b> (raw vs effective) and <b>visibility</b> (in-flight vs committed vs reported).</p>
+
+<h3 id="name-decoder">Name decoder</h3>
+<p>Each prefix answers one question, and field names stack them. Note that <code>set</code> is a past participle here, not a verb:
+<code>setAdj</code> means "the <code>adj</code> that was last set in <code>lmkd</code>".</p>
+<table>
+  <thead><tr><th>Prefix</th><th>Question it answers</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>cur</code></td><td>Which pass?</td><td>Being computed in the current pass; not yet sent anywhere.</td></tr>
+    <tr><td><code>set</code></td><td>Who has it?</td><td>Committed to <code>lmkd</code>, cgroups and AMS state at the end of the last pass.</td></tr>
+    <tr><td><code>rep</code></td><td>Who has it?</td><td>Reported to the app process and registered process observers.</td></tr>
+    <tr><td><code>Raw</code></td><td>Which version?</td><td>Unadjusted intrinsic + propagated score; this is what bound hosts inherit.</td></tr>
+    <tr><td>no <code>Raw</code></td><td>Which version?</td><td>Effective value after local adjustments (<code>BIND_ABOVE_CLIENT</code>, <code>maxAdj</code>, zram cap, LRU ladders).</td></tr>
+  </tbody>
+</table>
+
+<figure>
+<figcaption><b>Figure 7. Every state field sits in one cell of version × visibility.</b> Arrows show commit copies in step 5:
+<code>curRawAdj</code> commits to <code>setRawAdj</code>, while effective <code>cur*</code> values commit to <code>set*</code> and <code>rep*</code>.</figcaption>
+<svg viewBox="0 0 1000 235" role="img" aria-label="Grid of state slot names by computation stage and lifecycle">
+  <text x="10" y="18" class="th">every slot name is one cell: which version × who has seen it</text>
+  <text x="190" y="44" class="tb">Being calculated</text><text x="310" y="44" class="tms">cur…</text>
+  <text x="460" y="44" class="tb">Sent to lmkd / kernel</text><text x="618" y="44" class="tms">set…</text>
+  <text x="730" y="44" class="tb">Told to the app</text><text x="842" y="44" class="tms">rep…</text>
+
+  <text x="10" y="80" class="tb ta">Raw</text>
+  <text x="10" y="96" class="ts">before local adjustments</text>
+  <rect x="190" y="56" width="240" height="60" rx="2" class="ba"/>
+  <text x="202" y="78" class="tm">curRawAdj, curRawProcState</text>
+  <text x="202" y="100" class="ts">what bound hosts inherit</text>
+  <path d="M430,86 L458,86" class="lnv" marker-end="url(#ahv)"/>
+  <rect x="460" y="56" width="240" height="60" rx="2" class="bv"/>
+  <text x="472" y="78" class="tm">setRawAdj</text>
+  <text x="472" y="100" class="ts">saved at commit, never sent itself</text>
+  <rect x="730" y="56" width="260" height="60" rx="2" fill="url(#hatch)" class="hatch-l"/>
+  <text x="742" y="90" class="ts">none</text>
+
+  <text x="10" y="150" class="tb tw">no Raw</text>
+  <text x="10" y="166" class="ts">after local adjustments</text>
+  <rect x="190" y="126" width="240" height="60" rx="2" class="bw"/>
+  <text x="202" y="148" class="tm">curAdj, curProcState, …</text>
+  <text x="202" y="170" class="ts">the target for this pass</text>
+  <path d="M430,156 L458,156" class="lng" marker-end="url(#ahg)"/>
+  <rect x="460" y="126" width="240" height="60" rx="2" class="bg"/>
+  <text x="472" y="148" class="tm">setAdj, setProcState, …</text>
+  <text x="472" y="170" class="ts">what lmkd and cgroups have now</text>
+  <rect x="730" y="126" width="260" height="60" rx="2" class="b"/>
+  <text x="742" y="148" class="tm">repProcState</text>
+  <text x="742" y="170" class="ts">what the app was last told</text>
+
+  <path d="M190,204 L430,204" class="ln"/>
+  <text x="190" y="222" class="ts">in flight, rewritten every pass</text>
+  <path d="M460,204 L990,204" class="ln"/>
+  <text x="460" y="222" class="ts">committed: what the outside world currently believes</text>
+</svg>
+</figure>
+
+<table>
+  <thead><tr><th>Real name</th><th>Read it as</th></tr></thead>
+  <tbody>
+    <tr><td><code>curRawAdj</code></td><td>Inherited <code>adj</code>, this pass</td></tr>
+    <tr><td><code>curAdj</code></td><td>Effective <code>adj</code>, this pass</td></tr>
+    <tr><td><code>setRawAdj</code></td><td>Inherited <code>adj</code> when <code>lmkd</code> was last updated</td></tr>
+    <tr><td><code>setAdj</code></td><td><code>adj</code> that <code>lmkd</code> holds right now</td></tr>
+    <tr><td><code>repProcState</code></td><td><code>procState</code> the app was last told</td></tr>
+    <tr><td><code>maxAdj</code></td><td><code>adj</code> ceiling: the worst score this process is ever allowed to receive</td></tr>
+    <tr><td><code>cachedAdj</code>, <code>cachedProcState</code>, <code>cachedSchedGroup</code></td><td>Per-pass memo of the activity scan, unrelated to cached apps</td></tr>
+  </tbody>
+</table>
+
+<p>Think of a teacher grading an exam: the raw mark reflects the student's answers, while a late penalty or grade cap produces the final mark.
+The teacher enters the final mark into the registrar system (<code>set</code>), emails the student separately (<code>rep</code>), and writes down
+the raw mark too (<code>setRaw</code>). Any later calculation that seeds from last week's score must start from the raw mark before the penalty,
+or the penalty would be applied twice.</p>
+
+<figure>
+<figcaption><b>Figure 8. How one update pass moves values across <code>ProcessRecordInternal</code> fields.</b> Outgoing bindings read
+<code>mCurRawAdj</code> and <code>mCurRawProcState</code>; step 5 writes external daemons only when <code>mCur*</code> differs from <code>mSet*</code>
+or <code>mRep*</code>.</figcaption>
+<svg viewBox="0 0 1000 320" role="img" aria-label="State slots on ProcessRecordInternal and how values flow between them">
+  <text x="10" y="18" class="th">per-process state slots on ProcessRecordInternal · flow during one update pass</text>
+
+  <rect x="10" y="32" width="190" height="118" rx="2" class="b0"/>
+  <text x="22" y="52" class="tb">Bounds &amp; traversal cache</text>
+  <text x="22" y="72" class="tm">mMaxAdj</text>
+  <text x="22" y="87" class="ts">Ceiling: -800 persistent,</text>
+  <text x="22" y="101" class="ts">-700 isolated, 1001 default</text>
+  <text x="22" y="121" class="tm">mCachedAdj / ProcState</text>
+  <text x="22" y="136" class="ts">Per-pass activity memo</text>
+
+  <rect x="10" y="168" width="190" height="128" rx="2" class="bv"/>
+  <text x="22" y="188" class="tb tv">Prior committed raw</text>
+  <text x="22" y="208" class="tm">mSetRawAdj</text>
+  <text x="22" y="224" class="ts">Last committed curRawAdj.</text>
+  <text x="22" y="239" class="ts">Printed in dumps; copied</text>
+  <text x="22" y="254" class="ts">on process cleanup into</text>
+  <text x="22" y="274" class="tm">mPrevSetRawAdj</text>
+  <text x="22" y="288" class="ts">Seeds a restarted process</text>
+
+  <rect x="230" y="32" width="218" height="145" rx="2" class="ba"/>
+  <text x="242" y="52" class="tb ta">Raw (steps 1, 2, 4)</text>
+  <text x="242" y="74" class="tm">mCurRawAdj</text>
+  <text x="242" y="92" class="tm">mCurRawProcState</text>
+  <text x="242" y="114" class="ts">Unadjusted intrinsic + graph</text>
+  <text x="242" y="129" class="ts">score. Read by outgoing</text>
+  <text x="242" y="144" class="ts">service/provider bindings</text>
+  <text x="242" y="159" class="ts">so penalties don't cascade.</text>
+
+  <path d="M320,177 L320,202 L395,202 L395,177" class="lna" marker-end="url(#aha)"/>
+  <text x="280" y="220" class="tms">client.getCurRawAdj() → host</text>
+
+  <path d="M448,95 L510,95" class="lnw" marker-end="url(#ahw)"/>
+  <text x="456" y="86" class="tms">derive</text>
+
+  <rect x="512" y="32" width="218" height="205" rx="2" class="bw"/>
+  <text x="524" y="52" class="tb tw">Effective (steps 1, 2, 4)</text>
+  <text x="524" y="74" class="tm">mCurAdj</text>
+  <text x="524" y="92" class="tm">mCurProcState</text>
+  <text x="524" y="110" class="tm">mCurSchedGroup</text>
+  <text x="524" y="128" class="tm">mCurCapability</text>
+  <text x="524" y="146" class="tm">mCurCpuTimeReasons</text>
+  <text x="524" y="168" class="ts">Raw plus local adjustments:</text>
+  <text x="524" y="183" class="ts">BIND_ABOVE_CLIENT step,</text>
+  <text x="524" y="198" class="ts">maxAdj clamp, zram cap,</text>
+  <text x="524" y="213" class="ts">visible/previous ladders.</text>
+
+  <path d="M250,177 L250,255 L202,255" class="lnv" marker-end="url(#ahv)"/>
+  <text x="260" y="252" class="tms">applyOomAdjLSP: setRawAdj = curRawAdj</text>
+
+  <path d="M730,95 L775,95" class="lng" marker-end="url(#ahg)"/>
+  <path d="M730,195 L775,235" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="777" y="32" width="213" height="145" rx="2" class="bg"/>
+  <text x="789" y="52" class="tb tg">Committed (step 5)</text>
+  <text x="789" y="74" class="tm">mSetAdj</text>
+  <text x="789" y="92" class="tm">mSetProcState</text>
+  <text x="789" y="110" class="tm">mSetSchedGroup</text>
+  <text x="789" y="128" class="tm">mSetCapability</text>
+  <text x="789" y="148" class="ts">Last sent to lmkd, cgroups.</text>
+  <text x="789" y="163" class="ts">Baseline for skip checks.</text>
+
+  <rect x="777" y="192" width="213" height="104" rx="2" class="b"/>
+  <text x="789" y="212" class="tb">Reported (step 5)</text>
+  <text x="789" y="232" class="tm">mRepProcState</text>
+  <text x="789" y="250" class="tm">mRepForegroundActivities</text>
+  <text x="789" y="270" class="ts">What the app and process</text>
+  <text x="789" y="285" class="ts">observers were last told.</text>
+</svg>
+</figure>
+
+<table>
+  <thead>
+    <tr>
+      <th>Prefix / Field</th>
+      <th>ProcessRecordInternal fields</th>
+      <th>Precise role in OomAdjuster</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>Raw (in-flight)</b><br/><code>curRaw*</code></td>
+      <td style="white-space:nowrap"><code>mCurRawAdj</code><br/><code>mCurRawProcState</code></td>
+      <td>Scratch values written in steps 1 and 2 (and for cached slots in step 4). <code>computeServiceHostOomAdjLSP</code> and <code>computeProviderHostOomAdjLSP</code> read <code>client.getCurRawAdj()</code> and <code>client.getCurRawProcState()</code> so a client's local adjustments do not leak across bindings.</td>
+    </tr>
+    <tr>
+      <td><b>Raw (committed)</b><br/><code>setRaw*</code></td>
+      <td style="white-space:nowrap"><code>mSetRawAdj</code><br/><code>mPrevSetRawAdj</code></td>
+      <td>Records <code>mCurRawAdj</code> when step 5 commits. Printed in <code>dumpsys</code> and copied on process cleanup (<code>onCleanupApplicationRecordLSP</code>) into <code>mPrevSetRawAdj</code>, which seeds a restarted process in <code>getInitialRawAdjForHostingRecord</code> when <code>set_initial_oom_score_adj</code> is enabled.</td>
+    </tr>
+    <tr>
+      <td><b>Current (in-flight)</b><br/><code>cur*</code></td>
+      <td style="white-space:nowrap"><code>mCurAdj</code><br/><code>mCurProcState</code><br/><code>mCurSchedGroup</code><br/><code>mCurCapability</code><br/><code>mCurCpuTimeReasons</code><br/><code>mCurImplicitCpuTimeReasons</code></td>
+      <td>Effective values for the pass in progress. <code>mCurAdj</code> is derived from <code>mCurRawAdj</code> inside <code>setIntermediateAdjLSP</code> on each write in steps 1 and 2 (applying <code>BIND_ABOVE_CLIENT</code>, the <code>mMaxAdj</code> clamp, and the zram-writeback cap), and step 4 then applies LRU laddering.</td>
+    </tr>
+    <tr>
+      <td><b>Committed</b><br/><code>set*</code></td>
+      <td style="white-space:nowrap"><code>mSetAdj</code><br/><code>mSetProcState</code><br/><code>mSetSchedGroup</code><br/><code>mSetCapability</code><br/><code>mSetCpuTimeReasons</code></td>
+      <td>Values last applied in step 5. <code>applyOomAdjLSP</code> writes <code>lmkd</code> only when <code>mCurAdj != mSetAdj</code>, and <code>applyResultsLSP</code> updates cgroups only when <code>mCurSchedGroup != mSetSchedGroup</code>. Between passes, binding skip checks (<code>evaluateServiceConnectionAdd</code> and <code>…Removal</code>) compare these fields.</td>
+    </tr>
+    <tr>
+      <td><b>Reported</b><br/><code>rep*</code></td>
+      <td style="white-space:nowrap"><code>mRepProcState</code><br/><code>mRepForegroundActivities</code></td>
+      <td>Values last reported outside <code>OomAdjuster</code>. When <code>mCurProcState != mRepProcState</code>, step 5 sends a one-way Binder call to <code>IApplicationThread.setProcessState</code>. When foreground-activity visibility changes, AMS enqueues a <code>CHANGE_ACTIVITIES</code> event for process observers.</td>
+    </tr>
+    <tr>
+      <td><b>Ceiling &amp; cache</b><br/><code>max*</code>, <code>cached*</code></td>
+      <td style="white-space:nowrap"><code>mMaxAdj</code><br/><code>mCachedAdj</code><br/><code>mCachedProcState</code><br/><code>mCachedSchedGroup</code></td>
+      <td><code>mMaxAdj</code> caps the worst score a process can receive (default <code>UNKNOWN_ADJ</code>). Persistent apps, system-started isolated processes and <code>system_server</code> get negative ceilings, and any process with <code>mMaxAdj &lt;= FOREGROUND_APP_ADJ</code> short-circuits normal scoring. The <code>mCached*</code> fields memoize the window-manager activity scan within one pass.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="why-two-set">Why keep both <code>setAdj</code> and <code>setRawAdj</code></h3>
+<p>They answer different questions. <code>setAdj</code> is the deduplication baseline for <code>lmkd</code>: if the newly computed effective score
+matches <code>setAdj</code>, step 5 sends no socket packet. <code>setRawAdj</code> preserves the pre-adjustment score so a restarted process
+can be seeded before local adjustments run again.</p>
+<p>Neither field can be reconstructed from the other because local adjustments are many-to-one:</p>
+<table>
+  <thead><tr><th>Committed <code>setAdj</code></th><th>Could come from</th></tr></thead>
+  <tbody>
+    <tr><td>200</td><td><code>curRawAdj = 200</code> directly, or <code>curRawAdj = 100</code> stepped down by <code>BIND_ABOVE_CLIENT</code></td></tr>
+    <tr><td>102</td><td><code>curRawAdj = 100</code> placed third in the visible-band LRU ladder</td></tr>
+    <tr><td>900–999 (cached)</td><td>Matching values: step 4 writes the assigned cached slot into both <code>curRawAdj</code> and <code>curAdj</code></td></tr>
+  </tbody>
+</table>
+
+<h3 id="why-max-cached">Why <code>max</code> and <code>cached</code> exist</h3>
+<p>The ceiling field, <code>mMaxAdj</code>, fixes a process's worst-case protection when the process starts, regardless of what the binding
+graph later does. Centralising that guarantee in one clamp inside <code>setIntermediateAdjLSP</code> avoids scattering special cases for
+<code>system_server</code>, persistent apps and isolated system services across every scoring branch, and lets <code>computeOomAdjLSP</code>
+return immediately when <code>mMaxAdj &lt;= FOREGROUND_APP_ADJ</code>.</p>
+<p>The <code>mCachedAdj</code>, <code>mCachedProcState</code> and <code>mCachedSchedGroup</code> fields avoid repeated window-manager walks.
+Scoring activities queries <code>WindowProcessController</code> to inspect visible, pausing and stopping activities across tasks. Because
+step 2 can revisit a process multiple times during propagation, the first lookup is memoized on the process record and cleared by
+<code>resetCachedInfo()</code> at the start of the next pass.</p>
+<blockquote class="warn"><span class="lbl">Two meanings of "cached"</span>
+<code>mCached*</code> fields on <code>ProcessRecordInternal</code> are a per-pass memo of an activity scan. A <b>cached app</b> is an idle
+background process in the <code>900–999</code> band. The two concepts are unrelated.
+</blockquote>
+
+<h3 id="walkthrough">One host followed through three passes</h3>
+<p>Suppose service host <code>S</code> has no activities and is bound by app <code>V</code>, which owns a visible activity. Both visible-laddering
+flags are enabled (<a href="#div-vis-ladder">§6, Case 2</a>). Even though <code>S</code>'s role never changes, its committed <code>setAdj</code>
+moves whenever recency order shifts above it:</p>
+<table>
+  <thead><tr><th>Moment</th><th>curRawAdj</th><th>curAdj</th><th>setRawAdj</th><th>setAdj</th><th>What happens</th></tr></thead>
+  <tbody>
+    <tr><td>Pass 1, step 2</td><td>100</td><td>100</td><td>(old)</td><td>(old)</td><td><code>S</code> inherits <code>V</code>'s raw <code>100</code> (plain binding floor), and <code>setIntermediateAdjLSP</code> sets <code>curAdj = 100</code>.</td></tr>
+    <tr><td>Pass 1, step 4</td><td>100</td><td>101</td><td>(old)</td><td>(old)</td><td><code>S</code> sits second in LRU order within the visible band, so <code>curAdj</code> becomes <code>101</code>.</td></tr>
+    <tr><td>Pass 1, step 5</td><td>100</td><td>101</td><td>100</td><td>101</td><td><code>curAdj != setAdj</code>: step 5 sends <code>101</code> to <code>lmkd</code> and commits both fields.</td></tr>
+    <tr><td>Pass 2, step 5</td><td>100</td><td>101</td><td>100</td><td>101</td><td>No order change: <code>curAdj == setAdj</code>, so <code>lmkd</code> is not contacted.</td></tr>
+    <tr><td>Pass 3, step 5</td><td>100</td><td>102</td><td>100</td><td>102</td><td>Another visible app moved ahead in LRU order. <code>S</code>'s raw score is still <code>100</code>, but <code>curAdj</code> shifts to <code>102</code>, triggering an <code>lmkd</code> write.</td></tr>
+  </tbody>
+</table>
+<p>Notice what stays constant in the third pass: <code>curRawAdj</code> remains <code>100</code>, so any downstream process bound by <code>S</code>
+continues to read the band's base score rather than inheriting <code>S</code>'s ladder offset.</p>
+
+<h3 id="stage-evolution">The copies in code</h3>
+<p>Four short excerpts from <code>psc/OomAdjusterImpl.java</code> and <code>psc/OomAdjuster.java</code> show the entire lifecycle of the
+<code>adj</code> fields across one pass (lines unrelated to <code>adj</code> are elided with <code>…</code>):</p>
+
+<pre><code><span class="src">psc/OomAdjusterImpl.java · psc/OomAdjuster.java (excerpts)</span><span class="c">// Step 2, computeServiceHostOomAdjLSP: a binding reads the client's RAW values.</span>
+<span class="hg">@OomAdjust <span class="k">int</span> clientAdj = client.getCurRawAdj();</span>
+<span class="hg">@ProcessState <span class="k">int</span> clientProcState = client.getCurRawProcState();</span>
+…
+<span class="k">if</span> (adj &lt; prevRawAdj) {
+    schedGroup = setIntermediateAdjLSP(app, adj, schedGroup);
+}
+
+<span class="c">// Steps 1 and 2, setIntermediateAdjLSP: store raw, derive cur from it.</span>
+<span class="k">protected</span> @SchedGroup <span class="k">int</span> setIntermediateAdjLSP(ProcessRecordInternal app, @OomAdjust <span class="k">int</span> adj,
+        @SchedGroup <span class="k">int</span> schedGroup) {
+    app.setCurRawAdj(adj);
+
+<span class="hw">    adj = applyBindAboveClientToAdj(app.getServices().hasBindAboveClient(), adj);</span>
+    <span class="k">if</span> (adj &gt; app.getMaxAdj()) {
+        adj = app.getMaxAdj();
+        <span class="k">if</span> (adj &lt;= PERCEPTIBLE_LOW_APP_ADJ) {
+            schedGroup = SCHED_GROUP_DEFAULT;
+        }
+    }
+
+    <span class="k">if</span> (app.isZramWrittenBack()) {
+        app.setCurAdj(Math.min(adj, getAdjForZramWriteback()));
+    } <span class="k">else</span> {
+<span class="hw">        app.setCurAdj(adj);</span>
+    }
+    <span class="k">return</span> schedGroup;
+}
+
+<span class="c">// Step 4, applyLruAdjust: the visible ladder writes curAdj only.</span>
+<span class="k">if</span> (VISIBLE_APP_ADJ &lt;= curAdj &amp;&amp; curAdj &lt;= VISIBLE_APP_MAX_ADJ) {
+<span class="hw">    app.setCurAdj(nextVisibleAppAdj);</span>
+    nextVisibleAppAdj = Math.min(nextVisibleAppAdj + 1, VISIBLE_APP_MAX_ADJ);
+}
+
+<span class="c">// Step 5, applyOomAdjLSP: commit raw; send cur to lmkd only if it changed.</span>
+<span class="k">if</span> (state.getCurRawAdj() != state.getSetRawAdj()) {
+<span class="hg">    state.setSetRawAdj(state.getCurRawAdj());</span>
+}
+<span class="k">if</span> (state.getCurAdj() != state.getSetAdj()) {
+    …
+    mInjector.setOomAdj(state.getPid(), state.uid, state.getCurAdj(), forLmkdOnly);
+    …
+<span class="hg">    state.setSetAdj(state.getCurAdj());</span>
+}</code></pre>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+When reading or modifying a scoring rule, ask whether the adjustment should propagate along bindings or apply only to that one process.
+Propagating properties write raw fields in steps 1 and 2; single-process adjustments belong in <code>setIntermediateAdjLSP</code> or
+<code>applyLruAdjust</code> and touch only <code>curAdj</code>.
+</blockquote>
+
+<h2 id="divergences"><span class="n">6</span>Four cases where the copies differ, and why that matters</h2>
+<p>For a standalone foreground app with no special bindings, all four <code>adj</code> copies finish the pass with the same number.
+The four cases below show where raw, effective and committed copies diverge — and why collapsing them into one field would break either
+binding propagation or update skipping.</p>
+
+<h3 id="div-bind-above">Case 1 · A binding that asks to rank the host above the client</h3>
+<p>A client binding with <code>Context.BIND_ABOVE_CLIENT</code> demotes only its own effective score, never the raw score it passes to other
+services. When app <code>A</code> binds service <code>B</code> with <code>BIND_ABOVE_CLIENT</code>, it asks <code>lmkd</code> to reclaim
+<code>A</code> before <code>B</code>. <code>OomAdjuster</code> implements that in three parts:</p>
+<ul>
+  <li>When the binding is created, <code>A</code>'s <code>ProcessServiceRecordInternal.updateHasAboveClient()</code> sets <code>mHasAboveClient = true</code> whenever at least one outgoing binding carries <code>BIND_ABOVE_CLIENT</code> to another process.</li>
+  <li>In step 2, <code>computeServiceHostOomAdjLSP</code> lets <code>B</code> inherit <code>A</code>'s raw score without the usual visible-band floor. If <code>A</code> is the top app, <code>B</code> receives the foreground score.</li>
+  <li>Whenever <code>A</code>'s raw score is written, <code>setIntermediateAdjLSP</code> calls <code>applyBindAboveClientToAdj</code>, stepping <code>A</code>'s <code>curAdj</code> one band down (for example from foreground to visible) while leaving <code>A</code>'s <code>curRawAdj</code> untouched.</li>
+</ul>
+<p>Now suppose <code>A</code> also holds an ordinary binding to a sibling service <code>C</code> (Figure 9, left). Because step 2 reads
+<code>A.getCurRawAdj()</code>, <code>C</code> still sees <code>A</code> as a top app rather than inheriting <code>A</code>'s self-demotion.
+The <code>mMaxAdj</code> clamp and the zram-writeback cap work the same way: both modify <code>curAdj</code> without altering <code>curRawAdj</code>.</p>
+
+<figure>
+<figcaption><b>Figure 9. Local adjustments alter a process's own <code>curAdj</code> without changing what downstream hosts inherit.</b>
+Left: <code>BIND_ABOVE_CLIENT</code> steps client <code>A</code> down a band while both bound services still read <code>A</code>'s raw score.
+Right: the visible ladder assigns distinct <code>curAdj</code> ranks in LRU order while leaving <code>curRawAdj</code> at the band base.</figcaption>
+<svg viewBox="0 0 1000 240" role="img" aria-label="Divergence of curRawAdj and curAdj under BIND_ABOVE_CLIENT and visible laddering">
+  <rect x="10" y="10" width="480" height="220" rx="2" class="panel"/>
+  <text x="22" y="30" class="th">case 1 · bind_above_client does not demote sibling services</text>
+
+  <rect x="24" y="48" width="174" height="90" rx="2" class="ba"/>
+  <text x="34" y="68" class="tb ta">Client App A (Top)</text>
+  <text x="34" y="88" class="tm">curRawAdj = 0</text>
+  <text x="34" y="106" class="tm tw">curAdj    = 100</text>
+  <text x="34" y="124" class="tms">mHasAboveClient = true</text>
+
+  <path d="M198,72 L286,62" class="lna" marker-end="url(#aha)"/>
+  <text x="206" y="57" class="tms">curRaw = 0</text>
+
+  <path d="M198,115 L286,162" class="lna" marker-end="url(#aha)"/>
+  <text x="206" y="178" class="tms">curRaw = 0</text>
+
+  <rect x="288" y="42" width="188" height="72" rx="2" class="bg"/>
+  <text x="298" y="62" class="tb tg">Service B (ABOVE_CLIENT)</text>
+  <text x="298" y="80" class="tm">curRawAdj = 0</text>
+  <text x="298" y="98" class="tm tg">curAdj    = 0 (beats A)</text>
+
+  <rect x="288" y="136" width="188" height="72" rx="2" class="b"/>
+  <text x="298" y="156" class="tb">Service C (plain bind)</text>
+  <text x="298" y="174" class="tm">curRawAdj = 100</text>
+  <text x="298" y="192" class="tm">curAdj    = 100 (floor)</text>
+
+  <text x="24" y="222" class="ts">A's curAdj is 100, but B and C read A's curRawAdj, which is 0.</text>
+
+  <rect x="510" y="10" width="480" height="220" rx="2" class="panel"/>
+  <text x="522" y="30" class="th">case 2 · the visible ladder writes curadj only</text>
+
+  <rect x="524" y="48" width="184" height="82" rx="2" class="ba"/>
+  <text x="534" y="68" class="tb ta">Visible app V</text>
+  <text x="534" y="86" class="tm">curRawAdj = 100</text>
+  <text x="534" y="104" class="tm ta">curAdj    = 101 (LRU #2)</text>
+  <text x="534" y="119" class="tms">has visible activities</text>
+
+  <path d="M708,88 L784,88" class="lna" marker-end="url(#aha)"/>
+  <text x="712" y="80" class="tms">curRaw=100</text>
+
+  <rect x="786" y="48" width="190" height="82" rx="2" class="bw"/>
+  <text x="796" y="68" class="tb tw">Host S, bound by V</text>
+  <text x="796" y="86" class="tm">curRawAdj = 100</text>
+  <text x="796" y="104" class="tm tw">curAdj    = 102 (LRU #3)</text>
+  <text x="796" y="119" class="tms">no activities</text>
+
+  <text x="524" y="150" class="th">100–199 with both laddering flags on</text>
+  <rect x="524" y="158" width="452" height="22" rx="2" class="ba"/>
+  <text x="534" y="173" class="tms">100, 101, 102 … every visible-band process, most recent first</text>
+  <text x="524" y="196" class="th">100–199 with either flag off</text>
+  <rect x="524" y="204" width="452" height="22" rx="2" class="b"/>
+  <text x="534" y="219" class="tms">activities add window taskLayer (0–99); bound hosts stay at 100</text>
+</svg>
+</figure>
+
+<h3 id="div-vis-ladder">Case 2 · The visible ladder renumbers every member of the visible band</h3>
+<p>When both <code>oomadjuster_vis_laddering</code> and <code>remove_lru_spam_prevention</code> are enabled, <code>applyLruAdjust</code>
+spreads every process in the visible band across consecutive integers by recency so <code>lmkd</code> reclaims older ones first. Both apps
+with visible activities (such as split-screen or picture-in-picture windows) and headless service hosts bound by top or visible apps sit in
+this band; when either flag is off, <code>ComputeOomAdjWindowCallback</code> offsets visible activities by window <code>taskLayer</code> while
+headless bound hosts share the base score.</p>
+<p>Writing only <code>curAdj</code> prevents ladder drift down binding chains. If host <code>S</code> binds a second host <code>T</code>,
+propagation gives <code>T</code> the band's base score from <code>S.getCurRawAdj()</code>, and the LRU post-pass then assigns <code>T</code> a ladder slot
+solely from its own LRU position. Because headless hosts also sit on the ladder, any shift in LRU order above them renumbers their
+<code>curAdj</code> and writes <code>lmkd</code> even when their <code>procState</code> and capabilities stay identical.</p>
+
+<h3 id="div-exec-svc">Case 3 · A short service callback temporarily pins <code>adj</code> to foreground</h3>
+<p>While a service lifecycle callback (<code>onCreate</code>, <code>onBind</code>, <code>onStartCommand</code>, <code>onUnbind</code> or
+<code>onDestroy</code>) is in flight on the main thread, <code>hasExecutingServices()</code> remains true until
+<code>serviceDoneExecutingLocked</code> runs. During that window, step 1 grants the host <code>FOREGROUND_APP_ADJ</code> and
+<code>PROCESS_STATE_SERVICE</code>, with <code>SCHED_GROUP_DEFAULT</code> for foreground execution and <code>SCHED_GROUP_BACKGROUND</code>
+otherwise, protecting the callback from being killed or starved before it finishes.</p>
+<p>When the host is already bound by an important client — for example, bound by the top app with <code>BOUND_TOP</code> in the visible band —
+the intrinsic and propagation steps split the outputs (Figure 10). Propagation cannot improve on the intrinsic foreground <code>adj</code>,
+yet it restores the stronger <code>BOUND_TOP</code> <code>procState</code> and capabilities from the top-app binding. Only
+<code>oom_score_adj</code> moves: down to <code>0</code> when the callback starts and back to the visible score when
+<code>serviceDoneExecutingLocked</code> completes.</p>
+
+<figure>
+<figcaption><b>Figure 10. During a service lifecycle callback on a top-bound host, <code>adj</code> moves twice while <code>procState</code> stays put.</b>
+Step 1 pins <code>curRawAdj</code> and <code>curAdj</code> to <code>0</code> for the duration of the callback, while step 2 restores
+<code>BOUND_TOP</code> from the top app's binding.</figcaption>
+<svg viewBox="0 0 1000 165" role="img" aria-label="Service lifecycle callback on a top-bound host moves oom_score_adj from 100 to 0 and back while procState remains BOUND_TOP">
+  <text x="10" y="18" class="th">one service callback on a host bound by the top app</text>
+
+  <rect x="10" y="34" width="290" height="72" rx="2" class="b"/>
+  <text x="22" y="54" class="tb">1 · Before callback</text>
+  <text x="22" y="74" class="tm">setRawAdj = 100 · setAdj = 100</text>
+  <text x="22" y="92" class="tms">setProcState = BOUND_TOP</text>
+
+  <path d="M300,70 L342,70" class="lnw" marker-end="url(#ahw)"/>
+  <text x="304" y="61" class="tms">start</text>
+
+  <rect x="344" y="34" width="312" height="72" rx="2" class="bw"/>
+  <text x="356" y="54" class="tb tw">2 · Callback executing</text>
+  <text x="356" y="74" class="tm tw">curRawAdj = 0 → curAdj = 0 (write #1)</text>
+  <text x="356" y="92" class="tms">step 2 restores BOUND_TOP from binding</text>
+
+  <path d="M656,70 L698,70" class="ln" marker-end="url(#ah)"/>
+  <text x="662" y="61" class="tms">done</text>
+
+  <rect x="700" y="34" width="290" height="72" rx="2" class="b"/>
+  <text x="712" y="54" class="tb">3 · serviceDoneExecutingLocked</text>
+  <text x="712" y="74" class="tm">curRawAdj = 100 → curAdj = 100 (write #2)</text>
+  <text x="712" y="92" class="tms">setProcState stays BOUND_TOP throughout</text>
+
+  <text x="10" y="132" class="ts">For a cached or unbound service host, the temporary 0 score prevents lmkd reclamation mid-callback.</text>
+  <text x="10" y="150" class="ts">For an already-bound host, procState and capabilities stay unchanged while oom_score_adj steps 100 → 0 → 100.</text>
+</svg>
+</figure>
+
+<h3 id="div-skip">Case 4 · Some binding changes skip the update entirely</h3>
+<p>A less-important client cannot be the reason an already-important host is elevated, so AMS skips running a pass when adding or removing a
+single connection cannot change the host. Before scheduling a partial update on bind or unbind, AMS calls
+<code>evaluateServiceConnectionAdd</code> or <code>evaluateServiceConnectionRemoval</code> (or the content-provider equivalents), where
+<code>true</code> means an update is needed. Because no pass is active yet, both methods inspect the committed <code>set*</code> fields:</p>
+
+<pre><code><span class="src">psc/OomAdjuster.java · evaluateServiceConnectionRemoval</span><span class="k">public boolean</span> evaluateServiceConnectionRemoval(ProcessRecordInternal client,
+        ProcessRecordInternal app, ConnectionRecordInternal cr) {
+    <span class="k">if</span> (evaluateConnectionPrelude(client, app)) {
+        <span class="k">return true</span>;  <span class="c">// null, isolated, SDK sandbox or killed: always update</span>
+    }
+
+<span class="hl">    <span class="k">if</span> (app.getSetAdj() &gt;= client.getSetAdj()) {</span>
+        <span class="k">return true</span>;
+    } <span class="k">else if</span> (app.getSetProcState() &gt;= client.getSetProcState()) {
+        <span class="k">return true</span>;
+    } <span class="k">else if</span> (cr.hasFlag(Context.BIND_INCLUDE_CAPABILITIES
+                        | Context.BIND_BYPASS_USER_NETWORK_RESTRICTIONS)
+            &amp;&amp; (app.getSetCapability() &amp; client.getSetCapability())
+                        != PROCESS_CAPABILITY_NONE) {
+        <span class="k">return true</span>;
+    } <span class="k">else if</span> ((client.getSetCapability() &amp; app.getSetCapability()
+                &amp; ALL_CPU_TIME_CAPABILITIES) != 0) {
+        <span class="k">return true</span>;
+    }
+    <span class="k">return false</span>;
+}</code></pre>
+
+<figure>
+<figcaption><b>Figure 11. Removing a binding skips the partial update when the client could not have been what elevated the host.</b>
+The check reads committed <code>set*</code> values because <code>cur*</code> fields hold scratch state only during an active pass.</figcaption>
+<svg viewBox="0 0 1000 175" role="img" aria-label="Decision flow of evaluateServiceConnectionRemoval">
+  <text x="10" y="18" class="th">removing one binding · decided from committed set* values, before any update runs</text>
+  <rect x="10" y="40" width="270" height="90" rx="2" class="b"/>
+  <text x="22" y="62" class="tb">Binding client → host removed</text>
+  <text x="22" y="82" class="tm">evaluateServiceConnection</text>
+  <text x="22" y="98" class="tm">Removal(client, host, cr)</text>
+  <text x="22" y="118" class="ts">null, isolated, sandbox, killed → update</text>
+  <path d="M280,85 L318,85" class="ln" marker-end="url(#ah)"/>
+  <rect x="320" y="30" width="340" height="110" rx="2" class="ba"/>
+  <text x="332" y="52" class="tb ta">Is the host strictly better than the client?</text>
+  <text x="332" y="74" class="ts">host.setAdj &lt; client.setAdj, and</text>
+  <text x="332" y="91" class="ts">host.setProcState &lt; client.setProcState, and</text>
+  <text x="332" y="108" class="ts">no shared capability this binding carries, and</text>
+  <text x="332" y="125" class="ts">no shared CPU-time capability</text>
+  <path d="M660,62 L718,52" class="lng" marker-end="url(#ahg)"/>
+  <text x="672" y="46" class="tms">yes</text>
+  <path d="M660,108 L718,118" class="lnw" marker-end="url(#ahw)"/>
+  <text x="672" y="132" class="tms">no</text>
+  <rect x="720" y="28" width="270" height="52" rx="2" class="bg"/>
+  <text x="732" y="50" class="tb tg">Skip the update</text>
+  <text x="732" y="68" class="ts">this client could not have lifted the host</text>
+  <rect x="720" y="92" width="270" height="52" rx="2" class="bw"/>
+  <text x="732" y="114" class="tb tw">Run a partial update</text>
+  <text x="732" y="132" class="ts">this client may have lifted the host</text>
+  <text x="10" y="166" class="ts">Adding a binding runs the mirror check (is the client better than the host?), then a dry run of computeServiceHostOomAdjLSP.</text>
+</svg>
+</figure>
+
+<p>When the host is strictly better than the client in both <code>setAdj</code> and <code>setProcState</code> and shares none of the capabilities
+the connection could transmit, that client could not have been what held the host up, so removing the edge changes nothing. Notice how Case 2
+interacts with this test: on the visible ladder, a host that happens to be more recent in the LRU list than its visible client can have a
+slightly lower <code>setAdj</code> than that client, so checking <code>setAdj</code> alone would falsely skip the unbind. Checking
+<code>setProcState</code> alongside <code>setAdj</code> catches it, because a propagated binding never gives a host a strictly lower
+<code>procState</code> than the client that lifted it.</p>
+<p>Adding a connection runs the mirror pre-check in <code>evaluateServiceConnectionAdd</code>: if the client is better than the host in
+<code>adj</code>, <code>procState</code>, or a transmissible capability, it calls
+<code>computeServiceHostOomAdjLSP(cr, app, client, now, true /* dryRun */)</code> to test that single edge without mutating state, and skips
+the partial pass whenever nothing would improve.</p>
+
+<div class="part">Part III · Applying the results</div>
+
+<h2 id="apply"><span class="n">7</span>Results are sent out only when they change</h2>
+<p>Every external update costs a socket packet, a cgroup file write, or a Binder call, so step 5 acts strictly on deltas.
+<code>applyResultsLSP</code> compares each process's in-flight <code>cur*</code> values against its committed <code>set*</code> or
+reported <code>rep*</code> fields:</p>
+<table>
+  <thead><tr><th>Output changed</th><th>Action</th><th>Where it lands</th></tr></thead>
+  <tbody>
+    <tr><td><code>curAdj != setAdj</code></td><td><code>applyOomAdjLSP</code> → <code>ProcessList.setOomAdj(pid, uid, adj, forLmkdOnly)</code>, or batched <code>ProcessList.batchSetOomAdj</code></td><td>An <code>LMK_PROCPRIO</code> (or batched <code>LMK_PROCS_PRIO</code>) packet on the <code>lmkd</code> control socket. In <code>lmkd.cpp</code>, <code>cmd_procprio</code> writes <code>/proc/&lt;pid&gt;/oom_score_adj</code> (skipped when <code>forLmkdOnly</code> is set for zram-written-back processes) and updates <code>lmkd</code>'s internal slot table used by <code>find_and_kill_process</code>.</td></tr>
+    <tr><td><code>curSchedGroup != setSchedGroup</code></td><td><code>switch (curSchedGroup)</code> in <code>applyResultsLSP</code>, then <code>setAppAndChildProcessGroup</code></td><td>Posts a message to the process-group handler thread, which calls <code>ActivityManagerService.setProcessGroup</code> → <code>Process.setProcessGroup(pid, group)</code> and mirrors the group onto forked native child processes via <code>PhantomProcessList</code>. Native code applies the matching <code>libprocessgroup</code> task profile (<a href="#sched-vs-proc">§8</a>).</td></tr>
+    <tr><td>Entered or left <code>SCHED_GROUP_TOP_APP</code></td><td>UI and <code>RenderThread</code> priority update</td><td>Grants the main thread and <code>RenderThread</code> <code>THREAD_PRIORITY_TOP_APP_BOOST</code> (<code>-10</code>), or <code>SCHED_FIFO</code> real-time scheduling when FIFO UI scheduling is enabled; restores prior priorities when leaving <code>SCHED_GROUP_TOP_APP</code>.</td></tr>
+    <tr><td>CPU-time capability or freezer cutoff crossed</td><td><code>updateAppFreezeStateLSP</code></td><td>Calls <code>onProcessFreezabilityChanged</code> to thaw synchronously or queue an async freeze in <code>CachedAppOptimizer</code> (Part IV).</td></tr>
+    <tr><td><code>curProcState != repProcState</code></td><td><code>setProcessStateToThread</code></td><td>Sends a one-way Binder transaction to the app's <code>IApplicationThread.setProcessState</code>.</td></tr>
+    <tr><td>Any of <code>adj</code>, <code>procState</code>, or <code>capability</code> changed</td><td><code>PerfettoTrace.instant(PROC_STATE_CATEGORY, "process_state_changed")</code> (when <code>perfetto_sdk_tracing_v3</code> is enabled)</td><td>Emits a proto track event carrying previous and current <code>procState</code>, <code>oom_score_adj</code>, capability flags, CPU-time reasons, <code>oomAdjReason</code>, and pass sequence <code>mAdjSeq</code> (<a href="#perfetto">§12</a>).</td></tr>
+  </tbody>
+</table>
+<p>Two consequences matter when reading traces or <code>dumpsys</code>. First, cgroup writes are asynchronous: <code>mSetSchedGroup</code> updates
+immediately inside the commit step, while the kernel cgroup changes slightly later when the handler thread runs <code>setProcessGroup</code>. Second,
+<code>OomAdjuster</code> never reads kernel state back: if another subsystem alters a thread's cgroup or thaws a frozen process (<a href="#sched-outside">§9</a>
+and <a href="#freezer-outside">§11</a>), <code>mSet*</code> stays untouched until <code>OomAdjuster</code>'s own computed value changes again.</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+A scheduling-group change visible in <code>dumpsys</code> before the kernel cgroup reflects it is still queued on the process-group handler.
+A kernel cgroup or freeze state that diverges from <code>mSet*</code> for longer was written outside <code>OomAdjuster</code>.
+</blockquote>
+
+<h2 id="sched-vs-proc"><span class="n">8</span>OomAdjuster ranks CPU groups on its own scale</h2>
+<p><code>OomAdjuster</code> defines its own <code>SCHED_GROUP_*</code> constants in <code>psc/Constants.java</code> rather than storing
+<code>android.os.Process.THREAD_GROUP_*</code> constants directly. Two requirements drive that separation: <b>comparing groups as integers during
+binding propagation</b>, and <b>distinguishing the top app from services bound to it</b>.</p>
+
+<h3 id="sched-ordering">Reason 1 · The kernel's group IDs are not in priority order</h3>
+<p>Step 2 combines CPU scheduling groups along bindings by keeping the larger integer, which works only when higher numbers mean stronger CPU access.
+A service host may have several clients bound to it, and its group must settle at the best grant among them. Rather than consulting a priority lookup
+table at every edge, <code>OomAdjusterImpl</code> compares scheduling groups with <code>&gt;</code> (Figure 12):</p>
+
+<pre><code><span class="src">psc/OomAdjusterImpl.java · computeServiceHostOomAdjLSP</span><span class="k">final int</span> curSchedGroup = client.getCurrentSchedulingGroup();
+<span class="k">if</span> (curSchedGroup &gt; schedGroup) {
+    <span class="k">if</span> (cr.hasFlag(Context.BIND_IMPORTANT)) {
+        schedGroup = curSchedGroup;
+    } <span class="k">else</span> {
+        schedGroup = SCHED_GROUP_DEFAULT;
+    }
+}</code></pre>
+
+<p>The kernel-facing constants in <code>Process.java</code> are historical identifiers, not ranks: compared numerically,
+<code>THREAD_GROUP_RESTRICTED</code> would outrank <code>THREAD_GROUP_TOP_APP</code>, and <code>THREAD_GROUP_BACKGROUND</code> would outrank
+<code>THREAD_GROUP_DEFAULT</code>. In <code>psc/Constants.java</code>, the core groups from background through top-app bound rise
+monotonically from <code>0</code> to <code>4</code>.</p>
+<p>One historical quirk remains: <code>SCHED_GROUP_FOREGROUND_WINDOW</code>, added later for visible non-top windows (whose comment notes its
+priority sits between default and top app), has value <code>5</code>, above <code>SCHED_GROUP_TOP_APP</code> (<code>3</code>). Ordinary bindings
+still cap propagated groups at <code>SCHED_GROUP_DEFAULT</code> unless <code>BIND_IMPORTANT</code> is set.</p>
+<figure>
+<figcaption><b>Figure 12. <code>OomAdjuster</code>'s scheduling constants vs <code>Process.THREAD_GROUP_*</code> IDs in Android 17.</b>
+Rows are ordered from highest CPU priority at the top to lowest at the bottom. Red bars highlight values that sit out of priority order on each scale.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 262" role="img" aria-label="Bar chart comparing OomAdjuster SCHED_GROUP values in Android 17 against kernel THREAD_GROUP IDs">
+  <text x="200" y="22" class="th">oomadjuster sched_group</text>
+  <text x="530" y="22" class="th">process.thread_group id</text>
+  <line x1="200" y1="32" x2="200" y2="226" class="ln"/>
+  <line x1="560" y1="32" x2="560" y2="226" class="ln"/>
+  <text x="10" y="54" class="tb">Top app</text>
+  <rect x="200" y="40" width="120" height="20" rx="2" class="ba"/><text x="326" y="54" class="ts">3</text>
+  <rect x="560" y="40" width="150" height="20" rx="2" class="bw"/><text x="716" y="54" class="ts">5</text>
+  <text x="10" y="86" class="tb">Top-app bound</text>
+  <rect x="200" y="72" width="160" height="20" rx="2" class="ba"/><text x="366" y="86" class="ts">4</text>
+  <rect x="560" y="72" width="150" height="20" rx="2" class="bw"/><text x="716" y="86" class="ts">5 (same as top app)</text>
+  <text x="10" y="118" class="tb">Foreground window</text>
+  <rect x="200" y="104" width="200" height="20" rx="2" class="br"/><text x="406" y="118" class="ts">5 (added later)</text>
+  <rect x="560" y="104" width="240" height="20" rx="2" class="br"/><text x="806" y="118" class="ts">8</text>
+  <text x="10" y="150" class="tb">Default</text>
+  <rect x="200" y="136" width="80" height="20" rx="2" class="ba"/><text x="286" y="150" class="ts">2</text>
+  <rect x="530" y="136" width="30" height="20" rx="2" class="br"/><text x="566" y="150" class="ts">-1</text>
+  <text x="10" y="182" class="tb">Restricted</text>
+  <rect x="200" y="168" width="40" height="20" rx="2" class="ba"/><text x="246" y="182" class="ts">1</text>
+  <rect x="560" y="168" width="210" height="20" rx="2" class="br"/><text x="776" y="182" class="ts">7</text>
+  <text x="10" y="214" class="tb">Background</text>
+  <text x="206" y="214" class="ts">0</text>
+  <text x="566" y="214" class="ts">0</text>
+  <text x="10" y="250" class="ts">Top app (3) and top-app bound (4) map to the same kernel group (5), separated only for UI-thread boosts (Figure 13).</text>
+</svg>
+</figure>
+
+<figure>
+<figcaption><b>Figure 13. Both top-app constants share the <code>top-app</code> cpuset, while only <code>SCHED_GROUP_TOP_APP</code> boosts UI threads.</b>
+In step 5, <code>applyResultsLSP</code> switches on <code>curSchedGroup</code> to pick the <code>Process.THREAD_GROUP_*</code> cgroup target and
+gates the UI-thread and <code>RenderThread</code> boost on <code>SCHED_GROUP_TOP_APP</code>. In <code>libprocessgroup</code>,
+<code>THREAD_GROUP_DEFAULT</code> maps to the foreground cpuset policy.</figcaption>
+<svg viewBox="0 0 1000 285" role="img" aria-label="Mapping from OomAdjuster SCHED_GROUP constants to kernel Process.THREAD_GROUP constants and side effects">
+  <text x="10" y="18" class="th">oomadjuster sched_group (constants.java) → process.thread_group + thread priority boosts</text>
+
+  <text x="10" y="42" class="ts">OomAdjuster (@SchedGroup in Constants.java)</text>
+  <text x="415" y="42" class="ts">switch (curSchedGroup) → cgroup / libprocessgroup</text>
+  <text x="740" y="42" class="ts">Extra step 5 actions (applyResultsLSP)</text>
+
+  <rect x="10" y="52" width="345" height="32" rx="2" class="bg"/>
+  <text x="20" y="72" class="tm tg">3 · SCHED_GROUP_TOP_APP</text>
+  <path d="M355,68 L410,86" class="lng" marker-end="url(#ahg)"/>
+
+  <rect x="10" y="90" width="345" height="32" rx="2" class="ba"/>
+  <text x="20" y="110" class="tm ta">4 · SCHED_GROUP_TOP_APP_BOUND</text>
+  <path d="M355,106 L410,92" class="lna" marker-end="url(#aha)"/>
+
+  <rect x="412" y="56" width="295" height="62" rx="2" class="bg"/>
+  <text x="424" y="80" class="tm tg">Process.THREAD_GROUP_TOP_APP (5)</text>
+  <text x="424" y="98" class="tms">SP_TOP_APP cpuset &amp; task profile</text>
+
+  <rect x="740" y="52" width="250" height="32" rx="2" class="bg"/>
+  <text x="750" y="72" class="tms">UI thread -10 / FIFO + RenderThread</text>
+  <rect x="740" y="90" width="250" height="32" rx="2" class="b0"/>
+  <text x="750" y="110" class="tms">Cgroup only (no UI/RT thread boost)</text>
+  <path d="M707,72 L738,68" class="lng" marker-end="url(#ahg)"/>
+  <path d="M707,102 L738,106" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="10" y="128" width="345" height="32" rx="2" class="b"/>
+  <text x="20" y="148" class="tm">5 · SCHED_GROUP_FOREGROUND_WINDOW</text>
+  <path d="M355,144 L410,144" class="ln" marker-end="url(#ah)"/>
+  <rect x="412" y="128" width="295" height="32" rx="2" class="b"/>
+  <text x="424" y="148" class="tm">THREAD_GROUP_FOREGROUND_WINDOW (8)</text>
+  <rect x="740" y="128" width="250" height="32" rx="2" class="b0"/>
+  <text x="750" y="148" class="tms">Not TOP_APP: unboost UI if leaving top</text>
+
+  <rect x="10" y="166" width="345" height="32" rx="2" class="b"/>
+  <text x="20" y="186" class="tm">2 · SCHED_GROUP_DEFAULT</text>
+  <path d="M355,182 L410,182" class="ln" marker-end="url(#ah)"/>
+  <rect x="412" y="166" width="295" height="32" rx="2" class="b"/>
+  <text x="424" y="186" class="tm">THREAD_GROUP_DEFAULT (-1)</text>
+
+  <rect x="10" y="204" width="345" height="32" rx="2" class="bw"/>
+  <text x="20" y="224" class="tm tw">1 · SCHED_GROUP_RESTRICTED</text>
+  <path d="M355,220 L410,220" class="lnw" marker-end="url(#ahw)"/>
+  <rect x="412" y="204" width="295" height="32" rx="2" class="bw"/>
+  <text x="424" y="224" class="tm tw">THREAD_GROUP_RESTRICTED (7)</text>
+
+  <rect x="10" y="242" width="345" height="32" rx="2" class="b2"/>
+  <text x="20" y="262" class="tm">0 · SCHED_GROUP_BACKGROUND</text>
+  <path d="M355,258 L410,258" class="ln" marker-end="url(#ah)"/>
+  <rect x="412" y="242" width="295" height="32" rx="2" class="b2"/>
+  <text x="424" y="262" class="tm">THREAD_GROUP_BACKGROUND (0)</text>
+</svg>
+</figure>
+
+<h3 id="sched-top-bound">Reason 2 · Top app and top-app bound share CPUs but not the UI boost</h3>
+<p>Some bound service hosts execute work on the critical path of the visible UI, so confining them to slow background cores would stall frames.
+Giving them the <code>top-app</code> cpuset lets them run on big cores, yet they are not rendering the user's active window themselves and
+should not receive the top app's UI-thread boost (<code>THREAD_PRIORITY_TOP_APP_BOOST</code> or <code>SCHED_FIFO</code>) or <code>RenderThread</code> boost.</p>
+<p><code>SCHED_GROUP_TOP_APP_BOUND</code> expresses "top-app cpuset without UI-thread boost" (Figure 13). A service host receives it when bound
+from a visible activity with both <code>BIND_ADJUST_WITH_ACTIVITY</code> and <code>BIND_IMPORTANT</code> (whereas a <code>BIND_IMPORTANT</code>
+binding directly from the top app, or <code>BIND_SCHEDULE_LIKE_TOP_APP</code> from the system, grants full <code>SCHED_GROUP_TOP_APP</code>).
+In step 5, <code>applyResultsLSP</code> collapses the two for cgroups while keeping them separate for thread priority:</p>
+<ul>
+  <li>The <code>switch (curSchedGroup)</code> block maps both <code>SCHED_GROUP_TOP_APP</code> and <code>SCHED_GROUP_TOP_APP_BOUND</code> to <code>Process.THREAD_GROUP_TOP_APP</code>.</li>
+  <li>The UI-thread and <code>RenderThread</code> priority boost runs only when <code>curSchedGroup == SCHED_GROUP_TOP_APP</code>.</li>
+</ul>
+
+<h2 id="sched-outside"><span class="n">9</span>Other code also changes CPU groups and thread priorities</h2>
+<p><code>OomAdjuster</code> chooses each managed process's baseline scheduling group, but three other paths write cgroups or per-thread
+scheduler policies independently. Knowing those writers explains traces where a thread's actual CPU group or FIFO priority differs from
+<code>mSetSchedGroup</code>:</p>
+
+<ol>
+  <li><b>Zygote at process fork.</b> Without a launch hint, a cold-started top activity would spend its initial milliseconds in the default cgroup before <code>OomAdjuster</code> runs its first pass. When launching for the top activity, <code>ProcessList.startProcess</code> passes <code>--is-top-app</code> (<code>Zygote.START_AS_TOP_APP_ARG</code>) so native fork code in <code>com_android_internal_os_Zygote.cpp</code> calls <code>SetSchedulerPolicy</code> to place the child straight into <code>SP_TOP_APP</code>. When the app attaches, <code>setAttachingProcessStatesLSP</code> boosts its UI thread and, while the screen is on or animating, holds top-app state into the first pass.</li>
+  <li><b><code>SchedulingPolicyService</code> for audio and media.</b> Media and audio servers call <code>requestPriority</code> on <code>SchedulingPolicyService</code> to promote an individual thread — such as an app's audio callback thread — into <code>THREAD_GROUP_RT_APP</code> or <code>THREAD_GROUP_AUDIO_SYS</code> with <code>SCHED_FIFO</code> real-time priority. Its <code>requestCpusetBoost</code> path also moves the native <code>media.codec</code> process into <code>THREAD_GROUP_TOP_APP</code> during active decoding and restores it afterward.</li>
+  <li><b>Deferred handler and phantom-process mirroring.</b> As noted in <a href="#apply">§7</a>, step 5 dispatches <code>setProcessGroup</code> asynchronously on a handler thread, and <code>ActivityManagerService.onProcessGroupUpdated</code> mirrors that group onto any forked native child processes tracked by <code>PhantomProcessList</code>.</li>
+</ol>
+
+<blockquote class="warn"><span class="lbl">Caveat · mSetSchedGroup vs kernel reality</span>
+<code>mSetSchedGroup</code> records only the process-wide group <code>OomAdjuster</code> last requested. An audio thread promoted by
+<code>SchedulingPolicyService</code> can run in <code>SCHED_FIFO</code> inside a real-time cgroup while its owning process sits in
+<code>SCHED_GROUP_BACKGROUND</code>, and the process cgroup itself trails <code>mSetSchedGroup</code> until the handler message executes.
+</blockquote>
+
+<div class="part">Part IV · Process freezer</div>
+
+<h2 id="freezer-inside"><span class="n">10</span>A process is frozen once nothing gives it a reason to run</h2>
+<p><code>OomAdjuster</code> permits freezing a process as soon as the process holds neither CPU-time capability bit. Left unfrozen, a cached app
+is invisible to the user yet far from idle: periodic timers, handler messages and stray Binder work keep waking it up. To stop that background
+CPU drain, <code>CachedAppOptimizer</code> freezes cached processes in two steps: first <code>freezeBinder</code> blocks incoming Binder
+transactions on the process's kernel Binder interface (failing if transactions are currently in flight), and then <code>Process.setProcessFrozen</code>
+applies the <code>libprocessgroup</code> <code>Frozen</code> task profile by writing <code>1</code> to cgroup v2 <code>cgroup.freeze</code>.</p>
+<p>Whether a process is eligible to be frozen is decided in <code>psc/OomAdjuster.java</code> from its capability mask:</p>
+
+<pre><code><span class="src">psc/OomAdjuster.java</span><span class="k">public static final int</span> ALL_CPU_TIME_CAPABILITIES =
+        PROCESS_CAPABILITY_CPU_TIME | PROCESS_CAPABILITY_IMPLICIT_CPU_TIME;
+…
+<span class="k">public static boolean</span> getFreezePolicy(ProcessRecordInternal proc) {
+<span class="hg">    <span class="k">if</span> ((proc.getCurCapability() &amp; ALL_CPU_TIME_CAPABILITIES) != 0) {</span>
+        <span class="k">return false</span>;
+    }
+    <span class="c">// Default, freeze a process.</span>
+    <span class="k">return true</span>;
+}</code></pre>
+
+<p>Step 1 computes both CPU-time bits via <code>getCpuCapability</code> and <code>getImplicitCpuCapability</code>, and step 2 propagates them
+across connections:</p>
+<ul>
+  <li><b><code>PROCESS_CAPABILITY_CPU_TIME</code></b> (explicit reasons in <code>getCpuTimeReasons</code>): granted when the UID is on a power allowlist, <code>procState</code> is <code>TOP</code> or better, or the process has foreground activities, an executing service callback, a running foreground service, an active broadcast receiver, or active instrumentation. (In <code>getDefaultCapability</code>, <code>explicit_cpu_capability_for_top_processes</code> strips the CPU-time bits from <code>PROCESS_CAPABILITY_ALL</code> so top and persistent processes obtain CPU time solely through this explicit path.)</li>
+  <li><b><code>PROCESS_CAPABILITY_IMPLICIT_CPU_TIME</code></b> (score-based in <code>getImplicitCpuCapability</code>): granted whenever the process's <code>curAdj</code> or <code>maxAdj</code> sits strictly below <code>mFreezerCutoffAdj</code>. In <code>ActivityManagerConstants</code>, <code>freezer_cutoff_adj</code> defaults to <code>CACHED_APP_MIN_ADJ</code> (<code>900</code>), or to <code>HOME_APP_ADJ</code> (<code>600</code>) when <code>prototype_aggressive_freezing</code> is enabled.</li>
+  <li><b>Propagation across bindings</b> (<code>getCpuCapabilitiesFromClient</code>): every service and provider connection forwards the client's CPU-time bits to the host, except a service binding created with <code>Context.BIND_ALLOW_FREEZE</code> when no synchronous Binder call on that connection is active.</li>
+</ul>
+<p>Freezing the instant the last CPU-time bit clears would thrash processes that receive back-to-back broadcasts or short provider queries.
+<code>CachedAppOptimizer</code> therefore applies a debounce window, <code>mFreezerDebounceTimeout</code>
+(<code>config_defaultFreezerDebounceTimeout</code>, 10 seconds by default and configurable via <code>DeviceConfig</code>
+<code>freezer_debounce_timeout</code>). When the commit step calls <code>updateAppFreezeStateLSP</code> and <code>getFreezePolicy</code> returns
+<code>true</code>, <code>freezeAppAsyncLSP</code> posts <code>SET_FROZEN_PROCESS_MSG</code> on <code>FreezeHandler</code> delayed until the
+debounce window elapses; if another reason to run arrives before then, <code>unfreezeAppLSP</code> cancels the pending message (Figure 14).</p>
+<figure>
+<figcaption><b>Figure 14. A 10-second debounce window in <code>CachedAppOptimizer</code> prevents rapid freeze–thaw thrashing.</b>
+Top: when a second broadcast arrives inside the 10-second window, <code>unfreezeAppLSP</code> cancels the queued freeze message and starts a
+fresh 10-second wait afterward. Bottom: with no new work, <code>FreezeHandler</code> freezes Binder and cgroups at the 10-second mark.</figcaption>
+<svg xmlns="http://www.w3.org/2000/svg" style="max-width:860px" viewBox="0 0 860 185" role="img" aria-label="Timeline of the 10 second freezer debounce in CachedAppOptimizer">
+  <text x="10" y="18" class="th">after a cached process finishes its last reason to run</text>
+  <text x="10" y="52" class="tb">Interrupted wait</text>
+  <text x="10" y="67" class="ts">new work arrives</text>
+  <rect x="200" y="38" width="64" height="30" rx="2" class="bg"/>
+  <text x="207" y="57" class="ts">rx #1</text>
+  <rect x="264" y="38" width="190" height="30" rx="2" class="bw"/>
+  <text x="274" y="57" class="ts">pending freeze (cancelled)</text>
+  <rect x="454" y="38" width="64" height="30" rx="2" class="bg"/>
+  <text x="461" y="57" class="ts">rx #2</text>
+  <rect x="518" y="38" width="322" height="30" rx="2" class="bw"/>
+  <text x="528" y="57" class="ts">fresh 10 s pending-freeze window …</text>
+
+  <text x="10" y="106" class="tb">Uninterrupted</text>
+  <text x="10" y="121" class="ts">quiet for 10 s</text>
+  <rect x="200" y="92" width="64" height="30" rx="2" class="bg"/>
+  <text x="207" y="111" class="ts">rx #1</text>
+  <rect x="264" y="92" width="477" height="30" rx="2" class="bw"/>
+  <text x="274" y="111" class="ts">SET_FROZEN_PROCESS_MSG delayed on FreezeHandler</text>
+  <rect x="741" y="92" width="99" height="30" rx="2" fill="url(#hatch)" class="hatch-l"/>
+  <text x="749" y="111" class="ts">frozen</text>
+
+  <line x1="200" y1="146" x2="840" y2="146" class="ln"/>
+  <line x1="264" y1="142" x2="264" y2="150" class="ln"/><text x="257" y="166" class="ts">0 s</text>
+  <line x1="502" y1="142" x2="502" y2="150" class="ln"/><text x="495" y="166" class="ts">5 s</text>
+  <line x1="741" y1="142" x2="741" y2="150" class="ln"/><text x="731" y="166" class="ts">10 s</text>
+</svg>
+</figure>
+<p>Notice the asymmetry in step 5 when <code>onProcessFreezabilityChanged</code> runs. Transitioning to "do not freeze" calls
+<code>unfreezeAppLSP</code> synchronously inside the pass so the target can receive Binder calls immediately. Transitioning to "freeze" calls
+<code>freezeAppAsyncLSP</code>, leaving the actual freeze to run asynchronously on the freezer handler thread.</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+To stay unfrozen in the background, a process needs an explicit CPU-time reason (foreground service, active receiver, power allowlist), an
+<code>adj</code> below <code>mFreezerCutoffAdj</code>, or an active client bound without <code>BIND_ALLOW_FREEZE</code>. Adding
+<code>BIND_ALLOW_FREEZE</code> lets a client keep a service host alive in memory while still allowing the freezer to stop its CPU use when idle.
+</blockquote>
+
+<h2 id="freezer-outside"><span class="n">11</span>Many thaws and freezes bypass OomAdjuster</h2>
+<p>A frozen cached process occasionally needs to run briefly — to receive a broadcast, publish a content provider, or release a kernel file lock —
+without changing its overall importance. Running a full <code>OomAdjuster</code> pass for every such blip would waste lock time in
+<code>system_server</code>, so AMS and <code>CachedAppOptimizer</code> thaw and re-queue freezes directly without touching
+<code>oom_score_adj</code>:</p>
+
+<figure>
+<figcaption><b>Figure 15. Five paths thaw (and often re-freeze) a cached process without running <code>OomAdjuster</code>.</b>
+Top: even policy freezes requested by <code>OomAdjuster</code> execute asynchronously on <code>FreezeHandler</code>. Bottom: direct thaw paths and
+the <code>UNFREEZE_REASON_*</code> codes they emit in traces.</figcaption>
+<svg viewBox="0 0 1000 345" role="img" aria-label="Actors that change process freeze state inside and outside OomAdjuster">
+  <text x="10" y="18" class="th">how a process moves between thawed, pending freeze and frozen (cgroup.freeze = 1)</text>
+
+  <rect x="10" y="34" width="250" height="92" rx="2" class="ba"/>
+  <text x="22" y="54" class="tb ta">OomAdjuster (step 5)</text>
+  <text x="22" y="72" class="tm">updateAppFreezeStateLSP()</text>
+  <text x="22" y="90" class="ts">getFreezePolicy() is true</text>
+  <text x="22" y="106" class="ts">→ freezeAppAsyncLSP(app)</text>
+
+  <path d="M260,80 L328,80" class="lna" marker-end="url(#aha)"/>
+  <text x="266" y="72" class="tms">message</text>
+
+  <rect x="330" y="34" width="260" height="92" rx="2" class="bw"/>
+  <text x="342" y="54" class="tb tw">Pending freeze (FreezeHandler)</text>
+  <text x="342" y="72" class="tm">SET_FROZEN_PROCESS_MSG</text>
+  <text x="342" y="90" class="ts">isPendingFreeze() == true</text>
+  <text x="342" y="106" class="ts">Delay: mFreezerDebounceTimeout</text>
+
+  <path d="M590,80 L678,80" class="lnw" marker-end="url(#ahw)"/>
+  <text x="596" y="72" class="tms">handled</text>
+
+  <rect x="680" y="34" width="310" height="92" rx="2" class="bg"/>
+  <text x="692" y="54" class="tb tg">Frozen (freezeProcess)</text>
+  <text x="692" y="72" class="tm">freezeBinder() + setProcessFrozen()</text>
+  <text x="692" y="90" class="ts">isFrozen() == true</text>
+  <text x="692" y="106" class="ts">oom_score_adj unchanged</text>
+
+  <text x="10" y="154" class="th">five paths that thaw (and some that re-freeze) without running oomadjuster</text>
+
+  <rect x="10" y="168" width="186" height="118" rx="2" class="bv"/>
+  <text x="20" y="188" class="tb tv">1 · unfreezeTemporarily</text>
+  <text x="20" y="206" class="tms">BroadcastQueueImpl</text>
+  <text x="20" y="221" class="tms">ContentProviderHelper</text>
+  <text x="20" y="236" class="tms">AMS ping (PING, 15)</text>
+  <text x="20" y="256" class="ts">Thaws app + reachable hosts,</text>
+  <text x="20" y="271" class="ts">re-queues the freeze.</text>
+
+  <rect x="208" y="168" width="186" height="118" rx="2" class="br"/>
+  <text x="218" y="188" class="tb tr">2 · Binder at freeze</text>
+  <text x="218" y="206" class="tms">BINDER_TXNS (18)</text>
+  <text x="218" y="226" class="ts">freezeBinder fails on</text>
+  <text x="218" y="241" class="ts">pending txns: thaw, retry</text>
+  <text x="218" y="256" class="ts">with backoff, then kill.</text>
+
+  <rect x="406" y="168" width="186" height="118" rx="2" class="bw"/>
+  <text x="416" y="188" class="tb tw">3 · File locks</text>
+  <text x="416" y="206" class="tms">FILE_LOCKS (16)</text>
+  <text x="416" y="226" class="ts">/proc/locks check after a</text>
+  <text x="416" y="241" class="ts">freeze thaws a holder that</text>
+  <text x="416" y="256" class="ts">blocks an unfreezable one.</text>
+
+  <rect x="604" y="168" width="186" height="118" rx="2" class="b"/>
+  <text x="614" y="188" class="tb">4 · Shell</text>
+  <text x="614" y="206" class="tms">am freeze [--sticky]</text>
+  <text x="614" y="221" class="tms">am unfreeze</text>
+  <text x="614" y="241" class="ts">Forces a freeze, or thaws</text>
+  <text x="614" y="256" class="ts">with reason NONE (0).</text>
+
+  <rect x="802" y="168" width="188" height="118" rx="2" class="b"/>
+  <text x="812" y="188" class="tb">5 · Freezer disabled</text>
+  <text x="812" y="206" class="tms">enableFreezer(false)</text>
+  <text x="812" y="221" class="tms">FEATURE_FLAGS (19)</text>
+  <text x="812" y="241" class="ts">Used around dumpHeap:</text>
+  <text x="812" y="256" class="ts">thaws every frozen process</text>
+  <text x="812" y="271" class="ts">until re-enabled.</text>
+
+  <path d="M103,286 L103,304" class="lnv" marker-end="url(#ahv)"/>
+  <path d="M301,286 L301,304" class="lnr" marker-end="url(#ahr)"/>
+  <path d="M499,286 L499,304" class="lnw" marker-end="url(#ahw)"/>
+  <path d="M697,286 L697,304" class="ln" marker-end="url(#ah)"/>
+  <path d="M896,286 L896,304" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="10" y="306" width="980" height="30" rx="2" class="b2"/>
+  <text x="22" y="325" class="tms">None of these runs OomAdjuster or changes oom_score_adj. Paths 1, 2 and 5 re-queue the freeze; after 3 and 4 the next pass does.</text>
+</svg>
+</figure>
+
+<p>How each path operates in <code>CachedAppOptimizer.java</code> and <code>ActivityManagerService.java</code>:</p>
+
+<ol>
+  <li><b>The queued freeze.</b> <code>freezeAppAsyncLSP</code> posts <code>SET_FROZEN_PROCESS_MSG</code> to <code>FreezeHandler</code> delayed by <code>mFreezerDebounceTimeout</code> (never earlier than the process's earliest freezable timestamp). When the message fires, <code>freezeProcess</code> freezes Binder and writes <code>cgroup.freeze</code>, and can also enqueue memory compaction (<code>compactApp</code>) for the newly frozen cached process.</li>
+  <li><b><code>unfreezeTemporarily</code>.</b> <code>ActivityManagerService.unfreezeTemporarily</code> collects the target process plus every host reachable from it along bindings, and calls <code>CachedAppOptimizer.unfreezeTemporarily</code> on each. That thaws the process immediately and queues a fresh freeze delayed by at least <code>mFreezerDebounceTimeout</code>. Broadcast delivery (<code>BroadcastQueueImpl</code>), content-provider installation (<code>ContentProviderHelper</code>), and AMS process pings all use this path.</li>
+  <li><b>Pending Binder transactions at freeze time.</b> If <code>freezeBinder</code> fails because transactions are still in flight, <code>handleBinderFreezerFailure</code> thaws the process with <code>UNFREEZE_REASON_BINDER_TXNS</code> and schedules a retry with a shrinking, randomised timeout. Once the retry window drops below its minimum threshold, the process is killed rather than retried forever.</li>
+  <li><b>Binder transactions arriving while frozen.</b> Incoming calls to an already-frozen target do not thaw it. Instead, when the caller receives a Binder error, <code>binderError</code> schedules an inspection of frozen processes: a target that received a synchronous call while frozen is killed (<code>SUBREASON_FREEZER_BINDER_TRANSACTION</code>), as is one whose asynchronous Binder buffer is running out of space.</li>
+  <li><b>Kernel file locks.</b> After freezing a process, <code>FreezeHandler</code> runs a deadlock check over <code>/proc/locks</code> via <code>ProcLocksReader</code>. If a frozen process holds a file lock that blocks an unfreezable process, <code>onBlockingFileLock</code> thaws the holder with <code>UNFREEZE_REASON_FILE_LOCKS</code>.</li>
+  <li><b>Shell and heap-dump overrides.</b> <code>adb shell am freeze [--sticky] &lt;process&gt;</code> forces a freeze via <code>forceFreezeAppAsyncLSP</code>, and <code>am unfreeze</code> thaws with reason <code>NONE</code>. Calling <code>enableFreezer(false)</code> — used around <code>dumpHeap</code> and <code>enableAppFreezer</code> — thaws every frozen process with <code>UNFREEZE_REASON_FEATURE_FLAGS</code> until re-enabled.</li>
+</ol>
+
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Seeing a cached process thaw and re-freeze in a trace while its <code>oom_score_adj</code> stays flat in the <code>900–999</code> band is normal.
+Inspect the unfreeze reason (<a href="#perfetto">§12</a>): <code>start_receiver</code>, <code>finish_receiver</code>, <code>get_provider</code>,
+<code>ping</code>, <code>binder_txns</code> or <code>file_locks</code> indicate one of the direct paths above rather than an <code>OomAdjuster</code>
+score change.
+</blockquote>
+
+<div class="part">Part V · Observing &amp; reference</div>
+
+<h2 id="perfetto"><span class="n">12</span>Perfetto records every score change and the update behind it</h2>
+<p>Every mechanism covered above leaves structured events in a Perfetto system trace, and Perfetto's standard library provides SQL tables over
+them in <code>android.oom_adjuster</code>, <code>android.freezer</code> and <code>android.memory.lmk</code>:</p>
+<table>
+  <thead><tr><th>What</th><th>Source in the trace</th><th>Where to find it</th></tr></thead>
+  <tbody>
+    <tr><td>Each process's <code>oom_score_adj</code> over time</td><td>Kernel ftrace event <code>oom/oom_score_adj_update</code> (emitted whenever <code>/proc/&lt;pid&gt;/oom_score_adj</code> is written), or polled <code>process_stats</code></td><td>Per-process counter track <code>oom_score_adj</code>; Perfetto module <code>android.oom_adjuster</code> turns it into intervals in <code>android_oom_adj_intervals</code> with a coarse <code>bucket</code> name.</td></tr>
+    <tr><td>Which pass and event caused a score change</td><td><code>updateOomAdj_&lt;reason&gt;</code> slices on a <code>system_server</code> thread (atrace category <code>am</code>)</td><td><code>android_oom_adj_intervals</code> joins each score change to the latest enclosing or preceding update slice, exposing <code>oom_adj_reason</code> (for example <code>activityChange</code>) and <code>oom_adj_trigger</code> (the caller slice).</td></tr>
+    <tr><td><code>procState</code>, capabilities and CPU-time reasons per commit</td><td><code>process_state_changed</code> proto track event emitted by <code>applyResultsLSP</code> (Perfetto SDK category <code>proc_state</code>, behind <code>perfetto_sdk_tracing_v3</code>)</td><td>Track event carrying previous and current <code>procState</code>, <code>oom_score_adj</code>, capability bitmasks, CPU-time reason bitmasks, <code>oomAdjReason</code>, and pass sequence <code>mAdjSeq</code>.</td></tr>
+    <tr><td>Freeze and thaw intervals</td><td>Instant slices <code>Freeze &lt;name&gt;:&lt;pid&gt;</code> and <code>Unfreeze &lt;name&gt;:&lt;pid&gt; &lt;reason&gt;</code> on the <code>Freezer</code> track (atrace category <code>am</code>)</td><td><code>android_freezer_events</code> (module <code>android.freezer</code>): one row per frozen interval with <code>unfreeze_reason_int</code> and decoded <code>unfreeze_reason_str</code>.</td></tr>
+    <tr><td>Freezer policy transitions</td><td><code>updateAppFreezeStateLSP</code> instants on <code>Freezer</code> and compact state strings on <code>FreezeLite</code> when freezability or CPU-time bits change</td><td><code>slice</code> rows filtered on track names <code>Freezer</code> and <code>FreezeLite</code>.</td></tr>
+    <tr><td>Kills by <code>lmkd</code></td><td><code>lmkd</code> instant events on the <code>lowmemorykiller</code> track</td><td><code>android_lmk_events</code> (module <code>android.memory.lmk</code>), with victim <code>oom_score_adj</code> and decoded <code>kill_reason</code>.</td></tr>
+  </tbody>
+</table>
+<p>A PerfettoSQL query that lists every <code>oom_score_adj</code> interval for one app alongside the <code>OomAdjuster</code> pass that caused it:</p>
+<pre><code><span class="src">external/perfetto/…/stdlib/android/oom_adjuster.sql · android_oom_adj_intervals</span>INCLUDE PERFETTO MODULE android.oom_adjuster;
+
+SELECT ts, dur, score, bucket, oom_adj_reason, oom_adj_trigger
+FROM android_oom_adj_intervals
+WHERE process_name = 'com.example.app'
+ORDER BY ts;</code></pre>
+<p>Note that <code>bucket</code> comes from <code>android_oom_adj_score_to_bucket_name</code>, which groups scores more coarsely than
+<code>psc/Constants.java</code>: for instance, the entire visible band maps to <code>bfgs</code> and every cached score maps to
+<code>cached</code>. Inspect the numeric <code>score</code> column whenever you need the exact bands from <a href="#scales">§2</a>.</p>
+<blockquote class="key"><span class="lbl">What it means for you</span>
+Record traces with the <code>am</code> atrace category, the <code>oom/oom_score_adj_update</code> ftrace event, and (where enabled) the
+<code>proc_state</code> track-event category. A flat <code>oom_score_adj</code> paired with repeated <code>Unfreeze</code> instants points to
+the direct thaw paths in <a href="#freezer-outside">§11</a>; a score that steps up and down inside <code>updateOomAdj_*</code> slices points to
+the local adjustments in <a href="#divergences">§6</a>.
+</blockquote>
+
+<h2 id="cheatsheet"><span class="n">13</span>Cheat sheet: which field answers which question</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Question</th>
+      <th>Field or method to inspect</th>
+      <th>Rule of thumb</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>What score does a client pass across a service or provider binding?</td>
+      <td><code>client.getCurRawAdj()</code><br/><code>client.getCurRawProcState()</code></td>
+      <td>Bindings read <b>raw</b> values in step 2, so <code>BIND_ABOVE_CLIENT</code>, the <code>mMaxAdj</code> clamp and LRU laddering on the client never cascade down chains. An ordinary service binding floors the host at <code>100</code>.</td>
+    </tr>
+    <tr>
+      <td>What score was last sent to <code>lmkd</code> for this process?</td>
+      <td><code>getSetAdj()</code></td>
+      <td><code>mSetAdj</code> updates only inside <code>applyOomAdjLSP</code> alongside <code>mInjector.setOomAdj(pid, uid, curAdj, forLmkdOnly)</code>.</td>
+    </tr>
+    <tr>
+      <td>Why did the score change, and when?</td>
+      <td><code>updateOomAdj_*</code> slices<br/><code>android_oom_adj_intervals</code></td>
+      <td>The slice suffix names the <code>OOM_ADJ_REASON_*</code> trigger (<a href="#triggers">§3</a>), and <code>android_oom_adj_intervals</code> joins each kernel score write to that slice (<a href="#perfetto">§12</a>).</td>
+    </tr>
+    <tr>
+      <td>Why does <code>OomAdjuster</code> use <code>SCHED_GROUP_*</code> instead of <code>Process.THREAD_GROUP_*</code>?</td>
+      <td><code>psc/Constants.java</code><br/><code>applyResultsLSP()</code></td>
+      <td>Kernel <code>THREAD_GROUP_*</code> IDs are unordered labels, whereas <code>SCHED_GROUP_*</code> lets propagation compare groups with <code>&gt;</code> and separates <code>SCHED_GROUP_TOP_APP</code> (<code>3</code>, with UI boost) from <code>SCHED_GROUP_TOP_APP_BOUND</code> (<code>4</code>, cpuset only) before mapping both to <code>THREAD_GROUP_TOP_APP</code>.</td>
+    </tr>
+    <tr>
+      <td>Why is this background process not frozen?</td>
+      <td><code>getCurCapability()</code><br/><code>getCurCpuTimeReasons()</code></td>
+      <td>It holds <code>PROCESS_CAPABILITY_CPU_TIME</code> (explicit component/allowlist reason, or a client bound without <code>BIND_ALLOW_FREEZE</code>) or <code>PROCESS_CAPABILITY_IMPLICIT_CPU_TIME</code> (<code>adj</code> or <code>maxAdj</code> below <code>mFreezerCutoffAdj</code>), or its 10 s <code>FreezeHandler</code> debounce has not elapsed yet.</td>
+    </tr>
+    <tr>
+      <td>Can cgroup or freeze state change while <code>mSetSchedGroup</code> and <code>mSetAdj</code> stay constant?</td>
+      <td><code>SchedulingPolicyService</code><br/><code>CachedAppOptimizer</code><br/><code>unfreezeTemporarily()</code></td>
+      <td>Yes. Per-thread real-time audio boosts, deferred cgroup handler writes, queued freezes, temporary thaws for broadcasts/providers/pings, Binder retry thaws, file-lock thaws and shell/heap-dump overrides all bypass <code>OomAdjuster</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="method">Numbers and method</h2>
+<p>This page is an explainer. Its constants, flags and rules are read directly from the AOSP Android 17 sources listed below rather than from
+device benchmarks. The table collects the exact constants and defaults referenced in the text.</p>
+<table>
+  <thead><tr><th>Item</th><th>Exact value</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Update reasons</td><td>27 <code>OOM_ADJ_REASON_*</code> values (<code>0</code> through <code>26</code>, with <code>OOM_ADJ_REASON_COUNT = 27</code>), including <code>ACTIVITY</code> (1), <code>START_RECEIVER</code> (3), <code>BIND_SERVICE</code> (4), <code>GET_PROVIDER</code> (7), <code>PROCESS_END</code> (12), and <code>FOLLOW_UP</code> (23)</td><td><code>ActivityManagerInternal.java</code></td></tr>
+    <tr><td>Placeholder score in step 1</td><td><code>UNKNOWN_ADJ = 1001</code> and <code>PROCESS_STATE_CACHED_EMPTY = 19</code>, stored via <code>setIntermediateAdjLSP</code>, <code>setIntermediateProcStateLSP</code>, and <code>setIntermediateSchedGroupLSP</code></td><td><code>psc/Constants.java</code>, <code>psc/OomAdjuster.java</code></td></tr>
+    <tr><td>Shadow graph flags</td><td><code>enable_procstate_controller_computation</code> (<code>ProcStateController</code>) and <code>enable_capability_controller_computation</code> (<code>CapabilityController</code> in <code>partialUpdateProcessGraphLSP</code>); both compute in shadow without driving live outputs in Android 17</td><td><code>psc/OomAdjusterImpl.java</code>, <code>am/flags.aconfig</code></td></tr>
+    <tr><td>Restart initial score</td><td><code>mSetRawAdj</code> is copied on cleanup (<code>onCleanupApplicationRecordLSP</code>) to <code>mPrevSetRawAdj</code>, which seeds a restarted process in <code>getInitialRawAdjForHostingRecord</code> under <code>set_initial_oom_score_adj</code></td><td><code>psc/ProcessRecordInternal.java</code>, <code>psc/OomAdjuster.java</code></td></tr>
+    <tr><td>Fixed process ceilings</td><td><code>mMaxAdj</code> defaults to <code>UNKNOWN_ADJ = 1001</code>, with <code>SYSTEM_ADJ = -900</code> for <code>system_server</code>, <code>PERSISTENT_PROC_ADJ = -800</code> for persistent system apps, and <code>PERSISTENT_SERVICE_ADJ = -700</code> for system-started isolated processes</td><td><code>ProcessList.java</code>, <code>ActivityManagerService.java</code></td></tr>
+    <tr><td>Visible ladder</td><td><code>100, 101, 102 … 199</code> (<code>VISIBLE_APP_MAX_ADJ</code>) in LRU order when both <code>oomadjuster_vis_laddering</code> and <code>remove_lru_spam_prevention</code> are enabled; otherwise <code>VISIBLE_APP_MAX_ADJ = 100</code> (headless hosts stay at <code>100</code>, while visible activities add window <code>taskLayer</code> up to <code>VISIBLE_APP_LAYER_MAX = 99</code>)</td><td><code>psc/Constants.java</code>, <code>psc/OomAdjuster.java</code></td></tr>
+    <tr><td>Previous ladder</td><td><code>700, 701 … 799</code> (<code>PREVIOUS_APP_MAX_ADJ</code>) under <code>oomadjuster_prev_laddering</code></td><td><code>psc/OomAdjuster.java</code> (<code>applyLruAdjust</code>)</td></tr>
+    <tr><td>Plain service binding floor</td><td><code>VISIBLE_APP_ADJ = 100</code></td><td><code>psc/OomAdjusterImpl.java</code> (<code>computeServiceHostOomAdjLSP</code>)</td></tr>
+    <tr><td>Provider connection floor</td><td><code>FOREGROUND_APP_ADJ = 0</code></td><td><code>psc/OomAdjusterImpl.java</code> (<code>computeProviderHostOomAdjLSP</code>)</td></tr>
+    <tr><td>Above-client step</td><td>Steps the client's effective <code>curAdj</code> one band down (<code>0 → 100</code>, <code>100 → 200</code>, and so on) while <code>curRawAdj</code> stays unchanged</td><td><code>psc/OomAdjuster.java</code> (<code>applyBindAboveClientToAdj</code>)</td></tr>
+    <tr><td>Provider retain hold</td><td><code>DEFAULT_CONTENT_PROVIDER_RETAIN_TIME = 20_000</code> ms at <code>PREVIOUS_APP_ADJ = 700</code> (<code>adjType = "recent-provider"</code>)</td><td><code>ActivityManagerConstants.java</code>, <code>psc/OomAdjusterImpl.java</code></td></tr>
+    <tr><td>Service callback score</td><td><code>FOREGROUND_APP_ADJ = 0</code> with <code>PROCESS_STATE_SERVICE = 10</code> while <code>hasExecutingServices()</code> is true, using <code>SCHED_GROUP_DEFAULT</code> when <code>isExecServicesFg()</code> is true and <code>SCHED_GROUP_BACKGROUND</code> otherwise</td><td><code>psc/OomAdjusterImpl.java</code> (<code>computeOomAdjLSP</code>)</td></tr>
+    <tr><td>OomAdjuster CPU groups</td><td><code>SCHED_GROUP_UNDEFINED = Integer.MIN_VALUE</code>, <code>BACKGROUND = 0</code>, <code>RESTRICTED = 1</code>, <code>DEFAULT = 2</code>, <code>TOP_APP = 3</code>, <code>TOP_APP_BOUND = 4</code>, <code>FOREGROUND_WINDOW = 5</code></td><td><code>psc/Constants.java</code></td></tr>
+    <tr><td>Kernel thread-group IDs</td><td><code>THREAD_GROUP_DEFAULT = -1</code>, <code>BACKGROUND = 0</code>, <code>TOP_APP = 5</code>, <code>RESTRICTED = 7</code>, <code>FOREGROUND_WINDOW = 8</code> (plus <code>SYSTEM = 2</code>, <code>AUDIO_APP = 3</code>, <code>AUDIO_SYS = 4</code>, <code>RT_APP = 6</code>)</td><td><code>Process.java</code></td></tr>
+    <tr><td>Top-app UI boost</td><td><code>THREAD_PRIORITY_TOP_APP_BOOST = -10</code>, or <code>SCHED_FIFO</code> when UI FIFO scheduling is enabled</td><td><code>psc/OomAdjuster.java</code> (<code>applyResultsLSP</code>)</td></tr>
+    <tr><td>Cold-start top-app hint</td><td><code>--is-top-app</code> (<code>Zygote.START_AS_TOP_APP_ARG</code>) runs native <code>SetSchedulerPolicy</code> into <code>SP_TOP_APP</code> at fork, followed by <code>TOP</code> state on attach</td><td><code>ProcessList.java</code>, <code>com_android_internal_os_Zygote.cpp</code></td></tr>
+    <tr><td>Media scheduling boosts</td><td><code>requestPriority(pid, tid, prio, isForApp)</code> sets <code>THREAD_GROUP_RT_APP</code> or <code>THREAD_GROUP_AUDIO_SYS</code> with <code>SCHED_FIFO</code> (<code>1 ≤ prio ≤ 3</code>); <code>requestCpusetBoost</code> moves native <code>media.codec</code> to <code>THREAD_GROUP_TOP_APP</code></td><td><code>SchedulingPolicyService.java</code></td></tr>
+    <tr><td>Freezer debounce</td><td><code>config_defaultFreezerDebounceTimeout = 10_000</code> ms, overridable via <code>DeviceConfig</code> <code>freezer_debounce_timeout</code></td><td><code>config.xml</code>, <code>CachedAppOptimizer.java</code></td></tr>
+    <tr><td>Freezer cutoff</td><td><code>CACHED_APP_MIN_ADJ = 900</code> by default, or <code>HOME_APP_ADJ = 600</code> under <code>prototype_aggressive_freezing</code> (<code>mFreezerCutoffAdj</code>)</td><td><code>ActivityManagerConstants.java</code>, <code>psc/OomAdjuster.java</code></td></tr>
+    <tr><td>Freezer cgroup write</td><td><code>1</code> written to cgroup v2 <code>cgroup.freeze</code> via the <code>Frozen</code> task profile</td><td><code>task_profiles.json</code></td></tr>
+    <tr><td>Unfreeze reason codes</td><td><code>NONE</code> (0), <code>ACTIVITY</code> (1), <code>FINISH_RECEIVER</code> (2), <code>START_RECEIVER</code> (3), <code>GET_PROVIDER</code> (7), <code>PING</code> (15), <code>FILE_LOCKS</code> (16), <code>BINDER_TXNS</code> (18), <code>FEATURE_FLAGS</code> (19), <code>SHELL</code> (23)</td><td><code>CachedAppOptimizer.java</code>, <code>stdlib/android/freezer.sql</code></td></tr>
+    <tr><td>Perfetto buckets</td><td><code>&lt; 0 → system</code>, <code>0–99 → foreground</code>, <code>100–199 → bfgs</code>, <code>200 → foreground_service</code>, <code>201–249 → job</code>, <code>250–899 → background</code>, <code>900+ → cached</code></td><td><code>stdlib/android/oom_adjuster.sql</code></td></tr>
+  </tbody>
+</table>
+
+<h2 id="sources">Sources</h2>
+<p class="m">All paths are in AOSP as of Android 17.</p>
+<ul>
+  <li><code>OomAdjuster</code> engine (<code>psc</code>): <code>frameworks/base/services/core/java/com/android/server/am/psc/OomAdjusterImpl.java</code> (<code>fullUpdateLSP</code>, <code>partialUpdateLSP</code>, <code>partialUpdateProcessGraphLSP</code>, <code>computeConnectionsLSP</code>, <code>forEachConnectionLSP</code>, <code>computeOomAdjLSP</code>, <code>computeServiceHostOomAdjLSP</code>, <code>computeProviderHostOomAdjLSP</code>), <code>frameworks/base/services/core/java/com/android/server/am/psc/OomAdjuster.java</code> (<code>updateOomAdjLocked</code>, <code>oomAdjReasonToString</code>, <code>applyLruAdjust</code>, <code>setIntermediateAdjLSP</code>, <code>applyBindAboveClientToAdj</code>, <code>getInitialRawAdjForHostingRecord</code>, <code>getDefaultCapability</code>, <code>getCpuTimeReasons</code>, <code>getCpuCapability</code>, <code>getImplicitCpuCapability</code>, <code>getFreezePolicy</code>, <code>updateAppFreezeStateLSP</code>, <code>applyOomAdjLSP</code>, <code>applyResultsLSP</code>, <code>setAttachingProcessStatesLSP</code>, connection skip checks).</li>
+  <li><code>psc</code> state, constants and controllers: <code>frameworks/base/services/core/java/com/android/server/am/psc/ProcessRecordInternal.java</code> (raw, cur, set, rep, max and cached fields, <code>resetCachedInfo</code>, <code>onCleanupApplicationRecordLSP</code>), <code>frameworks/base/services/core/java/com/android/server/am/psc/Constants.java</code> (<code>*_ADJ</code> bands and <code>SCHED_GROUP_*</code> constants), <code>frameworks/base/services/core/java/com/android/server/am/psc/ProcessStateController.java</code> (<code>runFullUpdate</code>, <code>runUpdate</code>, <code>runPendingUpdate</code>, batch sessions, <code>setMaxAdj</code>), <code>frameworks/base/services/core/java/com/android/server/am/psc/ProcStateController.java</code>, <code>frameworks/base/services/core/java/com/android/server/am/psc/CapabilityController.java</code>, <code>frameworks/base/services/core/java/com/android/server/am/psc/ProcessServiceRecordInternal.java</code> (<code>updateHasAboveClient</code>, <code>hasExecutingServices</code>), <code>frameworks/base/services/core/java/com/android/server/am/psc/ConnectionRecordInternal.java</code> (<code>BIND_ALLOW_FREEZE</code> and capability transmission).</li>
+  <li>Activity manager &amp; freezer: <code>frameworks/base/services/core/java/com/android/server/am/CachedAppOptimizer.java</code> (<code>freezeAppAsyncLSP</code>, <code>unfreezeTemporarily</code>, <code>unfreezeAppLSP</code>, <code>FreezeHandler.freezeProcess</code>, <code>handleBinderFreezerFailure</code>, <code>binderError</code>, <code>onBlockingFileLock</code>, <code>enableFreezer</code>, <code>UNFREEZE_REASON_*</code>), <code>frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java</code> (<code>onProcessFreezabilityChanged</code>, <code>unfreezeTemporarily</code>, <code>setProcessGroup</code>, <code>onProcessGroupUpdated</code>, <code>dumpHeap</code>, <code>enableAppFreezer</code>), <code>frameworks/base/services/core/java/com/android/server/am/ProcessList.java</code> (<code>setOomAdj</code>, <code>batchSetOomAdj</code>, <code>LMK_PROCPRIO</code>, <code>setMaxAdj</code>, <code>startProcess</code>), <code>frameworks/base/services/core/java/com/android/server/am/ActivityManagerConstants.java</code> (<code>DEFAULT_FREEZER_CUTOFF_ADJ</code>, <code>DEFAULT_CONTENT_PROVIDER_RETAIN_TIME</code>), <code>frameworks/base/services/core/java/com/android/server/am/ActivityManagerShellCommand.java</code> (<code>am freeze</code>, <code>am unfreeze</code>), <code>frameworks/base/services/core/java/com/android/server/am/flags.aconfig</code>.</li>
+  <li>Framework enums, Zygote &amp; scheduling: <code>frameworks/base/core/java/android/app/ActivityManager.java</code>, <code>frameworks/base/core/java/android/app/ProcessStateEnum.aidl</code>, <code>frameworks/base/core/java/android/app/ActivityManagerInternal.java</code> (<code>PROCESS_STATE_*</code>, <code>PROCESS_CAPABILITY_*</code>, <code>OOM_ADJ_REASON_*</code>), <code>frameworks/base/core/java/android/os/Process.java</code> and <code>frameworks/base/core/jni/android_util_Process.cpp</code> (<code>THREAD_GROUP_*</code>, <code>THREAD_PRIORITY_TOP_APP_BOOST</code>, <code>setProcessGroup</code>), <code>frameworks/base/core/jni/com_android_internal_os_Zygote.cpp</code> (<code>SetSchedulerPolicy</code> for <code>--is-top-app</code>), <code>frameworks/base/services/core/java/com/android/server/os/SchedulingPolicyService.java</code> (<code>requestPriority</code>, <code>requestCpusetBoost</code>), <code>frameworks/base/core/res/res/values/config.xml</code> (<code>config_defaultFreezerDebounceTimeout</code>).</li>
+  <li>Low-memory killer &amp; cgroup profiles: <code>system/memory/lmkd/lmkd.cpp</code> (<code>cmd_procprio</code>, <code>/proc/&lt;pid&gt;/oom_score_adj</code> writes, <code>find_and_kill_process</code>), <code>system/core/libprocessgroup/sched_policy.cpp</code> and <code>system/core/libprocessgroup/profiles/task_profiles.json</code> (cpuset policies and the <code>Frozen</code> profile writing <code>cgroup.freeze</code>).</li>
+  <li>Perfetto trace processor &amp; stdlib: <code>external/perfetto/src/trace_processor/perfetto_sql/stdlib/android/oom_adjuster.sql</code> (<code>android_oom_adj_intervals</code>, <code>android_oom_adj_score_to_bucket_name</code>), <code>external/perfetto/src/trace_processor/perfetto_sql/stdlib/android/freezer.sql</code> (<code>android_freezer_events</code>), <code>external/perfetto/src/trace_processor/perfetto_sql/stdlib/android/memory/lmk.sql</code> (<code>android_lmk_events</code>), <code>external/perfetto/src/trace_processor/importers/ftrace/ftrace_parser.cc</code> and <code>external/perfetto/src/trace_processor/importers/common/tracks_common.h</code> (<code>oom_score_adj</code> counter track).</li>
+</ul>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>

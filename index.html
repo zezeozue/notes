@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Notes on Android and Perfetto internals</title>
-<meta name="description" content="Long-form explainers on the Android runtime, native memory, the input and display pipeline, Kotlin coroutines and Perfetto's trace processor." />
+<meta name="description" content="Long-form explainers on the Android runtime, native memory, process ranking and freezing, the input and display pipeline, Kotlin coroutines and Perfetto's trace processor." />
 <meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
 <meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
 <link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
@@ -18,7 +18,7 @@
 </div>
 
 <h1>Notes on Android and Perfetto internals</h1>
-<p class="subtitle">Long-form explainers on the Android runtime, native memory and Parcel, the path from a touch to pixels,
+<p class="subtitle">Long-form explainers on the Android runtime, native memory and Parcel, process ranking and freezing, the path from a touch to pixels,
 Kotlin coroutines, and how Perfetto's trace processor works. Each note opens with an “At a glance” summary
 and explains the rest with figures and tables.</p>
 
@@ -43,6 +43,11 @@ and explains the rest with figures and tables.</p>
     <span class="note-title">How Parcel holds native memory: its buffers, the copy a Binder call makes, and what keeps that copy alive in system_server</span>
     <span class="note-sub">How a Parcel lays out and grows its buffers, how a Binder call and a Bundle copy them into malloc, and which system_server structures keep app payloads alive.</span>
     <span class="note-meta">Parcel · Binder · Bundle · system_server</span>
+  </a></li>
+  <li><a href="oom_adjuster/index.html">
+    <span class="note-title">How Android decides which processes to kill, slow down or freeze</span>
+    <span class="note-sub">How OomAdjuster ranks processes across service and provider bindings, keeps raw and committed copies of each score, drives lmkd, cgroups and the cached-app freezer, and shows up in Perfetto.</span>
+    <span class="note-meta">oom_score_adj · procState · sched groups · freezer · Perfetto</span>
   </a></li>
 </ul>
 
@@ -81,7 +86,6 @@ and explains the rest with figures and tables.</p>
 
 <footer class="site-foot">
   <span>Plain HTML, CSS and a little JavaScript. Works offline.</span>
-  <span>License: see the LICENSE file in the repository.</span>
 </footer>
 </main>
 </body>
