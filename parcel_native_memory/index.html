@@ -999,7 +999,7 @@ This section follows one real call to see where that memory comes from: an app c
 <p><b>The mechanism.</b> Every process that opens <code>/dev/binder</code> maps a read-only <b>Binder buffer</b> of <code>BINDER_VM_SIZE = 1 MiB - 2 * PAGE_SIZE</code> (1,016&nbsp;KiB with 4&nbsp;KiB pages), set up in <code>ProcessState.cpp</code>.
 When the app calls <code>transact()</code>, the driver copies the Parcel's bytes (<code>mData</code>) once, straight into a slice of <code>system_server</code>'s buffer.
 While copying, it walks <code>mObjects</code>, the list of offsets where special records sit, and rewrites each one: a local Binder object (<code>BINDER_TYPE_BINDER</code>) becomes a handle (<code>BINDER_TYPE_HANDLE</code>), and for each file descriptor record (<code>BINDER_TYPE_FD</code>) it opens the same file in <code>system_server</code>'s fd table and writes the new number, here 94.</p>
-<p>A <code>system_server</code> Binder thread then wakes up. In <code>IPCThreadState.cpp</code>, <code>executeCommand(BR_TRANSACTION)</code> (the handler for an incoming call) wraps the slice in a Parcel that is a local variable on the thread's stack, using <code>ipcSetDataReference(..., freeBuffer)</code>. That Parcel borrows the bytes: it allocates nothing, and its release function is <code>freeBuffer</code>, which hands the slice back to the kernel (cell D in Figure&nbsp;1).</p>
+<p>A <code>system_server</code> Binder thread then wakes up. In <code>IPCThreadState.cpp</code>, <code>executeCommand(BR_TRANSACTION)</code> (the handler for an incoming call) wraps the slice in a Parcel that is a local variable on the thread's stack, using <code>ipcSetDataReference(..., freeBuffer)</code>. That Parcel borrows the bytes: it allocates nothing, and its release function is <code>freeBuffer</code>, which hands the slice back to the kernel (cell D in Figure&nbsp;1b).</p>
 
 <p><b>What it means for memory.</b> The request itself costs <code>system_server</code> no native heap at all. Whatever shows up in <code>malloc</code> later was created by code that copied data out of this slice.</p>
 
@@ -1081,90 +1081,112 @@ mParcelledData = p; <span class="c">// State 1: mMap remains null until any key 
 </details>
 
 <h3>When the copy is freed: the story of one unread entry</h3>
-<p><b>The problem.</b> <code>system_server</code> cannot simply decode the copy. The Bundle may contain the app's own <code>Parcelable</code> classes, and <code>system_server</code> does not have the app's <code>ClassLoader</code> to find them. Running untrusted app constructors inside <code>system_server</code> would also open the door to deserialization exploits. So the Bundle decodes as little as it can, as late as it can. The question is: when does Parcel P get freed?</p>
+<p><b>The problem.</b> <code>system_server</code> cannot eagerly decode an app's <code>Bundle</code>: it lacks the app's <code>ClassLoader</code> for custom <code>Parcelable</code> classes, and running untrusted constructors in <code>system_server</code> would invite deserialization exploits. So a <code>Bundle</code> decodes only what is asked for and skips the rest. When does its heap <code>Parcel P</code> actually get freed?</p>
 
-<p><b>The mechanism, as a story.</b> Follow our notification's extras through two entries: <code>"android.title"</code> (text) and <code>"android.picture"</code> (the Bitmap).</p>
-<ol>
-  <li><b>It arrives.</b> The Bundle is just Parcel P. Nothing is decoded: <code>mParcelledData</code> points at P, and the map of decoded values, <code>mMap</code>, is <code>null</code>. This is <i>State 1</i>. Questions that need no decoding still work: <code>hasFileDescriptors()</code> scans P in C++.</li>
-  <li><b>Someone reads one key.</b> The first <code>get*()</code> call runs <code>initializeFromParcelLocked()</code>, which walks P entry by entry (<code>Parcel.readArrayMap()</code>). The title is decoded on the spot. The picture is a <code>Parcelable</code>, so its bytes start with a type tag and a byte length (Figure&nbsp;7a). <code>Parcel.readLazyValue()</code> reads those two numbers, jumps over the payload without loading any class, and stores a placeholder, a <code>LazyValue</code>, in the map instead.</li>
-  <li><b>The placeholder pins P.</b> A <code>LazyValue</code> remembers where its bytes are: the source Parcel (<code>mSource</code>), a position and a length. That strong reference keeps all of P alive, including the title bytes that were already decoded, and fd&nbsp;95. The Bundle itself now holds P only weakly (<code>mParcelledData = null</code>, <code>mWeakParcelledData</code> = a <code>WeakReference</code> to P). This is <i>State 2b</i>.</li>
-</ol>
-<p>From here, the picture entry has three possible endings (Figure&nbsp;7b):</p>
-<ul>
-  <li><b>It gets read.</b> <code>getParcelable("android.picture")</code> calls <code>LazyValue.apply()</code>, which decodes the Bitmap and drops <code>mSource</code>. The map now holds the real object, and the Bundle's count of unread placeholders (<code>mLazyValues</code>) drops to 0. Because this Bundle owns its placeholders, it destroys P right away. This is <i>State 3</i>.</li>
-  <li><b>It is never read.</b> P, with every byte and fd&nbsp;95, lives as long as the Bundle does, and is freed only when the garbage collector finalizes it.</li>
-  <li><b>The Bundle was copied first.</b> <code>new Bundle(src)</code> on a decoded Bundle shares the same <code>LazyValue</code> objects between both maps and marks both Bundles as not owning them (<code>setOwnsLazyValues(false)</code>). Neither may destroy P, even after every entry is read, so P waits for GC and finalization. This is <i>State 4</i>.</li>
-</ul>
-<p>If no entry needed a placeholder (only primitives, strings and nested Bundles), the Bundle recycles P during the first read and nothing is pinned (<i>State 2a</i>).</p>
+<p><b>The pointer handoff (Figure&nbsp;7a).</b> Follow our notification's extras—<code>"android.title"</code> (a string) and <code>"android.picture"</code> (the 2&nbsp;MB <code>Bitmap</code>). On arrival (<i>State&nbsp;1</i>), nothing is decoded and the <code>Bundle</code> itself strongly owns <code>P</code> via <code>mParcelledData</code>. Calling <code>getString("android.title")</code> decodes the title, sees that the picture is length-prefixed (<code>L</code> bytes), jumps over those <code>L</code> bytes in <i>O</i>(1) without loading any class, and inserts a <code>Parcel.LazyValue</code> placeholder into <code>mMap</code> (<i>State&nbsp;2b</i>). The <code>Bundle</code> drops its own strong reference to weak, <b>but <code>LazyValue.mSource</code> now strongly pins all of <code>P</code></b>—including the already-decoded title bytes and <code>fd&nbsp;95</code>.</p>
 
 <figure>
-<figcaption><b>Figure 7. One unread entry keeps the whole copy alive.</b> (a) A length-prefixed entry lets <code>readLazyValue()</code> skip the Bitmap without decoding it, leaving a <code>LazyValue</code> that points back at P. (b) P is freed promptly only if that entry is eventually read by a Bundle that owns it; otherwise it waits for GC, with fd&nbsp;95 and the 2&nbsp;MB <code>memfd</code> still open.</figcaption>
-<svg viewBox="0 0 760 410" role="img" aria-label="Wire layout of a lazy Parcelable entry in Parcel P, and the three endings of a LazyValue: read and freed, never read, or shared after a copy">
-  <text x="10" y="18" class="th">a · inside parcel p: what readLazyValue() skips</text>
-  <rect x="10" y="28" width="164" height="56" rx="2" fill="url(#hatchr)" stroke="var(--bad-bd)"/>
-  <text x="92" y="50" class="tb tr" text-anchor="middle">"android.title"</text>
-  <text x="92" y="70" class="ts" text-anchor="middle">decoded; bytes stay</text>
-  <rect x="178" y="28" width="150" height="56" rx="2" class="b"/>
-  <text x="253" y="50" class="tb" text-anchor="middle">key</text>
-  <text x="253" y="70" class="tms" text-anchor="middle">"android.picture"</text>
-  <rect x="332" y="28" width="92" height="56" rx="2" class="bv"/>
-  <text x="378" y="50" class="tb tv" text-anchor="middle">type</text>
-  <text x="378" y="70" class="tms" text-anchor="middle">PARCELABLE</text>
-  <rect x="428" y="28" width="92" height="56" rx="2" class="bv"/>
-  <text x="474" y="50" class="tb tv" text-anchor="middle">length</text>
-  <text x="474" y="70" class="tms" text-anchor="middle">L bytes</text>
-  <rect x="524" y="28" width="226" height="56" rx="2" class="bw"/>
-  <text x="637" y="50" class="tb tw" text-anchor="middle">payload: L bytes</text>
-  <text x="637" y="70" class="tms" text-anchor="middle">Bitmap + fd 95 record</text>
-  <path d="M524,92 L524,100 L750,100 L750,92" class="lnv"/>
-  <text x="637" y="118" class="ts tv" text-anchor="middle">jumped over in O(1), no class loaded</text>
-  <text x="10" y="146" class="tms">map entry = LazyValue { mSource = P, position, length, type }</text>
+<figcaption><b>Figure 7a. Reading one key flips who pins <code>Parcel P</code>.</b> On arrival (left), the <code>Bundle</code> holds <code>P</code> directly. Reading <code>"android.title"</code> (right) jumps over the length-prefixed <code>Bitmap</code> in <i>O</i>(1) and drops a <code>LazyValue</code> into <code>mMap</code> whose strong <code>mSource</code> arrow keeps the entire buffer and <code>fd&nbsp;95</code> alive.</figcaption>
+<svg viewBox="0 0 760 288" role="img" aria-label="State 1 Bundle owns Parcel P via mParcelledData; after reading one key in State 2b, Bundle holds only a weak reference while LazyValue.mSource strongly pins all of Parcel P and fd 95">
+  <text x="10" y="18" class="th">a · state 1 · on arrival (0 keys decoded)</text>
+  <rect x="10" y="26" width="318" height="250" rx="3" class="panel"/>
 
-  <text x="10" y="178" class="th">b · the picture entry's story</text>
-  <rect x="10" y="188" width="190" height="96" rx="3" class="ba"/>
-  <text x="22" y="209" class="tb ta">Arrives (State 1)</text>
-  <text x="22" y="229" class="tms">mParcelledData = P</text>
-  <text x="22" y="247" class="tms">mMap = null</text>
-  <text x="22" y="270" class="ts">nothing decoded</text>
-  <path d="M200,236 L278,236" class="lna" marker-end="url(#aha)"/>
-  <text x="239" y="228" class="tms ta" text-anchor="middle">get*()</text>
+  <rect x="22" y="40" width="294" height="54" rx="3" class="ba"/>
+  <text x="34" y="60" class="tb ta">BaseBundle</text>
+  <text x="34" y="79" class="tms">mParcelledData ──► P  ·  mMap = null</text>
 
-  <rect x="280" y="188" width="210" height="96" rx="3" class="br"/>
-  <text x="292" y="209" class="tb tr">One key read (2b)</text>
-  <text x="292" y="229" class="tms">title → String</text>
-  <text x="292" y="247" class="tms">picture → LazyValue</text>
-  <text x="292" y="270" class="ts">LazyValue.mSource → P</text>
+  <path d="M169,94 L169,124" class="lna" marker-end="url(#aha)"/>
+  <text x="180" y="114" class="tms ta">strong</text>
 
-  <path d="M490,220 L528,214" class="lng" marker-end="url(#ahg)"/>
-  <path d="M490,240 L528,286" class="lnr" marker-end="url(#ahr)"/>
-  <path d="M490,262 L528,358" class="lnw" marker-end="url(#ahw)"/>
+  <rect x="22" y="126" width="294" height="136" rx="3" class="b"/>
+  <text x="34" y="147" class="tb">Parcel P (in malloc)</text>
+  <rect x="34" y="158" width="76" height="44" rx="2" class="ba"/>
+  <text x="72" y="177" class="tb ta" text-anchor="middle">"title"</text>
+  <text x="72" y="193" class="tms" text-anchor="middle">String</text>
+  <rect x="114" y="158" width="84" height="44" rx="2" class="bv"/>
+  <text x="156" y="177" class="tb tv" text-anchor="middle">tag + L</text>
+  <text x="156" y="193" class="tms" text-anchor="middle">8 B hdr</text>
+  <rect x="202" y="158" width="102" height="44" rx="2" class="bw"/>
+  <text x="253" y="177" class="tb tw" text-anchor="middle">Bitmap</text>
+  <text x="253" y="193" class="tms" text-anchor="middle">+ fd 95</text>
+  <text x="34" y="224" class="ts">hasFileDescriptors() scans P in C++</text>
+  <text x="34" y="242" class="ts">without decoding or loading classes.</text>
 
-  <rect x="530" y="188" width="220" height="64" rx="3" class="bg"/>
-  <text x="542" y="208" class="tb tg">Read: P freed at once</text>
-  <text x="542" y="226" class="ts">apply() decodes, mLazyValues = 0,</text>
-  <text x="542" y="242" class="ts">so P.destroy() runs (State 3)</text>
+  <path d="M332,150 L412,150" class="lnr" marker-end="url(#ahr)"/>
+  <text x="372" y="138" class="tms tr" text-anchor="middle">get*()</text>
+  <text x="372" y="168" class="ts" text-anchor="middle">skips L</text>
+  <text x="372" y="183" class="ts" text-anchor="middle">in O(1)</text>
 
-  <rect x="530" y="260" width="220" height="64" rx="3" class="br"/>
-  <text x="542" y="280" class="tb tr">Never read: P pinned</text>
-  <text x="542" y="298" class="ts">all of P and fd 95 live until</text>
-  <text x="542" y="314" class="ts">the Bundle is gone and GC runs</text>
+  <text x="418" y="18" class="th">b · state 2b · after reading "title"</text>
+  <rect x="418" y="26" width="332" height="250" rx="3" class="panel"/>
 
-  <rect x="530" y="332" width="220" height="64" rx="3" class="bw"/>
-  <text x="542" y="352" class="tb tw">Copied: P waits for GC</text>
-  <text x="542" y="370" class="ts">copies share the LazyValues, so</text>
-  <text x="542" y="386" class="ts">neither destroys P (State 4)</text>
+  <rect x="430" y="40" width="308" height="88" rx="3" class="b"/>
+  <text x="442" y="59" class="tb">BaseBundle · mMap</text>
+  <rect x="442" y="68" width="136" height="50" rx="2" class="bg"/>
+  <text x="510" y="88" class="tb tg" text-anchor="middle">"title"</text>
+  <text x="510" y="106" class="tms" text-anchor="middle">decoded String</text>
+  <rect x="586" y="68" width="140" height="50" rx="2" class="br"/>
+  <text x="656" y="88" class="tb tr" text-anchor="middle">"picture"</text>
+  <text x="656" y="106" class="tms" text-anchor="middle">LazyValue</text>
 
-  <rect x="10" y="300" width="480" height="96" rx="3" class="b0"/>
-  <text x="22" y="322" class="ts">No lazy entries at all? P is recycled at the first read (2a).</text>
-  <text x="22" y="342" class="ts">Copied before any read? appendFrom runs again:</text>
-  <text x="22" y="358" class="ts">a second malloc and a second fd.</text>
-  <text x="22" y="382" class="ts">system_server rarely reads app Parcelables, so "never read" is common.</text>
+  <path d="M484,128 L484,166" class="ln" stroke-dasharray="3 3" marker-end="url(#ah)"/>
+  <text x="492" y="152" class="ts">weak</text>
+
+  <path d="M656,118 L656,166" class="lnr" marker-end="url(#ahr)"/>
+  <text x="646" y="152" class="tms tr" text-anchor="end">mSource (strong)</text>
+
+  <rect x="430" y="168" width="308" height="94" rx="3" class="br"/>
+  <text x="442" y="189" class="tb tr">Entire Parcel P stays pinned</text>
+  <text x="442" y="209" class="tms">[ dead "title" | Bitmap + fd 95 ]</text>
+  <text x="442" y="231" class="ts">One LazyValue keeps every byte of P</text>
+  <text x="442" y="248" class="ts">and the 2 MB memfd (fd 95) open.</text>
 </svg>
 </figure>
 
-<p><b>Why it is built that way.</b> Skipping is safe and cheap: thanks to the length prefix, <code>system_server</code> never runs app code and never needs the app's class loader. The cost is that a skipped entry cannot exist on its own. It is only a window into P, so it must keep P alive. When the Bundle is sent onward, the window is copied back out with <code>appendFrom()</code>, still without decoding.</p>
+<p><b>Four fates for <code>Parcel P</code> (Figure&nbsp;7b).</b> Eager cleanup happens only when there were no lazy entries (<i>State&nbsp;2a</i>) or when an uncopied <code>Bundle</code> reads its last <code>LazyValue</code> (<i>State&nbsp;3</i>, calling <code>P.destroy()</code> immediately). In <code>system_server</code>, two sticky paths dominate instead: either nobody ever reads the app's <code>Parcelable</code> (keeping <code>P</code> pinned for the holder's whole lifetime), or code clones the decoded <code>Bundle</code> via <code>new Bundle(src)</code> (<i>State&nbsp;4</i>), which shares the <code>LazyValue</code> instances across both maps and marks neither <code>Bundle</code> allowed to destroy <code>P</code>—forcing cleanup to wait for GC and <code>finalize()</code>.</p>
 
-<p><b>What it means for memory.</b> <code>system_server</code> typically reads a few simple keys and leaves app <code>Parcelable</code>s alone, so "never read" is the common ending. Each such Bundle holds its full <code>appendFrom()</code> copy and every duplicated fd for as long as the record holding it lives, for example <code>ActivityRecord.mIcicle</code> (saved activity state) or <code>PendingIntentRecord.Key.requestIntent.mExtras</code>. That is how one allocation site comes to hold a large share of <code>system_server</code>'s unreleased native heap. §3 lists the records that hold these Bundles.</p>
+<figure>
+<figcaption><b>Figure 7b. All four fates of <code>Parcel P</code> after arrival.</b> Top and upper-right (green) free <code>P</code> deterministically. Lower-right (red and purple) are the paths hit in <code>system_server</code>: an unread entry pins <code>P</code> for hours, and cloning a partially decoded <code>Bundle</code> disables eager destruction even if every entry is later read.</figcaption>
+<svg viewBox="0 0 760 284" role="img" aria-label="State machine from State 1 Arrival to State 2a immediate recycle, or State 2b LazyValue fanning out to State 3 immediate destroy, Never read pinned for hours, or State 4 cloned waiting for GC">
+  <rect x="10" y="96" width="154" height="84" rx="3" class="ba"/>
+  <text x="22" y="119" class="tb ta">State 1 · Arrival</text>
+  <text x="22" y="139" class="tms">mParcelledData = P</text>
+  <text x="22" y="157" class="ts">0 keys decoded</text>
+
+  <path d="M164,116 L224,48" class="lng" marker-end="url(#ahg)"/>
+  <path d="M164,154 L224,182" class="lnw" marker-end="url(#ahw)"/>
+  <text x="192" y="64" class="tms tg" text-anchor="end">get*()</text>
+
+  <rect x="226" y="16" width="524" height="56" rx="3" class="bg"/>
+  <text x="238" y="38" class="tb tg">State 2a · Primitives / Strings only → P.recycle() immediately</text>
+  <text x="238" y="57" class="ts">No LazyValues created; mData and mObjects are freed during the first read.</text>
+
+  <rect x="226" y="140" width="190" height="92" rx="3" class="bw"/>
+  <text x="238" y="162" class="tb tw">State 2b · LazyValue</text>
+  <text x="238" y="182" class="tms">mLazyValues &gt; 0</text>
+  <text x="238" y="200" class="tms">mSource ──► P</text>
+  <text x="238" y="218" class="ts">pins P + fd 95</text>
+
+  <path d="M416,162 L476,116" class="lng" marker-end="url(#ahg)"/>
+  <path d="M416,186 L476,186" class="lnr" marker-end="url(#ahr)"/>
+  <path d="M416,210 L476,252" class="lnv" marker-end="url(#ahv)"/>
+
+  <rect x="478" y="86" width="272" height="56" rx="3" class="bg"/>
+  <text x="490" y="107" class="tb tg">State 3 · Entry read → P.destroy()</text>
+  <text x="490" y="126" class="ts">apply() drops mSource; freed at once.</text>
+
+  <rect x="478" y="154" width="272" height="60" rx="3" class="br"/>
+  <text x="490" y="175" class="tb tr">Never read → P pinned for hours</text>
+  <text x="490" y="193" class="ts">Common in system_server; waits until</text>
+  <text x="490" y="208" class="ts">holder drops Bundle + GC + finalize().</text>
+
+  <rect x="478" y="226" width="272" height="50" rx="3" class="bv"/>
+  <text x="490" y="246" class="tb tv">State 4 · Cloned → waits for GC</text>
+  <text x="490" y="264" class="ts">new Bundle(src) clears ownership on both.</text>
+</svg>
+</figure>
+
+<p><b>What it means for memory.</b> <code>system_server</code> reads simple routing keys and leaves app <code>Parcelables</code> untouched, so the red middle branch is the everyday case. Each such Bundle holds its full <code>appendFrom()</code> copy and every duplicated fd for as long as the record holding it lives (for example <code>ActivityRecord.mIcicle</code> or <code>PendingIntentRecord</code>). §3 lists the records that hold these Bundles.</p>
 
 <details><summary>Details: BaseBundle fields and lazy value types</summary>
 <p>The state is spread over five fields: <code>mParcelledData</code> (strong reference to P while undecoded), <code>mMap</code> (decoded entries and placeholders), <code>mWeakParcelledData</code> (weak reference to P after decoding), <code>mLazyValues</code> (count of placeholders not yet unwrapped), and the <code>FLAGS_OWNS_LAZY_VALUES</code> flag, read by <code>ownsLazyValues()</code>.</p>
@@ -1397,7 +1419,7 @@ When the record is created, <code>system_server</code> copies the incoming <code
 </details>
 
 <h3>Saved activity state is kept so a killed app can come back</h3>
-<p><b>The case.</b> A user opens a shopping app, browses, then presses Home. The activity stops, and its <code>onSaveInstanceState()</code> <code>Bundle</code> (say 64&nbsp;KiB) is sent to <code>system_server</code>. Later <code>lmkd</code> kills the cached process. When the user returns, Android starts a new process and recreates the activity from that saved <code>Bundle</code>.</p>
+<p>When a user presses Home, the stopped activity sends its <code>onSaveInstanceState()</code> <code>Bundle</code> to <code>system_server</code> so Android can kill the cached process and still restore the screen later (Figure 11). <code>activityStopped()</code> verifies <code>!icicle.hasFileDescriptors()</code> on the raw bytes without unparcelling—refusing FDs because the state must stay valid without the app—and stores the 100% parcelled buffer in <code>ActivityRecord.mIcicle</code> until <code>activityResumedLocked()</code> clears it or the activity finishes. Sources: <code>ActivityRecord.java</code>, <code>ActivityClientController.java</code>.</p>
 
 <figure>
 <figcaption><b>Figure 11. Saved state lives in <code>system_server</code> for exactly the time the app cannot hold it.</b> The <code>Bundle</code> arrives when the activity stops, outlives the killed process, is handed to the new process, and is dropped when the activity resumes.</figcaption>
@@ -1441,33 +1463,83 @@ When the record is created, <code>system_server</code> copies the incoming <code
 </svg>
 </figure>
 
-<p><b>The mechanism.</b> When the activity stops, <code>activityStopped()</code> checks that the <code>Bundle</code> contains no file descriptors (<code>!icicle.hasFileDescriptors()</code>, answered from the raw bytes without unparcelling). It then stores it as <code>ActivityRecord.mIcicle</code>, still completely parcelled, next to <code>ActivityRecord.intent</code>.
-When the activity resumes, <code>activityResumedLocked()</code> calls <code>setSavedState(null)</code> and the copy is released. Finishing or destroying the activity releases it too.</p>
-<p><b>Why.</b> Keeping state after the process dies is the whole purpose: it lets Android kill cached apps for memory and still restore them. <code>system_server</code> never reads the state, it only hands it back, so it never needs to unparcel it. Fds are refused because the state must stay valid without the app.</p>
-<p><b>For memory.</b> Every stopped activity whose process was killed can have its saved state in <code>system_server</code>'s native heap until the user returns or the activity is finished. Sources: <code>ActivityRecord.java</code>, <code>ActivityClientController.java</code>.</p>
+<h3>Widgets unpack Bitmaps eagerly instead of pinning a Parcel</h3>
+<p>A launcher must be able to redraw a home-screen widget after the weather app that provides it has been killed, so <code>AppWidgetServiceImpl.Widget</code> retains <code>views</code>, <code>maskedViews</code>, and <code>options</code>. Unlike a <code>Bundle</code>, <code>RemoteViews</code> unpacks its actions and <code>BitmapCache</code> on arrival (Figure 11b): Bitmaps above 12&nbsp;KiB live in <code>memfd</code> tracked by <code>NativeAllocationRegistry</code> (capped at <code>6 * screenWidth * screenHeight</code> bytes), leaving only widget <code>options</code> and <code>BUNDLE</code> reflection actions as lazy <code>Parcel</code> copies. Sources: <code>RemoteViews.java</code>, <code>Widget.java</code>, <code>AppWidgetServiceImpl.java</code>.</p>
 
-<h3>Widgets are kept for the launcher</h3>
-<p><b>The case.</b> A weather app's widget provider pushes a <code>RemoteViews</code> with a forecast <code>Bitmap</code>. The launcher may need to redraw that widget at any time, including after the weather app has been killed, so <code>system_server</code> keeps the views.</p>
-<p><b>What the record holds.</b> <code>AppWidgetServiceImpl.Widget</code> stores <code>views</code> and <code>maskedViews</code> (both <code>RemoteViews</code>) and <code>options</code> (a lazy <code>Bundle</code>). The provider also keeps <code>generatedPreviews</code>.</p>
-<p><b>How it differs from a Bundle.</b> <code>RemoteViews</code> does not parse lazily. Its constructor unpacks the list of view actions and its <code>BitmapCache</code> as soon as it arrives. Bitmaps above 12&nbsp;KiB are backed by <code>memfd</code>, and their native memory is tracked by <code>NativeAllocationRegistry</code> (NAR, the framework's way of tying native memory to a Java object's lifetime). The one exception is reflection actions of type <code>BUNDLE</code>, which keep a lazy <code>Parcel</code> copy.</p>
-<p><b>When it frees.</b> When the widget or its host is deleted, the provider is reset, or the package is uninstalled. App death does not free it.</p>
-<p><b>For memory.</b> Most widget memory is Bitmap memory, not <code>Parcel</code> copies; only <code>options</code> and <code>BUNDLE</code> actions are held as lazy copies. Sources: <code>Widget.java</code>, <code>AppWidgetServiceImpl.java</code>.</p>
-<details><summary>Details: size cap on RemoteViews bitmaps</summary>
-<p>Incoming <code>RemoteViews</code> bitmap memory is capped by <code>RemoteViewsValidator</code> at <code>6 * screenWidth * screenHeight</code> bytes.</p>
-</details>
+<figure>
+<figcaption><b>Figure 11b. Why widget Bitmaps are visible to Java tools while notification Bundle Bitmaps are not.</b> A <code>Bundle</code> leaves <code>Parcelables</code> inside an uncounted <code>Parcel</code> copy (left); <code>RemoteViews</code> unpacks immediately into NAR-backed <code>Bitmap</code> objects (right).</figcaption>
+<svg viewBox="0 0 760 198" role="img" aria-label="Left: Bundle keeps unparsed Parcel copy via finalize(), invisible to GC and dumps. Right: RemoteViews unpacks eagerly on arrival so Bitmaps are tracked by NativeAllocationRegistry.">
+  <text x="10" y="18" class="th">a · bundle extras (lazy — hidden in parcel)</text>
+  <rect x="10" y="26" width="360" height="162" rx="3" class="br"/>
+  <text x="24" y="50" class="tb tr">Stays inside heap Parcel P (finalize)</text>
+  <text x="24" y="74" class="ts">• Bitmap skipped as LazyValue in mMap</text>
+  <text x="24" y="96" class="ts">• P holds malloc bytes + duplicated memfd</text>
+  <text x="24" y="118" class="ts">• Java heap dump sees 48 B Parcel shell;</text>
+  <text x="24" y="136" class="ts">  native buffer + memfd are invisible</text>
+  <text x="24" y="166" class="tms tr">e.g. Notification.extras</text>
 
-<h3>Jobs, alarms, sticky broadcasts, the clipboard, and media sessions</h3>
-<p>The remaining five holders follow the same pattern. Each keeps an app's <code>Bundle</code> or <code>Intent</code> copy until its own release event.</p>
-<p><b>Scheduled jobs.</b> An app schedules a job with <code>JobInfo</code> extras. <code>JobInfo</code> holds <code>extras</code> (a <code>PersistableBundle</code>), <code>transientExtras</code> (a <code>Bundle</code>, which can carry arbitrary <code>Parcelable</code>s and <code>IBinder</code>s) and <code>clipData</code>. They stay as lazy, unparsed bytes until read or written to the jobs XML file. Jobs outlive the app process by design. They are freed on job completion, explicit cancel, or <code>ACTION_PACKAGE_FULLY_REMOVED</code>.</p>
-<p><b>Alarms.</b> An <code>Alarm</code> set with a <code>PendingIntent</code> keeps it as <code>operation</code>, which pins the <code>PendingIntentRecord</code> and its <code>Intent</code> copy. It is released on delivery, cancel, or package removal. An alarm set with a direct callback (<code>IAlarmListener</code>) is different: <code>AlarmManager</code> links to the callback's death (<code>linkToDeath</code>), so <code>binderDied()</code> drops it when the app dies.</p>
-<p><b>Sticky broadcasts.</b> A sticky broadcast is kept after delivery so that later receivers also get it. <code>BroadcastController</code> stores a clone of the <code>Intent</code> (<code>new Intent(intent)</code>, an <code>appendFrom()</code> copy) as <code>StickyBroadcast.intent</code>. It does not watch for the sender's death. It is freed when a matching sticky broadcast overwrites it, on <code>removeStickyBroadcast</code>, or when the user is removed.</p>
-<p><b>Clipboard.</b> When an app copies a clip, <code>ClipboardService</code> keeps it per user as <code>PerUserClipboard.primaryClip</code>, including lazy <code>Bundle</code> and <code>PersistableBundle</code> extras. It is freed when another clip replaces it, when the auto-clear timeout fires, or when the user is stopped.</p>
-<p><b>Media sessions: the one holder that dies with the app.</b> A music app publishes track metadata with album art. <code>MediaSessionRecord</code> reads the string fields of <code>mMetadata</code> (such as URIs) but leaves the artwork <code>Bitmap</code>s as <code>LazyValue</code>s backed by <code>memfd</code>. Because it links to the app's death, <code>onSessionDied</code> releases everything when the app dies. Otherwise it frees on session release or when the metadata is replaced.</p>
+  <text x="390" y="18" class="th">b · widget remoteviews (eager — tracked by nar)</text>
+  <rect x="390" y="26" width="360" height="162" rx="3" class="bg"/>
+  <text x="404" y="50" class="tb tg">Unpacked on arrival into Bitmap objects</text>
+  <text x="404" y="74" class="ts">• Constructor decodes actions + BitmapCache</text>
+  <text x="404" y="96" class="ts">• Bitmaps &gt;12 KiB use memfd + NAR</text>
+  <text x="404" y="118" class="ts">• GC and heap dumps see full pixel size;</text>
+  <text x="404" y="136" class="ts">  only options + BUNDLE actions stay lazy</text>
+  <text x="404" y="166" class="tms tg">e.g. AppWidgetServiceImpl.Widget</text>
+</svg>
+</figure>
 
-<h3 id="holders-summary">Summary: when each holder lets go</h3>
-<p>Table&nbsp;1 collects the release rules. The "survives app death" column is the one that matters for accounting: wherever it says yes, the bytes are charged to <code>system_server</code> and outlive the app that created them, and the allocation stack alone cannot say which row they belong to.</p>
+<h3 id="holders-summary">When each of the nine holders lets go</h3>
+<p>The remaining five subsystems—<code>JobStatus</code>, <code>Alarm</code>, <code>StickyBroadcast</code>, <code>ClipboardService</code>, and <code>MediaSessionRecord</code>—complete the picture. Grouping all nine by <i>what event frees them</i> (Figure 11c) shows why app process death rarely reclaims <code>system_server</code> Parcel memory: eight of the nine outlive the sender by design, and only holders registered with kernel <code>linkToDeath</code> (<code>MediaSessionRecord</code>'s <code>onSessionDied</code> and direct <code>IAlarmListener</code> callbacks, unlike <code>PendingIntent</code> alarms) drop their payloads when the app dies.</p>
 
-<p class="m"><b>Table 1.</b> When each <code>system_server</code> holder releases an app's bytes.</p>
+<figure>
+<figcaption><b>Figure 11c. Release triggers across all nine <code>system_server</code> holders, grouped by lifetime rule.</b> Top and middle groups survive app process death and stay charged to <code>system_server</code>; only the bottom green bar links to the app's Binder death.</figcaption>
+<svg viewBox="0 0 760 332" role="img" aria-label="Nine system_server holders grouped into three release regimes: UI/user lifecycle, schedule/token/overwrite lifecycle, and kernel linkToDeath on app exit">
+  <text x="10" y="18" class="th">1 · survives app death · freed by user or ui action</text>
+  <rect x="10" y="26" width="740" height="114" rx="3" class="panel"/>
+
+  <rect x="22" y="36" width="352" height="44" rx="2" class="bw"/>
+  <text x="34" y="55" class="tb tw">NotificationRecord</text>
+  <text x="34" y="72" class="ts">cancelNotification, pkg stop/remove (Archive strips)</text>
+
+  <rect x="386" y="36" width="352" height="44" rx="2" class="ba"/>
+  <text x="398" y="55" class="tb ta">ActivityRecord.mIcicle</text>
+  <text x="398" y="72" class="ts">activityResumedLocked (setSavedState(null)) or finish</text>
+
+  <rect x="22" y="86" width="352" height="44" rx="2" class="bw"/>
+  <text x="34" y="105" class="tb tw">AppWidgetServiceImpl.Widget</text>
+  <text x="34" y="122" class="ts">widget/host deleted, provider reset, or uninstall</text>
+
+  <rect x="386" y="86" width="352" height="44" rx="2" class="ba"/>
+  <text x="398" y="105" class="tb ta">ClipboardService (primaryClip)</text>
+  <text x="398" y="122" class="ts">next copy overwrites, auto-clear timeout, or user stop</text>
+
+  <text x="10" y="162" class="th">2 · survives app death · freed by schedule, overwrite, or last token drop</text>
+  <rect x="10" y="170" width="740" height="74" rx="3" class="panel"/>
+
+  <rect x="22" y="180" width="252" height="54" rx="2" class="ba"/>
+  <text x="34" y="199" class="tb ta">PendingIntentRecord + Alarm</text>
+  <text x="34" y="216" class="ts">cancel(), alarm fires, or last</text>
+  <text x="34" y="229" class="ts">BpBinder drops + GC</text>
+
+  <rect x="284" y="180" width="222" height="54" rx="2" class="ba"/>
+  <text x="296" y="199" class="tb ta">JobStatus (JobInfo)</text>
+  <text x="296" y="216" class="ts">job completion, cancel(),</text>
+  <text x="296" y="229" class="ts">or pkg fully removed</text>
+
+  <rect x="516" y="180" width="222" height="54" rx="2" class="ba"/>
+  <text x="528" y="199" class="tb ta">StickyBroadcast</text>
+  <text x="528" y="216" class="ts">matching sticky overwrite</text>
+  <text x="528" y="229" class="ts">or removeStickyBroadcast</text>
+
+  <text x="10" y="266" class="th">3 · dies with the app · kernel death-link frees immediately</text>
+  <rect x="10" y="274" width="740" height="50" rx="3" class="bg"/>
+  <text x="24" y="295" class="tb tg">MediaSessionRecord (mMetadata + memfd album art)  ·  Direct IAlarmListener alarms</text>
+  <text x="24" y="313" class="ts">onSessionDied / binderDied drops the Bundle and fds as soon as the app process exits.</text>
+</svg>
+</figure>
+
+<details><summary>Table 1 · Exact retained fields, buffer states, and release hooks for all 9 holders</summary>
 <div class="tbl-wrap"><table>
   <thead>
     <tr>
@@ -1544,18 +1616,15 @@ When the activity resumes, <code>activityResumedLocked()</code> calls <code>setS
     </tr>
   </tbody>
 </table></div>
+</details>
 
 <div class="part">Part II · How Parcel's Accounting Evolved</div>
 
 <h2 id="history-timeline"><span class="n">4</span>History: how Parcel gained, then lost, native memory accounting (2009–2021)</h2>
-<p>Two odd facts about today's <code>Parcel.java</code> have one explanation.
-First, every Parcel carries an 8-byte field, <code>private long mNativeSize</code>, that no code reads or writes.
-Second, ART's garbage collector (GC) is told nothing about Parcel's native buffers, even though Bundle copies can stay alive in <code>system_server</code> for hours (§2, §3).
-The explanation is a sequence of reasonable local decisions in <code>Parcel.java</code> and its JNI glue, <code>android_os_Parcel.cpp</code>.
-This section tells that story in four steps. Table&nbsp;2 at the end lists every change with its AOSP commit.</p>
+<p>Two odd facts about <code>Parcel.java</code>—an unused 8-byte <code>private long mNativeSize</code> field on every instance, and zero native buffer bytes reported to ART's GC—come from four locally reasonable changes colliding between 2012 and 2021 (Figure 12a, Figure 12b).</p>
 
 <figure>
-<figcaption><b>Figure 12. For most of Android's life, the GC has seen none of a Parcel's native memory.</b> Accounting existed only from 2015 to 2020, and even then it counted shared-memory (<code>ashmem</code>) bytes, not the heap buffers. It was removed in 2020 for a 3% speedup. One year later <code>LazyValue</code> made long-lived, unrecycled Parcels common in <code>system_server</code>.</figcaption>
+<figcaption><b>Figure 12a. For most of Android's life, the GC has seen none of a Parcel's native memory.</b> Accounting existed only from 2015 to 2020, counted only <code>ashmem</code> descriptors (never <code>malloc</code> buffers), and was removed a year before <code>LazyValue</code> made long-lived unrecycled Parcels routine.</figcaption>
 <svg viewBox="0 0 760 240" role="img" aria-label="Timeline from 2009 of what ART's GC knows about Parcel native memory: nothing until 2015, ashmem only until 2020, nothing again since">
   <text x="20" y="20" class="th">what ART's GC is told about a Parcel's native memory →</text>
 
@@ -1600,18 +1669,51 @@ This section tells that story in four steps. Table&nbsp;2 at the end lists every
 </svg>
 </figure>
 
-<h3>2009–2014: no accounting, and a JNI shape that makes it hard to add</h3>
-<p>The first open-source <code>Parcel.java</code> (Android 1.5, March 2009) reported 0 bytes to the Dalvik GC.
-A Parcel that nobody recycled was freed only when its <code>finalize()</code> method eventually ran.</p>
-<p>In March 2012 (Android 4.1) every Parcel JNI method became <code>static</code>, passing the native pointer explicitly instead of looking it up from the Java object. This made <code>writeInt()</code> about 3x faster.
-The side effect matters for this note: a static JNI method gets no reference to the Java object, so the C++ side cannot write a Java field such as a size counter (<code>env-&gt;SetLongField(thiz, …)</code>) unless the object is passed in.
-Any later accounting would have to return sizes to Java instead.</p>
-<p>In January 2014 (Android 5.0) the 64-bit transition widened that native pointer from <code>int</code> to <code>long</code>.</p>
+<figure>
+<figcaption><b>Figure 12b. How four independent changes collided to leave long-lived <code>Bundle</code> copies invisible.</b> Faster JNI blocked C++ from touching Java fields (1); the 2015 workaround counted only <code>ashmem</code> FDs (2); 2020 deleted that workaround assuming prompt <code>recycle()</code> (3); and 2021's <code>LazyValue</code> made unrecycled <code>Bundle</code> Parcels live for hours in <code>system_server</code> (4).</figcaption>
+<svg viewBox="0 0 760 246" role="img" aria-label="Four-step causal chain: 2012/2019 static and CriticalNative JNI, 2015 ashmem-only mNativeSize, Sep 2020 removal leaving dead field under recycle() assumption, 2021 LazyValue pinning Bundle Parcels for hours">
+  <rect x="10" y="16" width="172" height="148" rx="3" class="b"/>
+  <text x="22" y="38" class="tb">1 · 2012 &amp; 2019</text>
+  <text x="22" y="57" class="tms">static + @Critical</text>
+  <text x="22" y="80" class="ts">C++ writers lose</text>
+  <text x="22" y="97" class="ts">thiz and JNIEnv*,</text>
+  <text x="22" y="114" class="ts">so C++ cannot set</text>
+  <text x="22" y="131" class="ts">a Java size field.</text>
+  <path d="M182,90 L196,90" class="ln" marker-end="url(#ah)"/>
 
-<h3>2015: a shared-memory leak adds <code>mNativeSize</code>, but it only counts <code>ashmem</code></h3>
-<p>The problem was concrete. Notification <code>Bundle</code>s that were never recycled held Parcels with duplicated <code>ashmem</code> file descriptors (fds that map shared memory), so <code>Shmem</code> in <code>/proc/meminfo</code> kept growing. The GC saw only tiny Java objects, so nothing prompted it to run and free them.</p>
-<p>The fix (<i>"Track ashmem memory usage in Parcel"</i>, October 2015) worked within the static-JNI limit.
-Five JNI calls that can change a Parcel's fds now return the Parcel's open <code>ashmem</code> size. Java stores it in the new <code>mNativeSize</code> field and tells the GC the difference:</p>
+  <rect x="198" y="16" width="172" height="148" rx="3" class="bw"/>
+  <text x="210" y="38" class="tb tw">2 · Oct 2015</text>
+  <text x="210" y="57" class="tms tw">mNativeSize added</text>
+  <text x="210" y="80" class="ts">5 FD calls return</text>
+  <text x="210" y="97" class="ts">ashmem size to GC;</text>
+  <text x="210" y="114" class="ts">malloc mData stays</text>
+  <text x="210" y="131" class="ts">untracked (0 B).</text>
+  <path d="M370,90 L384,90" class="lnr" marker-end="url(#ahr)"/>
+
+  <rect x="386" y="16" width="172" height="148" rx="3" class="br"/>
+  <text x="398" y="38" class="tb tr">3 · Sep 2020</text>
+  <text x="398" y="57" class="tms tr">deleted for +3%</text>
+  <text x="398" y="80" class="ts">Assumes Parcels are</text>
+  <text x="398" y="97" class="ts">always recycle()d;</text>
+  <text x="398" y="114" class="ts">leaves dead 8 B</text>
+  <text x="398" y="131" class="ts">mNativeSize field.</text>
+  <path d="M558,90 L572,90" class="lnr" marker-end="url(#ahr)"/>
+
+  <rect x="574" y="16" width="176" height="148" rx="3" class="br"/>
+  <text x="586" y="38" class="tb tr">4 · 2021 (Android 13)</text>
+  <text x="586" y="57" class="tms tr">LazyValue ships</text>
+  <text x="586" y="80" class="ts">Unread Parcelables</text>
+  <text x="586" y="97" class="ts">pin Bundle Parcels</text>
+  <text x="586" y="114" class="ts">for hours—breaking</text>
+  <text x="586" y="131" class="ts">2020's assumption.</text>
+
+  <rect x="10" y="178" width="740" height="56" rx="3" class="b0"/>
+  <text x="380" y="201" class="ts" text-anchor="middle">Result in AOSP: long-lived Bundle copies hold malloc + memfd RAM in system_server</text>
+  <text x="380" y="219" class="ts" text-anchor="middle">while looking like 48 B Java objects carrying a dead 8 B mNativeSize field.</text>
+</svg>
+</figure>
+
+<p><b>Steps 1 &amp; 2 (2012–2020): JNI speedups force return-value accounting that skips <code>malloc</code>.</b> Switching Parcel's JNI methods to <code>static</code> in 2012 (~3&times; faster <code>writeInt()</code>) and marking primitive writers <code>@CriticalNative</code> in 2019–2020 stripped <code>thiz</code> and <code>JNIEnv*</code> from C++ calls. When unrecycled notification <code>Bundle</code>s leaked shared memory in 2015, five FD-bearing JNI calls worked around that constraint by returning <code>parcel-&gt;getOpenAshmemSize()</code> to Java's <code>updateNativeSize()</code>—fixing the <code>ashmem</code> leak while leaving <code>mData</code> and <code>mObjects</code> heap buffers completely uncounted:</p>
 
 <pre><code><span class="src">Parcel.java, Oct 2015 (0450565d9a6d) to Sep 2020 (c20809950691)</span><span class="hw"><span class="k">private long</span> mNativeSize; <span class="c">// only this line survived the 2020 removal</span></span>
 
@@ -1632,23 +1734,11 @@ Five JNI calls that can change a Parcel's fds now return the Parcel's open <code
     }
 }</code></pre>
 
-<p>This fixed the leak. But it never counted the Parcel's own heap buffers: <code>mData</code> (the payload bytes) and <code>mObjects</code> (the table of Binder/fd positions). A Parcel holding a 64 KiB Bundle in <code>malloc</code> memory still looked like 0 bytes to the GC.</p>
+<p><b>Steps 3 &amp; 4 (Sep 2020 – 2021): removing accounting right before <code>LazyValue</code> pins Parcels.</b> In September 2020 (Android&nbsp;12), <code>updateNativeSize()</code> was deleted for a ~3% <code>ParcelObtainPerfTest</code> gain under the assumption that variable-sized Parcels are explicitly <code>recycle()</code>d before GC matters—accidentally leaving <code>private long mNativeSize</code> declared on every instance. One year later (Android&nbsp;13), item-wise <code>Parcel.LazyValue</code> unparcelling broke that assumption in <code>system_server</code>: reading one primitive key from a <code>Bundle</code> leaves <code>LazyValue.mSource</code> pinning the entire heap <code>Parcel</code> and its duplicated FDs for hours.</p>
 
-<h3>2019–2020: faster JNI, then accounting removed for 3%</h3>
-<p>From October 2019 to June 2020 Parcel's JNI became cheaper. Object-marshalling calls became <code>@FastNative</code> (about 80 ns saved per call). The primitive writers became <code>@CriticalNative</code>, the fastest JNI mode, which gets no <code>JNIEnv*</code> and so cannot throw; they now return a <code>status_t</code> error code instead.
-After this, a primitive write can report a size only through its return value or a plain C++ atomic.</p>
-<p>In September 2020 a change deleted <code>updateNativeSize()</code> and made the five JNI calls return <code>void</code> again, for about 3% on <code>ParcelObtainPerfTest</code>.
-The reasoning: every variable-sized allocation is freed by an explicit <code>recycle()</code> before the GC would matter.
-The change deleted every read and write of <code>mNativeSize</code> but not its declaration, so since Android 12 every Parcel has carried an unused 8-byte field.</p>
+<p><b>Where that leaves things.</b> In AOSP today, a Java heap dump still shows a retained <code>Bundle</code> copy as a 48-byte <code>Parcel</code> shell (Figure&nbsp;P3). Its bytes appear only in native heap profiles under <code>BaseBundle.readFromParcelInner</code> → <code>Parcel::appendFrom</code>, which shows where the copy was made—not which <code>system_server</code> record in §3 still holds it.</p>
 
-<h3>2021: the "always recycled" assumption breaks</h3>
-<p>In 2021 Bundles started parsing item by item (<code>Parcel.LazyValue</code> in <code>BaseBundle.java</code>, shipped in Android 13). An unread <code>Parcelable</code> entry stays as a placeholder whose <code>mSource</code> field strongly references the whole backing Parcel (§2).
-So if <code>system_server</code> reads one <code>int</code> from a notification's extras but never touches the 2 MB <code>Bitmap</code> entry, the Parcel is never recycled. It lives as long as the Bundle does, which for the holders in §3 can be hours.
-This is exactly the case the 2020 removal assumed away.</p>
-
-<p><b>Where that leaves things.</b> In the AOSP code this note was checked against, the GC is still told nothing about a Parcel's <code>mData</code> or <code>mObjects</code>, and a Java heap dump shows a Bundle copy as a 48-byte object (Figure&nbsp;P3). The bytes show up only in native heap profiles, under the stack <code>BaseBundle.readFromParcelInner</code> → <code>Parcel::appendFrom</code>, which says where a copy was made but not which <code>system_server</code> record still holds it. Telling those apart takes the record-by-record reading in §3.</p>
-
-<p class="m"><b>Table 2.</b> Changes to how <code>Parcel</code> reports native memory. Commit IDs are in AOSP <code>frameworks/base</code>.</p>
+<details><summary>Table 2 · Chronological AOSP commit log (2009–2021)</summary>
 <div class="tbl-wrap"><table>
   <thead>
     <tr>
@@ -1709,6 +1799,7 @@ This is exactly the case the 2020 removal assumed away.</p>
     </tr>
   </tbody>
 </table></div>
+</details>
 
 <h2 id="sources">Sources</h2>
 <p class="m">All paths are in AOSP as of Android 17, except the Binder driver, which is in the Android common kernel.</p>
