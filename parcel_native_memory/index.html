@@ -55,44 +55,42 @@
 
 <main id="top">
 <h1>How Parcel holds native memory: its buffers, the copy a Binder call makes, and what keeps that copy alive in system_server</h1>
-<p class="lead">Data that apps send to <code>system_server</code> can stay in its native heap long after the call that delivered it, as copies made by <code>Parcel::appendFrom</code>, the function that copies bytes out of one Parcel into another.
-The copy happens because an app's data arrives in a kernel buffer that is freed when the Binder call ends, so reading a <code>Bundle</code> from it moves the bytes into <code>malloc</code>, where they stay for as long as <code>system_server</code> keeps the object holding them: a <code>PendingIntent</code>, a notification, saved activity state, a queued broadcast, or an app widget.
-Neither ART's garbage collector nor a Java heap dump sees these bytes; to them, a Parcel holding megabytes is a 48-byte object.
-This note builds Parcel up from first principles, traces where the bytes go and which <code>system_server</code> records keep them, and ends with how Parcel's native-memory accounting has changed since 2009.</p>
+<p class="lead">Data that apps send to <code>system_server</code> over Binder arrives in a temporary kernel buffer, yet copies of it made by <code>Parcel::appendFrom</code> can stay on <code>system_server</code>'s native heap for hours while looking like 48-byte objects to ART's garbage collector and Java heap dumps.
+This note builds <code>Parcel</code> up from first principles, traces how <code>Bundle</code> copies and retains app payloads across processes, and shows how <code>Parcel</code>'s native-memory accounting evolved from 2009 to 2021.</p>
 <p class="m">Checked against AOSP as of Android 17 (<code>frameworks/base</code>, <code>frameworks/native/libs/binder</code>, <code>libcore</code>) and the Android common kernel’s Binder driver.</p>
 
-<p class="m"><b>New to Parcel?</b> Read <a href="#ground-up">§0, Parcel from the ground up</a> first: seven figures that build the whole picture before the details below.</p>
+<p class="m"><b>New to Parcel?</b> Start at <a href="#ground-up">§0, Parcel from the ground up</a>—seven visual steps that build the mental model before the internals below.</p>
 
 <h2 id="glance">At a glance</h2>
-<ul>
-  <li><b>Recycling a Parcel frees its data; the pool keeps only the empty shell.</b> <code>recycle()</code> hands the data buffer back to <code>malloc</code> at once, and the 32-entry pool reuses only the Java object and its empty C++ header, so the pool is not where the memory goes (<a href="#parcel-anatomy">§1</a>).</li>
-  <li><b>Reading a Bundle that arrived over Binder copies its bytes into <code>malloc</code>.</b> The incoming bytes sit in a shared kernel buffer that is freed before the reply is sent, so anything kept past the call must be copied out first (<a href="#binder-bundle">§2</a>).</li>
-  <li><b>One unread entry keeps the whole copied Bundle alive.</b> Large values such as a notification's <code>Bitmap</code> are left unparsed as placeholders (<code>LazyValue</code>) that point back to the entire copied buffer, so the buffer stays allocated until that entry is read or the Bundle is dropped (<a href="#binder-bundle">§2</a>, <a href="#holders">§3</a>).</li>
-  <li><b>Most of these copies outlive the app that sent them.</b> Notifications, <code>PendingIntent</code>s, saved activity state, widgets, jobs, sticky broadcasts and the clipboard each keep their copy until their own release event; only media sessions are freed when the app dies (<a href="#holders">§3</a>).</li>
-  <li><b>Neither the garbage collector nor a heap dump knows how big a Parcel's native buffer is.</b> Parcel still releases its native memory from <code>finalize()</code>, which reports no size. From 2015 to 2020 it reported open <code>ashmem</code> sizes to the GC, never its heap buffers, and that reporting was then removed (<a href="#history-timeline">§4</a>).</li>
-</ul>
+<ol>
+  <li><b>Incoming Binder buffers die with the call, so kept Bundles copy into <code>malloc</code>.</b> Transactions arrive in a shared ~1 MiB <code>/dev/binder</code> kernel mapping freed before the reply is sent; when <code>system_server</code> reads a <code>Bundle</code> (<code>Intent</code> or <code>Notification</code> extras, saved state), <code>Parcel::appendFrom</code> copies its slice into <code>malloc</code> and duplicates every embedded file descriptor (<a href="#binder-bundle">§2</a>).</li>
+  <li><b>One unread entry pins the entire copied <code>Bundle</code>.</b> Reading even one primitive or string key leaves larger entries (such as a notification <code>Bitmap</code> or custom app <code>Parcelable</code>) wrapped in <code>Parcel.LazyValue</code> placeholders that keep the whole copied buffer and its duplicated <code>ashmem</code>/<code>memfd</code> descriptors alive (<a href="#binder-bundle">§2</a>).</li>
+  <li><b>Most <code>system_server</code> holders outlive the app that sent them.</b> Notifications, <code>PendingIntents</code>, saved activity state, widgets, jobs, alarms, sticky broadcasts, and clipboard entries keep their <code>Bundle</code> copies until cancelled or replaced—only media sessions release theirs when the app dies (<a href="#holders">§3</a>). Meanwhile, <code>Parcel.recycle()</code> frees buffers immediately and pools only 32 empty 120 B shells, so pooling is not the cause (<a href="#parcel-anatomy">§1</a>).</li>
+  <li><b>Java tools see 48 B instead of the native buffer.</b> <code>Parcel</code> cleans up via <code>finalize()</code> rather than <code>NativeAllocationRegistry</code>, reporting 0 native bytes to ART's GC and Java heap dumps; from 2015 to 2020 it reported open <code>ashmem</code> sizes (never <code>malloc</code> buffers), and even that was removed for a 3% microbenchmark gain (<a href="#history-timeline">§4</a>).</li>
+</ol>
 
-<details><summary>Details: the exact mechanisms behind each bullet</summary>
+<details><summary>Details: exact classes and functions behind each step</summary>
 <ul>
-  <li><b>Pool.</b> <code>recycle()</code> calls <code>Parcel::freeData()</code>, which frees <code>mData</code> and <code>mObjects</code> back to Scudo. The 32-entry <code>sOwnedPool</code> caches the Java object and its empty 120-byte C++ <code>Parcel</code>.</li>
-  <li><b>Copy on read.</b> The incoming buffer is the ~1 MiB driver <code>mmap</code>; <code>IPCThreadState</code> frees it before sending the reply. <code>BaseBundle.readFromParcelInner()</code> copies the Bundle's byte range into a heap <code>Parcel</code> via <code>appendFrom()</code>, duplicating every file descriptor and incrementing every embedded Binder strong reference.</li>
-  <li><b>LazyValue.</b> Reading any key, even a primitive or string, triggers top-level unparcelling, which wraps length-prefixed <code>Parcelable</code> entries in <code>Parcel.LazyValue</code>. Each <code>LazyValue.mSource</code> holds a strong reference to the whole copied <code>Parcel</code> and its duplicated <code>ashmem</code> or <code>memfd</code> descriptors.</li>
-  <li><b>Holders.</b> <code>NotificationRecord</code>, <code>PendingIntentRecord.Key</code>, <code>ActivityRecord.mIcicle</code>, <code>AppWidgetServiceImpl.Widget</code>, <code>JobStatus</code>, <code>AlarmManagerService.Alarm</code> (through its <code>PendingIntent</code>), <code>StickyBroadcast</code> and <code>ClipboardService</code> survive app death; <code>MediaSessionRecord</code> uses <code>linkToDeath</code>.</li>
-  <li><b>mNativeSize.</b> <code>Parcel.java</code> still declares <code>private long mNativeSize</code>, left over from the 2015–2020 <code>ashmem</code> accounting; nothing reads or writes it.</li>
+  <li><b>Pool (<a href="#parcel-anatomy">§1</a>).</b> <code>recycle()</code> calls <code>Parcel::freeData()</code>, freeing <code>mData</code> and <code>mObjects</code> back to Scudo. The 32-entry <code>sOwnedPool</code> caches only the Java object and its empty 120-byte C++ <code>Parcel</code>.</li>
+  <li><b>Copy on read (<a href="#binder-bundle">§2</a>).</b> <code>IPCThreadState</code> frees the ~1 MiB driver <code>mmap</code> slice before sending the reply. <code>BaseBundle.readFromParcelInner()</code> copies the Bundle's byte range into a heap <code>Parcel</code> via <code>appendFrom()</code>, duplicating FDs and incrementing Binder strong refs.</li>
+  <li><b>LazyValue (<a href="#binder-bundle">§2</a>).</b> Top-level unparcelling wraps length-prefixed <code>Parcelable</code> entries in <code>Parcel.LazyValue</code>; <code>LazyValue.mSource</code> retains the entire copied <code>Parcel</code>.</li>
+  <li><b>Holders (<a href="#holders">§3</a>).</b> <code>NotificationRecord</code>, <code>PendingIntentRecord.Key</code>, <code>ActivityRecord.mIcicle</code>, <code>AppWidgetServiceImpl.Widget</code>, <code>JobStatus</code>, <code>AlarmManagerService.Alarm</code> (via its <code>PendingIntent</code>), <code>StickyBroadcast</code>, and <code>ClipboardService</code> survive app death; <code>MediaSessionRecord</code> uses <code>linkToDeath</code>.</li>
+  <li><b>mNativeSize (<a href="#history-timeline">§4</a>).</b> <code>Parcel.java</code> still declares <code>private long mNativeSize</code>, left over from the 2015–2020 <code>ashmem</code> accounting; nothing reads or writes it.</li>
 </ul>
 </details>
 
-<p><b>Terms.</b></p>
+<details><summary>Glossary of terms (Binder, Owned vs Borrowed Parcel, LazyValue, NAR, Scudo, ashmem/memfd)</summary>
 <ul>
-  <li><b>Binder (<code>/dev/binder</code>)</b>: Android's kernel inter-process communication (IPC) driver. It moves messages between processes with a single copy and translates object handles and file descriptors along the way.</li>
-  <li><b>Owned <code>Parcel</code></b>: a Parcel whose bytes live in its own <code>malloc</code> buffer and are freed with <code>free()</code>. (C++ <code>android::Parcel</code> with <code>mOwner == nullptr</code>; the byte buffer is <code>mData</code>, the table of object offsets is <code>mObjects</code>, both on the native heap.)</li>
-  <li><b>Borrowed <code>Parcel</code></b>: a Parcel that points into the read-only ~1 MiB kernel buffer the Binder call was delivered into, and is released by telling the driver (<code>BC_FREE_BUFFER</code>), not with <code>free()</code>. (Set up by <code>ipcSetDataReference()</code>; <code>mOwner != nullptr</code>.)</li>
-  <li><b><code>LazyValue</code></b>: a placeholder a Bundle stores for a large value it has not parsed yet (<code>Parcelable</code>, <code>List</code>, <code>Map</code>, array, <code>Serializable</code>); it keeps the whole source Parcel alive until that entry is read. (Lives in <code>BaseBundle.mMap</code>; the reference is <code>mSource</code>.)</li>
-  <li><b><code>NativeAllocationRegistry</code> (NAR)</b>: a <code>libcore</code> helper that frees an object's native memory when its Java object becomes unreachable and reports that memory to heap dumps. Parcel does not use it; it relies on <code>finalize()</code>.</li>
-  <li><b>Scudo</b>: Android's default native heap allocator, implementing <code>malloc</code>, <code>realloc</code> and <code>free</code> in bionic.</li>
-  <li><b><code>ashmem</code> / <code>memfd</code></b>: kernel shared-memory files. A process passes one by sending its file descriptor (fd); the pages stay allocated while any process holds an open fd.</li>
-  <li><b><code>BC_*</code> / <code>BR_*</code></b>: Binder driver commands. User space sends <code>BC_</code> commands (for example <code>BC_FREE_BUFFER</code>, <code>BC_REPLY</code>) and the driver returns <code>BR_</code> commands (for example <code>BR_TRANSACTION</code>).</li>
+  <li><b>Binder (<code>/dev/binder</code>)</b>: Android's kernel IPC driver; moves messages across processes with a single copy while translating Binder handles and file descriptors.</li>
+  <li><b>Owned <code>Parcel</code></b>: a Parcel whose bytes live in its own <code>malloc</code> buffer and are freed with <code>free()</code> (C++ <code>android::Parcel</code> with <code>mOwner == nullptr</code>; <code>mData</code> holds bytes and <code>mObjects</code> holds kernel-object offsets on the native heap).</li>
+  <li><b>Borrowed <code>Parcel</code></b>: a Parcel pointing into the read-only ~1 MiB <code>/dev/binder</code> kernel buffer of an incoming call, released via <code>BC_FREE_BUFFER</code> rather than <code>free()</code> (<code>ipcSetDataReference()</code>; <code>mOwner != nullptr</code>).</li>
+  <li><b><code>LazyValue</code></b>: a placeholder in <code>BaseBundle.mMap</code> for an unparsed length-prefixed entry (<code>Parcelable</code>, <code>List</code>, <code>Map</code>, array, <code>Serializable</code>); its <code>mSource</code> field keeps the backing <code>Parcel</code> alive until read.</li>
+  <li><b><code>NativeAllocationRegistry</code> (NAR)</b>: a <code>libcore</code> helper pairing a Java object with a <code>Cleaner</code> so native memory is freed on GC and sized in heap dumps. Parcel does not use it.</li>
+  <li><b>Scudo</b>: Android's native heap allocator in bionic (<code>malloc</code> / <code>realloc</code> / <code>free</code>).</li>
+  <li><b><code>ashmem</code> / <code>memfd</code></b>: kernel shared-memory files passed via file descriptors; pages stay allocated while any process holds an open fd.</li>
+  <li><b><code>BC_*</code> / <code>BR_*</code></b>: Binder driver commands sent from user space (<code>BC_FREE_BUFFER</code>, <code>BC_REPLY</code>) and returned by the driver (<code>BR_TRANSACTION</code>).</li>
 </ul>
+</details>
 
 <div class="part">Part 0 · Ground-up primer</div>
 
@@ -438,7 +436,7 @@ As long as the Bundle is alive and even one such value has not been read, the en
   <thead><tr><th>Idea from this primer</th><th>Where it is taken apart in detail</th></tr></thead>
   <tbody>
     <tr><td>Java wrapper, 120-byte C++ header, <code>mData</code>, <code>mObjects</code>, pools, 1.5&times; growth (P2, P3)</td><td>§1 Inside a Parcel</td></tr>
-    <tr><td>Owned (<code>malloc</code>) vs borrowed (Binder buffer) Parcels (P5)</td><td>§1, Figure 1</td></tr>
+    <tr><td>Owned (<code>malloc</code>) vs borrowed (Binder buffer) Parcels (P5)</td><td>§1, Figures 1a–1b</td></tr>
     <tr><td>Kernel copy, fd and Binder rewriting, freeing before the reply (P4, P5)</td><td>§2 Binder mmap &amp; Bundle copies</td></tr>
     <tr><td><code>appendFrom()</code> copy and <code>LazyValue</code> retention (P7)</td><td>§2, BaseBundle and LazyValue</td></tr>
     <tr><td>Which <code>system_server</code> structures keep app Bundles alive (P7)</td><td>§3 system_server holders</td></tr>
@@ -464,15 +462,88 @@ If you made the Parcel with <code>Parcel.obtain()</code>, you made all three, an
   <li><b>The bytes may belong to the kernel.</b> An incoming request is read where the kernel put it, in your process's Binder buffer (Figure P5); copying it into <code>malloc</code> first would add a second copy to every call. Those bytes go back to the kernel with <code>BC_FREE_BUFFER</code>. Passing them to <code>free()</code> would corrupt the heap.</li>
   <li><b>The C++ struct may be someone else's local variable.</b> For an incoming call, libbinder declares <code>Parcel data, reply;</code> as locals in <code>IPCThreadState::executeCommand()</code>, on the Binder thread's stack. They vanish when the call ends. Deleting them from Java would crash the process.</li>
 </ul>
-<p><b>The solution.</b> Each Parcel answers two questions, one per layer:</p>
+<p><b>The solution: one switch at each seam (Figure&nbsp;1a).</b> Because the struct and the bytes can have different owners, Parcel records each choice right at the boundary it controls:</p>
 <ol>
-  <li><b>Does the Java wrapper own the C++ struct?</b> Java field <code>mOwnsNativeParcelObject</code>. <code>true</code>: the wrapper created the struct (<code>nativeCreate()</code> → <code>new Parcel()</code>) and deletes it. <code>false</code>: the wrapper is a temporary view of a struct that C++ owns.</li>
-  <li><b>How are the bytes released?</b> C++ field <code>mOwner</code>. <code>nullptr</code>: the bytes came from <code>malloc</code> and are released with <code>free()</code>. Otherwise it points to the function to call instead; for Binder that is <code>IPCThreadState::freeBuffer</code>, which sends <code>BC_FREE_BUFFER</code>.</li>
+  <li><b>Java → C++ struct (<code>mOwnsNativeParcelObject</code> on <code>Parcel.java</code>).</b> <code>true</code> when Java allocated a heap struct (<code>nativeCreate()</code> → <code>new Parcel()</code>) and must delete it; <code>false</code> when Java is temporarily viewing a C++ stack variable.</li>
+  <li><b>C++ struct → bytes (<code>mOwner</code> on <code>android::Parcel</code>).</b> <code>nullptr</code> when the bytes live in <code>malloc</code> and release via <code>free()</code>; otherwise a callback (<code>IPCThreadState::freeBuffer</code>) that sends <code>BC_FREE_BUFFER</code> to the kernel instead.</li>
 </ol>
-<p>The two answers are independent, and all four combinations occur in one ordinary call (Figure&nbsp;1). The unexpected one is the client's reply, cell C: you created it with <code>obtain()</code>, so you own the struct, but after <code>transact()</code> its bytes are the server's answer sitting in your Binder buffer.</p>
+<p>Because the two switches sit at different seams, all four combinations occur in one ordinary Binder call (Figure&nbsp;1b). Even a single Parcel can flip one switch mid-life: your client <code>reply</code> starts with <code>mOwner = nullptr</code> at <code>obtain()</code>, then flips <code>mOwner</code> to <code>freeBuffer</code> when <code>transact()</code> points it at the server's answer inside your Binder buffer (Figure&nbsp;1a, bottom).</p>
 
 <figure>
-<figcaption><b>Figure 1. The four kinds of Parcel in one Binder call, sorted by who frees the struct (columns) and who frees the bytes (rows).</b> Only the top row costs native heap. The bottom row is memory in the Binder buffer, handed back to the kernel with <code>BC_FREE_BUFFER</code>. Writing to a bottom-row Parcel first copies its bytes into <code>malloc</code> and gives the kernel slice back, so it moves to the top row.</figcaption>
+<figcaption><b>Figure 1a. Two independent ownership switches—and how a client's <code>reply</code> flips the second one mid-call.</b> Top: <code>mOwnsNativeParcelObject</code> decides who frees the 120-byte C++ struct; <code>mOwner</code> decides how the payload bytes are released. Bottom: a client's <code>reply</code> starts as an empty owned shell, flips <code>mOwner</code> to <code>freeBuffer</code> when the kernel delivers the answer into the Binder buffer (landing in cell&nbsp;C of Figure&nbsp;1b), and resets on <code>recycle()</code>.</figcaption>
+<svg viewBox="0 0 760 364" role="img" aria-label="Top: Java Parcel switches mOwnsNativeParcelObject between heap and stack C++ struct, while C++ Parcel switches mOwner between malloc free and kernel BC_FREE_BUFFER. Bottom: three steps showing client reply flipping mOwner during transact.">
+  <text x="10" y="18" class="th">a · one switch at each boundary seam (2 × 2 = 4 combinations)</text>
+  <rect x="10" y="26" width="740" height="148" rx="3" class="panel"/>
+
+  <rect x="22" y="58" width="136" height="84" rx="3" class="b"/>
+  <text x="90" y="82" class="tb" text-anchor="middle">Java Parcel</text>
+  <text x="90" y="101" class="tms" text-anchor="middle">mOwnsNative...</text>
+  <text x="90" y="120" class="ts" text-anchor="middle">switch 1</text>
+
+  <path d="M158,86 L194,66" class="lna" marker-end="url(#aha)"/>
+  <path d="M158,114 L194,134" class="lnv" marker-end="url(#ahv)"/>
+
+  <rect x="196" y="38" width="180" height="54" rx="3" class="ba"/>
+  <text x="208" y="58" class="tb ta">true · heap new Parcel()</text>
+  <text x="208" y="76" class="ts">Java wrapper deletes it</text>
+
+  <rect x="196" y="108" width="180" height="54" rx="3" class="bv"/>
+  <text x="208" y="128" class="tb tv">false · C++ stack local</text>
+  <text x="208" y="146" class="ts">dies when call returns</text>
+
+  <path d="M376,65 L396,86" class="ln"/>
+  <path d="M376,135 L396,114" class="ln"/>
+
+  <rect x="396" y="58" width="126" height="84" rx="3" class="b"/>
+  <text x="459" y="82" class="tb" text-anchor="middle">C++ Parcel</text>
+  <text x="459" y="101" class="tms" text-anchor="middle">mOwner</text>
+  <text x="459" y="120" class="ts" text-anchor="middle">switch 2</text>
+
+  <path d="M522,86 L556,66" class="lna" marker-end="url(#aha)"/>
+  <path d="M522,114 L556,134" class="lnw" marker-end="url(#ahw)"/>
+
+  <rect x="558" y="38" width="180" height="54" rx="3" class="ba"/>
+  <text x="570" y="58" class="tb ta">nullptr · malloc heap</text>
+  <text x="570" y="76" class="ts">released by free()</text>
+
+  <rect x="558" y="108" width="180" height="54" rx="3" class="bw"/>
+  <text x="570" y="128" class="tb tw">freeBuffer · kernel</text>
+  <text x="570" y="146" class="ts">released by BC_FREE_BUFFER</text>
+
+  <text x="10" y="198" class="th">b · why they are independent: following your client reply into cell C</text>
+  <rect x="10" y="206" width="740" height="148" rx="3" class="panel"/>
+
+  <rect x="22" y="220" width="196" height="120" rx="3" class="b"/>
+  <text x="34" y="242" class="tb">1 · reply = obtain()</text>
+  <text x="34" y="264" class="tms ta">mOwnsNative = true</text>
+  <text x="34" y="282" class="tms">mOwner      = nullptr</text>
+  <text x="34" y="306" class="ts">Empty heap struct;</text>
+  <text x="34" y="323" class="ts">no bytes allocated yet.</text>
+
+  <path d="M220,280 L280,280" class="lnw" marker-end="url(#ahw)"/>
+  <text x="250" y="270" class="tms tw" text-anchor="middle">transact()</text>
+
+  <rect x="282" y="220" width="196" height="120" rx="3" class="bw"/>
+  <text x="294" y="242" class="tb tw">2 · answer lands (cell C)</text>
+  <text x="294" y="264" class="tms ta">mOwnsNative = true</text>
+  <text x="294" y="282" class="tms tw">mOwner      = freeBuffer</text>
+  <text x="294" y="306" class="ts">Points into your Binder</text>
+  <text x="294" y="323" class="ts">buffer; zero malloc.</text>
+
+  <path d="M480,280 L540,280" class="lng" marker-end="url(#ahg)"/>
+  <text x="510" y="270" class="tms tg" text-anchor="middle">recycle()</text>
+
+  <rect x="542" y="220" width="196" height="120" rx="3" class="bg"/>
+  <text x="554" y="242" class="tb tg">3 · reply.recycle()</text>
+  <text x="554" y="264" class="tms tw">mOwner → BC_FREE_BUFFER</text>
+  <text x="554" y="282" class="tms ta">mOwnsNative → sOwnedPool</text>
+  <text x="554" y="306" class="ts">Kernel slice freed; empty</text>
+  <text x="554" y="323" class="ts">120 B shell is pooled.</text>
+</svg>
+</figure>
+
+<figure>
+<figcaption><b>Figure 1b. The four kinds of Parcel in one Binder call, sorted by who frees the struct (columns) and who frees the bytes (rows).</b> Only the top row costs native heap. The bottom row is memory in the Binder buffer, handed back to the kernel with <code>BC_FREE_BUFFER</code>. Writing to a bottom-row Parcel first copies its bytes into <code>malloc</code> and gives the kernel slice back, so it moves to the top row.</figcaption>
 <svg viewBox="0 0 760 392" role="img" aria-label="Two by two grid of Parcel ownership: Java-owned or stack struct, malloc or kernel bytes, with the four Parcels of a Binder call placed in it">
   <text x="160" y="18" class="th">java wrapper owns the c++ struct</text>
   <text x="160" y="34" class="tms">mOwnsNativeParcelObject = true</text>
@@ -530,10 +601,10 @@ If you made the Parcel with <code>Parcel.obtain()</code>, you made all three, an
 </figure>
 
 <p><b>Two pools of spare wrappers.</b> Every Binder call needs wrappers on both sides, so <code>Parcel.java</code> keeps up to 32 spares of each kind instead of allocating Java objects per call.
-One pool cannot serve both kinds, because what a spare wrapper carries differs (Figure&nbsp;1b).</p>
+One pool cannot serve both kinds, because what a spare wrapper carries differs (Figure&nbsp;1c).</p>
 
 <figure>
-<figcaption><b>Figure 1b. What a spare wrapper carries.</b> An owned wrapper keeps its empty C++ struct between uses. A holder wrapper carries nothing and is pointed at libbinder's stack struct for one call. Neither pool keeps payload bytes: <code>recycle()</code> releases them before the wrapper goes back.</figcaption>
+<figcaption><b>Figure 1c. What a spare wrapper carries.</b> An owned wrapper keeps its empty C++ struct between uses. A holder wrapper carries nothing and is pointed at libbinder's stack struct for one call. Neither pool keeps payload bytes: <code>recycle()</code> releases them before the wrapper goes back.</figcaption>
 <svg viewBox="0 0 760 330" role="img" aria-label="Two pools: owned wrappers keep an empty C++ struct; holder wrappers carry nothing and borrow libbinder's stack struct for one call">
   <text x="10" y="18" class="tb">owned wrappers <tspan class="tms">sOwnedPool</tspan> · cells A and C</text>
   <rect x="10" y="26" width="365" height="296" rx="3" class="panel"/>
@@ -575,7 +646,7 @@ One pool cannot serve both kinds, because what a spare wrapper carries differs (
 </svg>
 </figure>
 
-<p><b>What this means for memory.</b> Only the top row of Figure&nbsp;1 is native heap that can linger. B, C and D are released within one call. A is short-lived for ordinary requests, but it is also where a Bundle's private copy lives (Figure P7), and that copy can stay in <code>system_server</code> for hours. Sections 2 and 3 follow cell A.</p>
+<p><b>What this means for memory.</b> Only the top row of Figure&nbsp;1b is native heap that can linger. B, C and D are released within one call. A is short-lived for ordinary requests, but it is also where a Bundle's private copy lives (Figure P7), and that copy can stay in <code>system_server</code> for hours. Sections 2 and 3 follow cell A.</p>
 
 <p>In code: <code>recycle()</code> on an owned Parcel calls <code>freeBuffer()</code> → <code>nativeFreeBuffer()</code> → <code>Parcel::freeData()</code>, which frees <code>mData</code> and <code>mObjects</code> at once, then offers the wrapper to <code>sOwnedPool</code>. If the pool already holds 32, the wrapper is not kept and only its empty struct waits for the GC. A Parcel dropped without <code>recycle()</code> keeps its bytes until the GC runs <code>Parcel.finalize()</code> → <code>destroy()</code> → <code>delete parcel</code>.</p>
 
@@ -618,7 +689,7 @@ The kernel cannot parse the Parcel format, so something has to tell it where the
   <rect x="22" y="174" width="186" height="30" rx="2" class="b0"/>
   <text x="32" y="194" class="tms">mObjects</text>
   <rect x="22" y="210" width="186" height="30" rx="2" class="b0"/>
-  <text x="32" y="230" class="tms">mOwner (Figure 1)</text>
+  <text x="32" y="230" class="tms">mOwner (Figure 1a)</text>
   <text x="22" y="264" class="ts">+ object counts and a few flags</text>
 
   <text x="250" y="18" class="th">mData: the byte stream, in malloc</text>
