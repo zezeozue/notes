@@ -457,19 +457,19 @@ Most methods in <code>Parcel.cpp</code> first check three facts about the instan
 
 <h3>Who frees what: two ownership questions, four real cases</h3>
 
-<p><b>The problem.</b> A Parcel is three pieces (Figure P3): the small Java wrapper, the 120-byte C++ <code>android::Parcel</code> struct, and the payload bytes (<code>mData</code> plus <code>mObjects</code>).
-When you build a Parcel yourself with <code>Parcel.obtain()</code>, you created all three, so the answer to "who frees them?" is simple: you do, when you call <code>recycle()</code>.</p>
-<p>But Binder also hands you Parcels that you did not create, and freeing those the normal way would be a bug:</p>
+<p><b>The problem.</b> A Parcel has three pieces (Figure P3): the Java wrapper, the 120-byte C++ <code>android::Parcel</code> struct, and the payload bytes (<code>mData</code> and <code>mObjects</code>).
+If you made the Parcel with <code>Parcel.obtain()</code>, you made all three, and <code>recycle()</code> frees them.</p>
+<p>Binder also hands you Parcels you did not make. Freeing those the normal way would be a bug:</p>
 <ul>
-  <li><b>The bytes may belong to the kernel.</b> An incoming request arrives in your process's Binder buffer (the ~1&nbsp;MiB kernel-managed area from Figure P5). Copying it into <code>malloc</code> just so the Parcel could own it would add a second copy to every Binder call, so libbinder reads it where it lies. Those bytes must go back to the kernel with a <code>BC_FREE_BUFFER</code> command. Calling <code>free()</code> on them would corrupt the heap.</li>
-  <li><b>The C++ struct may be someone else's local variable.</b> When a Binder thread runs an incoming call, libbinder declares <code>Parcel data, reply;</code> as ordinary local variables in <code>IPCThreadState::executeCommand()</code>. They live on that thread's stack and vanish when the call ends. A Java wrapper that tried to <code>delete</code> them would crash the process.</li>
+  <li><b>The bytes may belong to the kernel.</b> An incoming request is read where the kernel put it, in your process's Binder buffer (Figure P5); copying it into <code>malloc</code> first would add a second copy to every call. Those bytes go back to the kernel with <code>BC_FREE_BUFFER</code>. Passing them to <code>free()</code> would corrupt the heap.</li>
+  <li><b>The C++ struct may be someone else's local variable.</b> For an incoming call, libbinder declares <code>Parcel data, reply;</code> as locals in <code>IPCThreadState::executeCommand()</code>, on the Binder thread's stack. They vanish when the call ends. Deleting them from Java would crash the process.</li>
 </ul>
-<p><b>The solution.</b> Each Parcel records the answer to two separate questions, one per layer:</p>
+<p><b>The solution.</b> Each Parcel answers two questions, one per layer:</p>
 <ol>
-  <li><b>Does the Java wrapper own the C++ struct?</b> That is the Java field <code>mOwnsNativeParcelObject</code>. If <code>true</code>, the wrapper created the struct (<code>nativeCreate()</code> → <code>new Parcel()</code>) and will delete it. If <code>false</code>, the wrapper is only a temporary window onto a struct that C++ code owns.</li>
-  <li><b>How are the bytes released?</b> That is the C++ field <code>mOwner</code>. If it is <code>nullptr</code>, the bytes came from <code>malloc</code> and are released with <code>free()</code>. If it is set, it points to a function to call <i>instead</i> of <code>free()</code>. For Binder that function is <code>IPCThreadState::freeBuffer</code>, which sends <code>BC_FREE_BUFFER</code> so the kernel can reuse that part of the Binder buffer.</li>
+  <li><b>Does the Java wrapper own the C++ struct?</b> Java field <code>mOwnsNativeParcelObject</code>. <code>true</code>: the wrapper created the struct (<code>nativeCreate()</code> → <code>new Parcel()</code>) and deletes it. <code>false</code>: the wrapper is a temporary view of a struct that C++ owns.</li>
+  <li><b>How are the bytes released?</b> C++ field <code>mOwner</code>. <code>nullptr</code>: the bytes came from <code>malloc</code> and are released with <code>free()</code>. Otherwise it points to the function to call instead; for Binder that is <code>IPCThreadState::freeBuffer</code>, which sends <code>BC_FREE_BUFFER</code>.</li>
 </ol>
-<p>The two questions really are independent: all four combinations occur in an ordinary call, as Figure&nbsp;1 shows. The surprising cell is the client's <code>reply</code>: you created it with <code>obtain()</code>, so you own the struct, but after <code>transact()</code> its bytes point into <i>your</i> Binder buffer, where the kernel copied the server's answer.</p>
+<p>The two answers are independent, and all four combinations occur in one ordinary call (Figure&nbsp;1). The unexpected one is the client's reply, cell C: you created it with <code>obtain()</code>, so you own the struct, but after <code>transact()</code> its bytes are the server's answer sitting in your Binder buffer.</p>
 
 <figure>
 <figcaption><b>Figure 1. The four kinds of Parcel in one Binder call, sorted by who frees the struct (columns) and who frees the bytes (rows).</b> Only the top row costs native heap. The bottom row is memory in the Binder buffer, handed back to the kernel with <code>BC_FREE_BUFFER</code>. Writing to a bottom-row Parcel first copies its bytes into <code>malloc</code> and gives the kernel slice back, so it moves to the top row.</figcaption>
@@ -529,16 +529,55 @@ When you build a Parcel yourself with <code>Parcel.obtain()</code>, you created 
 </svg>
 </figure>
 
-<p><b>Why there are two pools.</b> Every Binder call needs Parcel wrappers on both sides, so <code>Parcel.java</code> keeps up to 32 spare wrappers of each kind instead of allocating new Java objects each time.
-The kinds cannot share a pool because they are built differently.
-An owned wrapper (<code>sOwnedPool</code>, the left column: A and C) keeps its own empty C++ struct attached, ready to reuse.
-A holder wrapper (<code>sHolderPool</code>, the right column: B and D) has no struct of its own; <code>Binder.execTransact()</code> takes one through the package-private <code>Parcel.obtain(long ptr)</code> and points it at libbinder's stack struct for the length of one call.
-Neither pool keeps payload bytes: <code>recycle()</code> releases the bytes first, so a pooled wrapper costs only the Java object, plus the 120-byte struct for owned wrappers.</p>
+<p><b>Two pools of spare wrappers.</b> Every Binder call needs wrappers on both sides, so <code>Parcel.java</code> keeps up to 32 spares of each kind instead of allocating Java objects per call.
+One pool cannot serve both kinds, because what a spare wrapper carries differs (Figure&nbsp;1b).</p>
 
-<p><b>What this means for memory.</b> Only the top row of Figure&nbsp;1 is native heap that can linger. Cells B, C and D are gone within one call. Cell A is short-lived for ordinary requests, but it is also where a <code>Bundle</code>'s private copy lives (Figure P7), and that copy can stay in <code>system_server</code> for hours. Sections 2 and 3 follow that cell.</p>
+<figure>
+<figcaption><b>Figure 1b. What a spare wrapper carries.</b> An owned wrapper keeps its empty C++ struct between uses. A holder wrapper carries nothing and is pointed at libbinder's stack struct for one call. Neither pool keeps payload bytes: <code>recycle()</code> releases them before the wrapper goes back.</figcaption>
+<svg viewBox="0 0 760 330" role="img" aria-label="Two pools: owned wrappers keep an empty C++ struct; holder wrappers carry nothing and borrow libbinder's stack struct for one call">
+  <text x="10" y="18" class="tb">owned wrappers <tspan class="tms">sOwnedPool</tspan> · cells A and C</text>
+  <rect x="10" y="26" width="365" height="296" rx="3" class="panel"/>
+  <text x="24" y="48" class="ts">a spare, waiting in the pool:</text>
+  <rect x="24" y="58" width="130" height="44" rx="3" class="b"/>
+  <text x="89" y="85" class="tb" text-anchor="middle">Java wrapper</text>
+  <path d="M154,80 L190,80" class="lna" marker-end="url(#aha)"/>
+  <rect x="192" y="58" width="168" height="44" rx="3" class="ba"/>
+  <text x="276" y="77" class="tb ta" text-anchor="middle">C++ struct, 120 B</text>
+  <text x="276" y="94" class="tms" text-anchor="middle">mData = null</text>
+  <text x="24" y="134" class="tb">obtain()</text>
+  <text x="24" y="152" class="ts">take a spare; writes malloc the bytes</text>
+  <text x="24" y="182" class="tb">recycle()</text>
+  <text x="24" y="200" class="ts">free the bytes, then put the wrapper and</text>
+  <text x="24" y="216" class="ts">its empty struct back (if fewer than 32)</text>
+  <rect x="24" y="234" width="336" height="80" rx="3" class="br"/>
+  <text x="36" y="254" class="tb tr">never recycled</text>
+  <text x="36" y="272" class="ts">the bytes stay allocated until the GC</text>
+  <text x="36" y="288" class="ts">runs finalize() → delete, which can be</text>
+  <text x="36" y="303" class="ts">long after the Parcel stopped being used</text>
 
-<p>In code: <code>recycle()</code> on an owned Parcel calls <code>freeBuffer()</code> → <code>nativeFreeBuffer()</code> → <code>Parcel::freeData()</code>, which frees <code>mData</code> and <code>mObjects</code> immediately, then returns the wrapper (and its now-empty struct) to <code>sOwnedPool</code>.
-If the pool already holds 32 wrappers, or the Parcel is simply dropped without <code>recycle()</code>, nothing frees the bytes until the garbage collector runs <code>Parcel.finalize()</code> → <code>destroy()</code> → <code>delete parcel</code>.</p>
+  <text x="395" y="18" class="tb">holder wrappers <tspan class="tms">sHolderPool</tspan> · cells B and D</text>
+  <rect x="385" y="26" width="365" height="296" rx="3" class="panel"/>
+  <text x="399" y="48" class="ts">a spare, waiting in the pool:</text>
+  <rect x="399" y="58" width="130" height="44" rx="3" class="b"/>
+  <text x="464" y="85" class="tb" text-anchor="middle">Java wrapper</text>
+  <rect x="565" y="58" width="168" height="44" rx="3" fill="url(#hatch)" stroke="var(--bd)"/>
+  <text x="649" y="85" class="ts" text-anchor="middle">nothing attached</text>
+  <text x="399" y="134" class="tb">Binder.execTransact()</text>
+  <text x="399" y="152" class="ts">obtain(ptr) points a spare at libbinder's</text>
+  <text x="399" y="168" class="ts">stack struct for this one call</text>
+  <text x="399" y="198" class="tb">recycle()</text>
+  <text x="399" y="216" class="ts">detach (mNativePtr = 0) and put it back;</text>
+  <text x="399" y="232" class="ts">Java frees nothing</text>
+  <rect x="399" y="250" width="336" height="64" rx="3" class="bv"/>
+  <text x="411" y="270" class="tb tv">libbinder owns the struct and bytes</text>
+  <text x="411" y="288" class="ts">the stack struct ends with the call; the</text>
+  <text x="411" y="303" class="ts">bytes go back to the kernel or are freed</text>
+</svg>
+</figure>
+
+<p><b>What this means for memory.</b> Only the top row of Figure&nbsp;1 is native heap that can linger. B, C and D are released within one call. A is short-lived for ordinary requests, but it is also where a Bundle's private copy lives (Figure P7), and that copy can stay in <code>system_server</code> for hours. Sections 2 and 3 follow cell A.</p>
+
+<p>In code: <code>recycle()</code> on an owned Parcel calls <code>freeBuffer()</code> → <code>nativeFreeBuffer()</code> → <code>Parcel::freeData()</code>, which frees <code>mData</code> and <code>mObjects</code> at once, then offers the wrapper to <code>sOwnedPool</code>. If the pool already holds 32, the wrapper is not kept and only its empty struct waits for the GC. A Parcel dropped without <code>recycle()</code> keeps its bytes until the GC runs <code>Parcel.finalize()</code> → <code>destroy()</code> → <code>delete parcel</code>.</p>
 
 <pre><code><span class="src">frameworks/base/core/java/android/os/Parcel.java · recycle() &amp; finalize()</span><span class="k">public final void</span> recycle() {
     mRecycled = <span class="k">true</span>;
