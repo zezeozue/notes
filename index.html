@@ -44,6 +44,11 @@ and explains the rest with figures and tables.</p>
     <span class="note-sub">Why a normal Binder call copies once into a kernel mapping, why a Bundle copies its slice onto the native heap via malloc, and which system_server structures keep app payloads alive.</span>
     <span class="note-meta">Parcel · Binder · Bundle · system_server</span>
   </a></li>
+  <li><a href="binder_client_trace/index.html">
+    <span class="note-title">Naming both ends of a Binder call in a trace: client-side AIDL slices from BpBinder</span>
+    <span class="note-sub">How libbinder names the server end of an AIDL call today, why the client end shows only "blocked in binder", and two ways to give it the same name: a table attached by generated code, or reflection in BinderProxy. With costs and on-device checks. Includes a Binder-from-scratch primer.</span>
+    <span class="note-meta">Binder · AIDL · libbinder · atrace · Perfetto</span>
+  </a></li>
   <li><a href="oom_adjuster/index.html">
     <span class="note-title">How Android decides which processes to kill, slow down or freeze</span>
     <span class="note-sub">How OomAdjuster ranks processes across service and provider bindings, keeps raw and committed copies of each score, drives lmkd, cgroups and the cached-app freezer, and shows up in Perfetto.</span>

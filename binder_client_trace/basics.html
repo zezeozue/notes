@@ -1,0 +1,1316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Binder from scratch: how both ends of an AIDL call get named in a trace</title>
+<meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#171614" media="(prefers-color-scheme: dark)" />
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../assets/site.css" />
+<script src="../assets/site.js"></script>
+<style>
+details { margin: 12px 0; border: 1px solid var(--line, #ccc); border-radius: 6px; padding: 6px 12px; }
+details > summary { cursor: pointer; color: var(--muted, #666); }
+</style>
+</head>
+<body class="note">
+<div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-l"/></pattern>
+    <pattern id="hatchr" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" class="hatch-r"/></pattern>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <button type="button" class="icon-btn" id="nav-btn" aria-controls="toc" aria-expanded="false" title="Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="lbl">Contents</span></button>
+  <a class="tb-home" href="../index.html">Notes</a>
+  <span class="tb-sep" aria-hidden="true">/</span>
+  <span class="tb-title" title="Parcels · BpBinder/BBinder · generated code · trace names">Binder from scratch</span>
+  <span class="tb-spacer"></span>
+  <a class="tb-x" href="index.html">BpBinder client slices</a>
+  <a class="tb-x" href="../parcel_native_memory/index.html">Parcel &amp; native memory</a>
+  <button type="button" class="icon-btn" id="theme-btn" title="Theme" aria-label="Theme"></button>
+</header>
+
+<nav id="toc" aria-label="Contents">
+  <div class="h">Contents</div>
+  <a href="#big">0 · The whole story in five pictures</a>
+  <a href="#wall">1 · Two processes, one wall</a>
+  <a href="#parcel">2 · The envelope: Parcel</a>
+  <a href="#wire">3 · On the wire: the actual bytes</a>
+  <a href="#ibinder">4 · BpBinder and BBinder</a>
+  <a href="#aidl">5 · The AIDL compiler</a>
+  <a href="#java">6 · Java wears a native costume</a>
+  <a href="#seq">7 · Sequence diagrams</a>
+  <a href="#trace">8 · What a trace slice is</a>
+  <a href="#who">9 · Generated code vs libbinder</a>
+  <a href="#server">10 · How the server names its slice</a>
+  <a href="#blind">11 · Why the client was blind</a>
+  <a href="#cheat">12 · Fix 1: a cheat sheet (cpp)</a>
+  <a href="#peek">13 · Fix 2: Java proxies register their Stub</a>
+  <a href="#whoknows" style="padding-left:18px">who knows what; registration step by step</a>
+  <a href="#result">14 · What you see now</a>
+  <a href="#cost">15 · How the costs were measured</a>
+  <a href="#glossary">Glossary</a>
+</nav>
+
+<main id="top">
+<h1>Binder from scratch: how a call crosses processes, and how both ends get a name in the trace</h1>
+<p class="lead">An app asks system_server a question: <i>"is a monkey driving this phone?"</i> (<code>IActivityManager.isUserAMonkey()</code>). The two programs share no memory. Yet the call looks like an ordinary method call in the app's code, and with the change in <a href="index.html">the companion report</a>, a trace labels both ends with the same name. This note follows that one call from start to finish and introduces each piece only when the call needs it.</p>
+
+<h2 id="big"><span class="n">0</span>The whole story in five pictures</h2>
+<p>If you only read one section, read this one. Each picture answers one question, and the rest of the note unpacks them.</p>
+
+<h3>Picture 1 · The life of one transaction</h3>
+<figure>
+<figcaption><b>One call, start to finish.</b> Time runs left to right; each row is one thread. The app thread does a little work (1–2), then sleeps inside the kernel while the request travels (3), system_server does the real work (4–5), and the reply travels back (6–7) and wakes the app (8). The two colored bars are the trace slices: the <b>server</b> slice (green) already existed; the <b>client</b> slice (blue) is what this change adds. It spans everything the app waited for.</figcaption>
+<svg viewBox="0 0 1000 400" role="img" aria-label="Life of a transaction">
+  <text x="12" y="74" class="tb">app thread</text>
+  <text x="12" y="192" class="tb">kernel</text>
+  <text x="12" y="310" class="tb">system_server</text><text x="12" y="326" class="ts">binder thread</text>
+  <line x1="130" y1="70" x2="985" y2="70" class="ln" style="opacity:.35"/>
+  <line x1="130" y1="188" x2="985" y2="188" class="ln" style="opacity:.35"/>
+  <line x1="130" y1="306" x2="985" y2="306" class="ln" style="opacity:.35"/>
+
+  <!-- client slice (new) -->
+  <rect x="262" y="22" width="604" height="22" rx="3" class="ba"/>
+  <text x="270" y="38" class="tms">AIDL::java::android.app.IActivityManager::isUserAMonkey::client   (new)</text>
+  <!-- server slice -->
+  <rect x="470" y="262" width="236" height="22" rx="3" class="bg"/>
+  <text x="476" y="278" class="tms">…::isUserAMonkey::server  (existing)</text>
+
+  <!-- app work boxes -->
+  <rect x="140" y="54" width="110" height="32" rx="4" class="b"/><text x="195" y="74" text-anchor="middle" class="tms">Proxy fills Parcel</text>
+  <rect x="262" y="54" width="34" height="32" rx="4" class="bg"/><text x="279" y="74" text-anchor="middle" class="tms" style="font-size:9.5px">Bp</text>
+  <rect x="300" y="58" width="560" height="24" fill="url(#hatch)" class="b0"/><text x="580" y="74" text-anchor="middle" class="ts">sleeping in the kernel, waiting for the reply</text>
+  <rect x="866" y="54" width="114" height="32" rx="4" class="b"/><text x="923" y="74" text-anchor="middle" class="tms">read reply</text>
+
+  <!-- kernel boxes -->
+  <rect x="300" y="172" width="150" height="32" rx="4" class="b2"/><text x="375" y="192" text-anchor="middle" class="tms">copy 76 B, wake</text>
+  <rect x="710" y="172" width="150" height="32" rx="4" class="b2"/><text x="785" y="192" text-anchor="middle" class="tms">copy 8 B, wake</text>
+
+  <!-- server boxes -->
+  <rect x="470" y="290" width="236" height="32" rx="4" class="b"/><text x="588" y="310" text-anchor="middle" class="tms">Stub.onTransact → isUserAMonkey()</text>
+
+  <!-- arrows -->
+  <path d="M296,86 L310,172" class="lna" marker-end="url(#aha)"/>
+  <path d="M450,204 L476,290" class="lna" marker-end="url(#aha)"/>
+  <path d="M706,290 L720,204" class="lng" marker-end="url(#ahg)"/>
+  <path d="M860,172 L872,86" class="lng" marker-end="url(#ahg)"/>
+
+  <!-- numbered steps -->
+  <g class="tm" style="font-size:11px">
+  <circle cx="195" cy="104" r="10" class="b0"/><text x="195" y="108" text-anchor="middle">1</text>
+  <circle cx="279" cy="104" r="10" class="b0"/><text x="279" y="108" text-anchor="middle">2</text>
+  <circle cx="375" cy="222" r="10" class="b0"/><text x="375" y="226" text-anchor="middle">3</text>
+  <circle cx="490" cy="340" r="10" class="b0"/><text x="490" y="344" text-anchor="middle">4</text>
+  <circle cx="680" cy="340" r="10" class="b0"/><text x="680" y="344" text-anchor="middle">5</text>
+  <circle cx="785" cy="222" r="10" class="b0"/><text x="785" y="226" text-anchor="middle">6</text>
+  <circle cx="866" cy="104" r="10" class="b0"/><text x="866" y="108" text-anchor="middle">7</text>
+  <circle cx="923" cy="104" r="10" class="b0"/><text x="923" y="108" text-anchor="middle">8</text>
+  </g>
+  <text x="140" y="372" class="ts">1 Proxy writes descriptor + args · 2 BpBinder::transact: client slice begins, ioctl · 3 kernel copies Parcel into system_server, wakes a thread ·
+</text>
+  <text x="140" y="390" class="ts">4 BBinder::transact: server slice begins · 5 method returns, reply written, server slice ends · 6 kernel copies reply · 7 app wakes, client slice ends · 8 Proxy reads reply</text>
+</svg>
+</figure>
+
+<h3>Picture 2 · What the trace showed before, and what it shows now</h3>
+<figure>
+<figcaption><b>Before vs. after, as Perfetto draws it.</b> Before: system_server's thread had a named slice, but the app's thread showed only that it was blocked in binder. To find out who it was waiting on, you had to follow kernel binder events into another process, and ProfilingManager traces strip other processes. After: the app's own thread says exactly which interface and method it was waiting on, and the name matches the server's.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Before and after">
+  <text x="245" y="20" text-anchor="middle" class="tb">before</text>
+  <text x="755" y="20" text-anchor="middle" class="tb">after (this change)</text>
+  <line x1="500" y1="8" x2="500" y2="240" class="ln dash"/>
+  <text x="20" y="64" class="ts">app thread</text>
+  <rect x="100" y="48" width="370" height="26" fill="url(#hatch)" class="b0"/><text x="285" y="66" text-anchor="middle" class="ts">blocked in binder · no name</text>
+  <text x="20" y="144" class="ts">server thread</text>
+  <rect x="210" y="128" width="150" height="26" rx="3" class="bg"/><text x="285" y="146" text-anchor="middle" class="tms">…::isUserAMonkey::server</text>
+  <text x="100" y="196" class="ts tr">"What is this app waiting for?"</text>
+  <text x="100" y="214" class="ts">→ follow kernel events into another process (often redacted)</text>
+
+  <text x="530" y="64" class="ts">app thread</text>
+  <rect x="610" y="48" width="370" height="26" rx="3" class="ba"/><text x="795" y="66" text-anchor="middle" class="tms">…::isUserAMonkey::client</text>
+  <text x="530" y="144" class="ts">server thread</text>
+  <rect x="720" y="128" width="150" height="26" rx="3" class="bg"/><text x="795" y="146" text-anchor="middle" class="tms">…::isUserAMonkey::server</text>
+  <path d="M795,74 L795,128" class="ln dash" marker-end="url(#ah)"/>
+  <text x="610" y="196" class="ts tg">The app's own thread names the call.</text>
+  <text x="610" y="214" class="ts">Same string on both ends: AIDL::java::android.app.IActivityManager::isUserAMonkey</text>
+</svg>
+</figure>
+
+<h3>Picture 3 · How the server names its slice (unchanged)</h3>
+<figure>
+<figcaption><b>Server side, inside <code>BBinder::transact</code>.</b> One cheap check decides everything. If the <code>aidl</code> tag is off, the call goes straight to the generated code. If it's on, libbinder builds the name from things the server already holds: its own descriptor, and method names from either a table (cpp, NDK, Rust) or the Java Stub.</figcaption>
+<svg viewBox="0 0 1000 330" role="img" aria-label="Server naming flow">
+  <rect x="380" y="10" width="240" height="36" rx="6" class="ba"/><text x="500" y="33" text-anchor="middle" class="tm">BBinder::transact(code, data)</text>
+  <polygon points="500,62 590,92 500,122 410,92" class="b0"/><text x="500" y="96" text-anchor="middle" class="tms">aidl tag on?</text>
+  <path d="M500,46 L500,62" class="ln" marker-end="url(#ah)"/>
+  <path d="M590,92 L830,92 L830,272" class="lng" style="stroke-width:3" marker-end="url(#ahg)"/><text x="700" y="84" text-anchor="middle" class="ts tg">no (almost always)</text>
+  <path d="M410,92 L170,92 L170,140" class="lna" marker-end="url(#aha)"/><text x="290" y="84" text-anchor="middle" class="ts ta">yes</text>
+  <rect x="60" y="140" width="220" height="44" rx="5" class="b"/><text x="170" y="160" text-anchor="middle" class="tm">descriptor</text><text x="170" y="176" text-anchor="middle" class="ts">getInterfaceDescriptor(): local</text>
+  <polygon points="170,198 270,224 170,250 70,224" class="b0"/><text x="170" y="228" text-anchor="middle" class="tms">Java service?</text>
+  <path d="M170,184 L170,198" class="ln" marker-end="url(#ah)"/>
+  <rect x="320" y="150" width="250" height="44" rx="5" class="bg"/><text x="445" y="170" text-anchor="middle" class="tm">names[code − 1]</text><text x="445" y="186" text-anchor="middle" class="ts">table from generated constructor</text>
+  <rect x="320" y="226" width="250" height="44" rx="5" class="bg"/><text x="445" y="246" text-anchor="middle" class="tm">Stub.getTransactionName(code)</text><text x="445" y="262" text-anchor="middle" class="ts">via JavaBBinder, JNI</text>
+  <path d="M270,224 L295,224 L295,172 L320,172" class="ln" marker-end="url(#ah)"/><text x="300" y="166" class="ts">no</text>
+  <path d="M270,224 L295,224 L295,248 L320,248" class="ln" marker-end="url(#ah)"/><text x="300" y="262" class="ts">yes</text>
+  <rect x="600" y="196" width="170" height="40" rx="5" class="ba"/><text x="685" y="214" text-anchor="middle" class="tm">trace_begin</text><text x="685" y="229" text-anchor="middle" class="ts">"…::server"</text>
+  <path d="M570,172 L600,210" class="ln" marker-end="url(#ah)"/><path d="M570,248 L600,222" class="ln" marker-end="url(#ah)"/>
+  <path d="M770,216 L810,272" class="ln" marker-end="url(#ah)"/>
+  <rect x="740" y="272" width="180" height="40" rx="5" class="b"/><text x="830" y="290" text-anchor="middle" class="tm">onTransact(code)</text><text x="830" y="305" text-anchor="middle" class="ts">generated Stub, then trace_end</text>
+</svg>
+</figure>
+
+<h3>Picture 4 · How the client names its slice (the change)</h3>
+<figure>
+<figcaption><b>Client side: set up once, then checked on every call.</b> Top: when a proxy is built, its generated constructor attaches a per-interface table to the <code>BpBinder</code>. cpp hands over a static table with all names. Java calls <code>BinderProxy.setTransactionNames</code>, and JNI attaches a table that knows the descriptor and the <code>Stub</code> class. Bottom: inside <code>BpBinder::transact</code>, the thick green line is the path almost every call takes: one check, then straight to the kernel. Only when someone is tracing <code>aidl</code> does the blue path run. cpp reads <code>names[code − 1]</code>; Java calls the table's <code>resolveName</code>, which asks <code>Stub.getDefaultTransactionName</code> once per code and caches the answer. No path makes an extra binder call, and the untraced path does no allocation and takes no lock.</figcaption>
+<svg viewBox="0 0 1000 650" role="img" aria-label="Client naming flow">
+  <text x="40" y="16" class="th">once, when the proxy is built</text>
+  <rect x="40" y="24" width="170" height="40" rx="5" class="b"/><text x="125" y="42" text-anchor="middle" class="tm">BpFoo ctor</text><text x="125" y="57" text-anchor="middle" class="ts">generated cpp</text>
+  <path d="M210,44 L235,44" class="ln" marker-end="url(#ah)"/>
+  <rect x="235" y="24" width="525" height="40" rx="5" class="bg"/><text x="497" y="42" text-anchor="middle" class="tm">bp-&gt;setTransactionCodeMap(&amp;IFoo_data)</text><text x="497" y="57" text-anchor="middle" class="ts">static table: descriptor + names[]</text>
+  <rect x="40" y="76" width="170" height="56" rx="5" class="b"/><text x="125" y="98" text-anchor="middle" class="tm">Stub.Proxy ctor</text><text x="125" y="114" text-anchor="middle" class="ts">generated Java</text>
+  <path d="M210,104 L235,104" class="lna" marker-end="url(#aha)"/>
+  <rect x="235" y="76" width="320" height="56" rx="5" class="ba"/><text x="395" y="98" text-anchor="middle" class="tm">BinderProxy.setTransactionNames</text><text x="395" y="116" text-anchor="middle" class="ts">(remote, DESCRIPTOR, Stub.class)</text>
+  <path d="M555,104 L580,104" class="lna" marker-end="url(#aha)"/>
+  <rect x="580" y="76" width="180" height="56" rx="5" class="ba"/><text x="670" y="94" text-anchor="middle" class="tm">JNI: table</text><text x="670" y="110" text-anchor="middle" class="ts">descriptor, Stub ref,</text><text x="670" y="124" text-anchor="middle" class="ts">jmethodID, name cache</text>
+  <path d="M760,44 L796,44" class="ln" marker-end="url(#ah)"/>
+  <path d="M760,104 L796,104" class="lna" marker-end="url(#aha)"/>
+  <rect x="800" y="24" width="170" height="108" rx="6" class="bg"/><text x="885" y="58" text-anchor="middle" class="tm">BpBinder</text><text x="885" y="76" text-anchor="middle" class="ts">handle + table pointer</text><text x="885" y="92" text-anchor="middle" class="ts">first table wins</text>
+  <line x1="20" y1="150" x2="980" y2="150" class="ln dash" style="opacity:.5"/>
+  <text x="40" y="170" class="th">every call</text>
+  <g transform="translate(0,160)">
+  <rect x="270" y="8" width="220" height="36" rx="6" class="bg"/><text x="380" y="31" text-anchor="middle" class="tm">BpBinder::transact(code, data)</text>
+  <path d="M380,44 L380,64" class="ln" marker-end="url(#ah)"/>
+  <polygon points="380,64 480,92 380,120 280,92" class="b0"/><text x="380" y="90" text-anchor="middle" class="tms">aidl tag on?</text><text x="380" y="104" text-anchor="middle" class="ts">1 load + 1 bit test</text>
+  <path d="M480,92 L880,92 L880,408" class="lng" style="stroke-width:3" marker-end="url(#ahg)"/>
+  <text x="680" y="84" text-anchor="middle" class="ts tg">no (almost always): straight to the kernel</text>
+  <path d="M380,120 L380,150" class="lna" marker-end="url(#aha)"/><text x="388" y="139" class="ts ta">yes</text>
+  <polygon points="380,150 490,178 380,206 270,178" class="b0"/><text x="380" y="175" text-anchor="middle" class="tms">table attached</text><text x="380" y="189" text-anchor="middle" class="tms">and a user code?</text>
+  <path d="M490,178 L868,178" class="ln dash" marker-end="url(#ah)"/>
+  <text x="680" y="170" text-anchor="middle" class="ts">no: no client slice (NDK/Rust proxies trace themselves)</text>
+  <path d="M380,206 L380,236" class="lna" marker-end="url(#aha)"/><text x="388" y="225" class="ts ta">yes</text>
+  <polygon points="380,236 480,264 380,292 280,264" class="b0"/><text x="380" y="268" text-anchor="middle" class="tms">names in table?</text>
+  <path d="M280,264 L244,264" class="lna" marker-end="url(#aha)"/><text x="262" y="256" text-anchor="middle" class="ts ta">yes</text>
+  <rect x="40" y="240" width="200" height="48" rx="5" class="bg"/><text x="140" y="260" text-anchor="middle" class="tm">cpp: names[code − 1]</text><text x="140" y="278" text-anchor="middle" class="ts">descriptor from the table</text>
+  <path d="M480,264 L516,258" class="lna" marker-end="url(#aha)"/><text x="498" y="252" text-anchor="middle" class="ts ta">no</text>
+  <rect x="520" y="236" width="250" height="42" rx="5" class="ba"/><text x="645" y="254" text-anchor="middle" class="tm">Java: resolveName(t, code)</text><text x="645" y="270" text-anchor="middle" class="ts">descriptor from the table</text>
+  <path d="M645,278 L645,292" class="ln" marker-end="url(#ah)"/>
+  <rect x="520" y="292" width="250" height="42" rx="5" class="ba"/><text x="645" y="310" text-anchor="middle" class="tm">cache[code]</text><text x="645" y="326" text-anchor="middle" class="ts">miss: Stub.getDefaultTransactionName</text>
+  <path d="M140,288 L140,382 L266,382" class="lna" marker-end="url(#aha)"/>
+  <path d="M645,334 L645,382 L494,382" class="lna" marker-end="url(#aha)"/>
+  <rect x="270" y="360" width="220" height="44" rx="5" class="ba"/><text x="380" y="378" text-anchor="middle" class="tm">snprintf + trace_begin</text><text x="380" y="395" text-anchor="middle" class="ts">"AIDL::&lt;backend&gt;::&lt;desc&gt;::&lt;method&gt;::client"</text>
+  <path d="M380,404 L380,432 L786,432" class="lna" marker-end="url(#aha)"/>
+  <rect x="790" y="410" width="180" height="44" rx="5" class="b2"/><text x="880" y="430" text-anchor="middle" class="tm">IPCThreadState</text><text x="880" y="446" text-anchor="middle" class="ts">ioctl → kernel → reply</text>
+  <text x="880" y="476" text-anchor="middle" class="ts">then trace_end, only if trace_begin ran</text>
+  </g>
+</svg>
+</figure>
+
+<h3>Picture 5 · Why it's cheap</h3>
+<figure>
+<figcaption><b>Per call, to scale where it can be.</b> The whole binder call (grey) is about 40 µs on this VM. With tracing off, the change adds about 9 instructions, a few nanoseconds: about a ten-thousandth of the bar, too thin to draw, so it is shown magnified a thousand times. With <code>aidl</code> tracing on, a client slice adds about 2.35 µs (measured on native calls), mostly the two writes to the kernel's trace buffer. Everything sits behind a read-only build flag, <code>android.os.binder.flags.bpbinder_client_trace</code>, which is <b>off by default</b> and compiles the whole thing out.</figcaption>
+<svg viewBox="0 0 1000 230" role="img" aria-label="Cost to scale">
+  <text x="20" y="44" class="t">tracing off</text>
+  <rect x="160" y="28" width="760" height="26" class="b2"/><text x="540" y="46" text-anchor="middle" class="tms">binder call ≈ 40 µs</text>
+  <rect x="920" y="28" width="2" height="26" class="fg"/>
+  <path d="M921,58 L921,74 L880,74" class="lng"/><text x="870" y="78" text-anchor="end" class="tms tg">+ ~9 instructions (≈ 2–3 ns); the box below is that time ×1000, to scale →</text>
+  <rect x="872" y="84" width="48" height="14" class="bg"/>
+  <text x="20" y="144" class="t">tracing on</text>
+  <rect x="160" y="128" width="760" height="26" class="b2"/><text x="540" y="146" text-anchor="middle" class="tms">binder call ≈ 40 µs</text>
+  <rect x="920" y="128" width="45" height="26" class="bw"/><text x="942" y="146" text-anchor="middle" class="tms">+2.3</text>
+  <text x="160" y="182" class="ts">orange: one client slice ≈ 2.3 µs (native): snprintf (0.1 µs) + two trace_marker writes (~0.9 µs hot, more in context)</text>
+  <text x="160" y="200" class="ts">plus ≈ 57 + strlen(name) bytes of trace buffer (≈ 133 B for a typical name)</text>
+  <text x="160" y="218" class="ts">memory: BpBinder stays 160 bytes; libbinder +1.4 KB of shared code</text>
+</svg>
+</figure>
+<p>The rest of the note builds these pictures up from scratch: what a process boundary is, what a Parcel is, what <code>BpBinder</code> and <code>BBinder</code> are, what the AIDL compiler generates, and how each number above was measured.</p>
+
+<h2 id="wall"><span class="n">1</span>Two processes, one wall</h2>
+<p>Every Android app and every system service runs in its own <b>process</b>. A process gets its own private address space: the app's address <code>0x7f00…</code> and system_server's <code>0x7f00…</code> are completely different bytes. So the app cannot just jump into system_server's code, or hand it a pointer. There's a wall between them.</p>
+<p>Only the kernel can see both sides. <b>Binder</b> is the kernel driver Android uses to pass a request through that wall. It does something unusual: it moves a <i>thread's attention</i>, not just bytes. The calling thread goes to sleep, a thread in the other process wakes up with the request, runs the method, sends back a reply, and the caller wakes up holding the answer. From the caller's point of view, it called a function and it returned.</p>
+<figure>
+<figcaption><b>A binder call is a relay.</b> The app thread hands a request to the kernel and sleeps. A system_server thread that was waiting in the kernel wakes up, does the work, and hands the reply back. Arrows go down into the kernel and back up; nothing crosses the wall directly.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Binder relay">
+  <rect x="40" y="20" width="360" height="120" rx="8" class="b"/>
+  <text x="220" y="44" text-anchor="middle" class="tb">app process</text>
+  <text x="220" y="66" text-anchor="middle" class="tms">am.isUserAMonkey()</text>
+  <rect x="600" y="20" width="360" height="120" rx="8" class="b"/>
+  <text x="780" y="44" text-anchor="middle" class="tb">system_server process</text>
+  <text x="780" y="66" text-anchor="middle" class="tms">ActivityManagerService.isUserAMonkey()</text>
+  <line x1="500" y1="10" x2="500" y2="150" class="lnr dash"/>
+  <text x="500" y="165" text-anchor="middle" class="ts tr">no shared memory</text>
+  <rect x="40" y="185" width="920" height="50" rx="8" class="b2"/>
+  <text x="500" y="207" text-anchor="middle" class="tb">kernel: binder driver</text>
+  <text x="500" y="224" text-anchor="middle" class="ts">copies the request into system_server, wakes one of its binder threads, carries the reply back</text>
+  <path d="M180,140 L180,185" class="lna" marker-end="url(#aha)"/><text x="190" y="168" class="ts">1 request, then sleep</text>
+  <path d="M700,185 L700,140" class="lna" marker-end="url(#aha)"/><text x="710" y="168" class="ts">2 wake, run method</text>
+  <path d="M860,140 L860,185" class="lng" marker-end="url(#ahg)"/><text x="870" y="168" class="ts">3 reply</text>
+  <path d="M300,185 L300,140" class="lng" marker-end="url(#ahg)"/><text x="310" y="168" class="ts">4 wake with answer</text>
+</svg>
+</figure>
+<p>Two questions follow immediately. <i>What</i> goes through the wall? And <i>how</i> does the app say which object, and which method, it means?</p>
+
+<h2 id="parcel"><span class="n">2</span>The envelope: Parcel</h2>
+<p>Whatever goes through has to be flat bytes, because pointers mean nothing on the other side. The container for those bytes is a <b>Parcel</b>. Think of an envelope with a long strip of paper inside and a pen that writes left to right. <code>writeInt32(7)</code> writes four bytes and moves the pen. On the other side, a reader with its own finger reads the same strip left to right: <code>readInt32()</code> returns 7 and moves the finger. That finger is the Parcel's <b>read position</b>, and it will matter later.</p>
+<p>Here is the strip for our call. <code>isUserAMonkey()</code> takes no arguments, so all that's written is a short header:</p>
+<figure>
+<figcaption><b>The Parcel for <code>isUserAMonkey()</code>.</b> Every AIDL call starts with this same header: three numbers, then the interface's name. The name is called the <b>interface descriptor</b> (or "interface token"). Arguments, if there were any, would follow it.</figcaption>
+<svg viewBox="0 0 1000 175" role="img" aria-label="Parcel layout">
+  <text x="20" y="22" class="th">byte offset →</text>
+  <rect x="20" y="34" width="110" height="52" class="b2"/><text x="75" y="56" text-anchor="middle" class="tm">policy</text><text x="75" y="74" text-anchor="middle" class="ts">strict-mode bits</text>
+  <rect x="130" y="34" width="110" height="52" class="b2"/><text x="185" y="56" text-anchor="middle" class="tm">-1</text><text x="185" y="74" text-anchor="middle" class="ts">work source</text>
+  <rect x="240" y="34" width="110" height="52" class="b2"/><text x="295" y="56" text-anchor="middle" class="tm">'SYST'</text><text x="295" y="74" text-anchor="middle" class="ts">header</text>
+  <rect x="350" y="34" width="80" height="52" class="ba"/><text x="390" y="56" text-anchor="middle" class="tm">28</text><text x="390" y="74" text-anchor="middle" class="ts">length</text>
+  <rect x="430" y="34" width="500" height="52" class="ba"/><text x="680" y="56" text-anchor="middle" class="tm">a n d r o i d . a p p . I A c t i v i t y M a n a g e r \0</text><text x="680" y="74" text-anchor="middle" class="ts">descriptor, UTF-16 (2 bytes per character)</text>
+  <text x="20" y="104" class="tms">0</text><text x="130" y="104" class="tms">4</text><text x="240" y="104" class="tms">8</text><text x="350" y="104" class="tms">12</text><text x="430" y="104" class="tms">16</text><text x="925" y="104" class="tms">74</text>
+  <path d="M350,120 L930,120" class="lna"/><text x="640" y="140" text-anchor="middle" class="ts ta">the interface token: written by every AIDL proxy, checked by every AIDL server</text>
+  <text x="20" y="165" class="ts">The method is <b>not</b> in here. It travels beside the envelope as a number: the transaction code.</text>
+</svg>
+</figure>
+<p>Notice what the envelope does <b>not</b> say: the method name. The method is identified by a plain number, the <b>transaction code</b>, which the kernel carries next to the Parcel. AIDL numbers methods in the order they're declared: the first method is code 1, the second is code 2, and so on. The string <code>"isUserAMonkey"</code> never crosses the wall. Keep that in mind; it's the whole puzzle of this note. The next section shows the exact bytes.</p>
+
+<h2 id="wire"><span class="n">3</span>On the wire: the actual bytes</h2>
+<p>"Envelope" is a metaphor. Here's what is really in memory, and what the kernel is really handed.</p>
+<h3>The Parcel bytes</h3>
+<p>Our call's Parcel is 76 bytes. Integers are 4 bytes, little-endian (least significant byte first). Strings are UTF-16: 2 bytes per character, NUL-terminated, padded to a multiple of 4.</p>
+<pre><code><span class="src">data Parcel for isUserAMonkey(), 76 bytes</span><span class="c">offset  bytes                                            meaning</span>
+0x00    00 00 00 80                                      strict-mode policy (bit 31 = "gather violations")
+0x04    ff ff ff ff                                      work source uid: -1 = not set
+0x08    54 53 59 53                                      header 'SYST' (0x53595354, little-endian)
+<span class="hw">0x0c    1c 00 00 00                                      descriptor length: 28 characters</span>
+<span class="hw">0x10    61 00 6e 00 64 00 72 00  6f 00 69 00 64 00 2e 00  a n d r o i d .</span>
+<span class="hw">0x20    61 00 70 00 70 00 2e 00  49 00 41 00 63 00 74 00  a p p . I A c t</span>
+<span class="hw">0x30    69 00 76 00 69 00 74 00  79 00 4d 00 61 00 6e 00  i v i t y M a n</span>
+<span class="hw">0x40    61 00 67 00 65 00 72 00  00 00 00 00              a g e r \0 (pad)</span>
+<span class="c">        (no arguments: isUserAMonkey() takes none)</span></code></pre>
+<p>The yellow rows are the <b>interface token</b>. The reply that comes back is tiny: 8 bytes.</p>
+<pre><code><span class="src">reply Parcel, 8 bytes</span>0x00    00 00 00 00      exception code: 0 = no exception (writeNoException)
+0x04    00 00 00 00      the boolean result: 0 = false (writeBoolean)</code></pre>
+<p>Where does the strict-mode word come from? It's how StrictMode policies follow a call into the server. The low bits carry the thread's policy, which is 0 here. Treat it as bookkeeping; for this note, the important thing is that the token always sits at byte 12.</p>
+
+<h3>What the kernel is handed</h3>
+<p>The Parcel doesn't go to the kernel on its own. libbinder wraps it in a small command and makes one system call, <code>ioctl(fd, BINDER_WRITE_READ, …)</code>, on the binder device. The command is <code>BC_TRANSACTION</code> ("binder command: transaction"), followed by this struct:</p>
+<figure>
+<figcaption><b>The request as the kernel sees it.</b> <code>binder_transaction_data</code> carries the address (handle), the method (code), and pointers to the Parcel bytes. If the Parcel contained binder objects or file descriptors, <code>offsets</code> would list where they are, so the kernel can translate them for the receiver. Ours has none.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="binder_transaction_data">
+  <text x="20" y="22" class="th">write buffer passed to ioctl(BINDER_WRITE_READ)</text>
+  <rect x="20" y="32" width="150" height="40" class="b2"/><text x="95" y="57" text-anchor="middle" class="tm">BC_TRANSACTION</text>
+  <rect x="170" y="32" width="810" height="40" class="b"/><text x="575" y="57" text-anchor="middle" class="tm">struct binder_transaction_data</text>
+  <rect x="170" y="90" width="135" height="58" class="bg"/><text x="237" y="112" text-anchor="middle" class="tm">target.handle</text><text x="237" y="130" text-anchor="middle" class="tms">7</text>
+  <rect x="305" y="90" width="110" height="58" class="b"/><text x="360" y="112" text-anchor="middle" class="tm">code</text><text x="360" y="130" text-anchor="middle" class="tms">42</text>
+  <rect x="415" y="90" width="110" height="58" class="b"/><text x="470" y="112" text-anchor="middle" class="tm">flags</text><text x="470" y="130" text-anchor="middle" class="tms">0 (sync)</text>
+  <rect x="525" y="90" width="150" height="58" class="b0"/><text x="600" y="112" text-anchor="middle" class="tm">sender_pid/euid</text><text x="600" y="130" text-anchor="middle" class="tms">filled by kernel</text>
+  <rect x="675" y="90" width="110" height="58" class="b"/><text x="730" y="112" text-anchor="middle" class="tm">data_size</text><text x="730" y="130" text-anchor="middle" class="tms">76</text>
+  <rect x="785" y="90" width="195" height="58" class="ba"/><text x="882" y="112" text-anchor="middle" class="tm">data.ptr.buffer</text><text x="882" y="130" text-anchor="middle" class="tms">→ the 76 bytes above</text>
+  <path d="M882,148 L882,196" class="lna" marker-end="url(#aha)"/>
+  <rect x="560" y="196" width="420" height="40" class="ba"/><text x="770" y="221" text-anchor="middle" class="tms">00 00 00 80 ff ff ff ff 54 53 59 53 1c 00 00 00 61 00 …</text>
+  <text x="20" y="260" class="t">The kernel copies those 76 bytes once, straight into a buffer that system_server has mapped,</text>
+  <text x="20" y="280" class="t">and wakes a binder thread there with <tspan class="tm">BR_TRANSACTION</tspan> and the same struct (handle replaced by the target object).</text>
+</svg>
+</figure>
+<p>Two details here pay off later. First, the kernel itself writes <code>sender_pid</code> and <code>sender_euid</code>, so the server knows who's calling, and the caller can't lie about it. Second, the kernel moves bytes and translates handles, but it <b>never parses the Parcel</b>. It doesn't know which interface or method this is. Those meanings exist only in user space, in the code on each end.</p>
+
+<h2 id="ibinder"><span class="n">4</span>Phone numbers and people: BpBinder, BBinder</h2>
+
+<p>Next: <i>who</i> is the envelope addressed to? system_server hosts hundreds of objects. The answer is libbinder's central abstraction, <b><code>IBinder</code></b>: "something you can send a transaction to". Its one important method is:</p>
+<pre><code>status_t transact(uint32_t code, const Parcel&amp; data, Parcel* reply, uint32_t flags);</code></pre>
+<p>There are two kinds of <code>IBinder</code>, and the difference between them is the heart of this note:</p>
+<ul>
+<li><b><code>BBinder</code></b> ("binder") is <i>the real object</i>. It lives in the process that implements the service, here system_server. When a transaction arrives, its <code>transact()</code> runs the actual code.</li>
+<li><b><code>BpBinder</code></b> ("binder proxy") is a <i>stand-in</i> for an object that lives in another process. It contains almost nothing: mainly a small integer <b>handle</b>. Its <code>transact()</code> just asks the kernel to deliver the envelope to whatever object that handle refers to.</li>
+</ul>
+<p>A good picture: a <code>BBinder</code> is a person; a <code>BpBinder</code> is that person's phone number. You can call a phone number, but you can't ask it a question about the person without making a call.</p>
+<figure>
+<figcaption><b>A handle is like a file descriptor for a remote object.</b> The app's <code>BpBinder</code> holds handle 7. Only the kernel knows that handle 7 in this app means a specific <code>BBinder</code> inside system_server. The app never sees system_server's memory.</figcaption>
+<svg viewBox="0 0 1000 220" role="img" aria-label="Handles">
+  <rect x="40" y="20" width="300" height="110" rx="8" class="b"/>
+  <text x="190" y="44" text-anchor="middle" class="tb">app process</text>
+  <rect x="80" y="62" width="220" height="50" rx="6" class="bg"/>
+  <text x="190" y="84" text-anchor="middle" class="tm">BpBinder</text><text x="190" y="102" text-anchor="middle" class="ts">handle = 7 (that's about all)</text>
+  <rect x="660" y="20" width="300" height="110" rx="8" class="b"/>
+  <text x="810" y="44" text-anchor="middle" class="tb">system_server process</text>
+  <rect x="700" y="62" width="220" height="50" rx="6" class="ba"/>
+  <text x="810" y="84" text-anchor="middle" class="tm">BBinder</text><text x="810" y="102" text-anchor="middle" class="ts">the ActivityManager object</text>
+  <rect x="360" y="150" width="280" height="56" rx="8" class="b2"/>
+  <text x="500" y="172" text-anchor="middle" class="tb">kernel</text><text x="500" y="190" text-anchor="middle" class="tms">app's handle 7 → that BBinder</text>
+  <path d="M190,112 L390,160" class="lna" marker-end="url(#aha)"/>
+  <path d="M610,160 L810,112" class="lna" marker-end="url(#aha)"/>
+</svg>
+</figure>
+<p>On the server, a few <b>binder threads</b> wait inside the kernel. When an envelope arrives for one of its <code>BBinder</code>s, the kernel wakes one of them, and it calls that <code>BBinder</code>'s <code>transact()</code> with the code and the Parcel.</p>
+
+<h2 id="aidl"><span class="n">5</span>The AIDL compiler: one .aidl file, code for four languages</h2>
+<p>Nobody writes those bytes by hand. You describe the interface once:</p>
+<pre><code><span class="src">IActivityManager.aidl (excerpt)</span>package android.app;
+interface IActivityManager {
+    ...
+    boolean isUserAMonkey();
+    ...
+}</code></pre>
+<p>The <b>AIDL compiler</b> (<code>aidl</code>, in <code>system/tools/aidl</code>) runs at build time and writes source code for whichever <b>backends</b> the build asks for: Java, C++ ("cpp"), NDK C++, and Rust. Every backend gets the same five things, in its own language:</p>
+<figure>
+<figcaption><b>What comes out of the compiler.</b> One input, four backends, and five pieces each. The names table (bottom row) is the piece this note is about: it's the only place the method names survive to runtime.</figcaption>
+<svg viewBox="0 0 1000 330" role="img" aria-label="AIDL compiler outputs">
+  <rect x="380" y="10" width="240" height="44" rx="6" class="b0"/><text x="500" y="30" text-anchor="middle" class="tm">IActivityManager.aidl</text><text x="500" y="46" text-anchor="middle" class="ts">interface + methods, in order</text>
+  <rect x="420" y="72" width="160" height="30" rx="6" class="b2"/><text x="500" y="92" text-anchor="middle" class="tm">aidl compiler</text>
+  <path d="M500,54 L500,72" class="ln" marker-end="url(#ah)"/>
+  <path d="M500,102 L240,128" class="ln" marker-end="url(#ah)"/><path d="M500,102 L460,128" class="ln" marker-end="url(#ah)"/><path d="M500,102 L680,128" class="ln" marker-end="url(#ah)"/><path d="M500,102 L890,128" class="ln" marker-end="url(#ah)"/>
+  <text x="240" y="144" text-anchor="middle" class="tb">Java</text><text x="460" y="144" text-anchor="middle" class="tb">cpp</text><text x="680" y="144" text-anchor="middle" class="tb">NDK</text><text x="890" y="144" text-anchor="middle" class="tb">Rust</text>
+  <text x="10" y="170" class="th">descriptor</text>
+  <text x="240" y="170" text-anchor="middle" class="tms">DESCRIPTOR = "android.app.…"</text><text x="460" y="170" text-anchor="middle" class="tms">IFoo::descriptor</text><text x="680" y="170" text-anchor="middle" class="tms">IFoo::descriptor</text><text x="890" y="170" text-anchor="middle" class="tms">get_descriptor()</text>
+  <text x="10" y="196" class="th">codes</text>
+  <text x="240" y="196" text-anchor="middle" class="tms">TRANSACTION_x = FIRST+i</text><text x="460" y="196" text-anchor="middle" class="tms">TRANSACTION_x</text><text x="680" y="196" text-anchor="middle" class="tms">TRANSACTION_x</text><text x="890" y="196" text-anchor="middle" class="tms">transactions::x</text>
+  <text x="10" y="222" class="th">client</text>
+  <text x="240" y="222" text-anchor="middle" class="tms">Stub.Proxy</text><text x="460" y="222" text-anchor="middle" class="tms">BpFoo</text><text x="680" y="222" text-anchor="middle" class="tms">BpFoo</text><text x="890" y="222" text-anchor="middle" class="tms">BpFoo</text>
+  <text x="10" y="248" class="th">server</text>
+  <text x="240" y="248" text-anchor="middle" class="tms">Stub.onTransact</text><text x="460" y="248" text-anchor="middle" class="tms">BnFoo::onTransact</text><text x="680" y="248" text-anchor="middle" class="tms">BnFoo::onTransact</text><text x="890" y="248" text-anchor="middle" class="tms">on_transact()</text>
+  <rect x="5" y="262" width="990" height="56" rx="6" class="bg" style="opacity:.6"/>
+  <text x="10" y="284" class="th">names</text>
+  <text x="240" y="284" text-anchor="middle" class="tms">getDefaultTransactionName()</text><text x="460" y="284" text-anchor="middle" class="tms">IFoo_names[] + IFoo_data</text><text x="680" y="284" text-anchor="middle" class="tms">names[] → AIBinder_Class</text><text x="890" y="284" text-anchor="middle" class="tms">functionNames: [c"…"]</text>
+  <text x="240" y="304" text-anchor="middle" class="ts">a switch returning literals</text><text x="460" y="304" text-anchor="middle" class="ts">static array + table</text><text x="680" y="304" text-anchor="middle" class="ts">registered at startup</text><text x="890" y="304" text-anchor="middle" class="ts">registered via the NDK</text>
+</svg>
+</figure>
+<p>Here is one method, <code>GetName()</code> from AIDL's own test interface, as each backend writes it (trimmed, real generated code). Look for the same four beats in each: <b>write the token</b>, <b>transact with a code</b> on the client; <b>check the token</b>, <b>switch on the code</b> on the server.</p>
+<details open><summary>Java (client and server)</summary>
+<div class="two">
+<pre><code><span class="src">Stub.Proxy (client)</span>String GetName() {
+  Parcel _data = Parcel.obtain(asBinder());
+  Parcel _reply = Parcel.obtain();
+<span class="hw">  _data.writeInterfaceToken(DESCRIPTOR);</span>
+<span class="hw">  mRemote.transact(Stub.TRANSACTION_GetName,</span>
+<span class="hw">                   _data, _reply, 0);</span>
+  _reply.readException();
+  return _reply.readString();
+}</code></pre>
+<pre><code><span class="src">Stub (server)</span>boolean onTransact(int code, Parcel data,
+                   Parcel reply, int flags) {
+<span class="hw">  data.enforceInterface(DESCRIPTOR);</span>
+<span class="hw">  switch (code) {</span>
+    case TRANSACTION_GetName:
+      String _result = this.GetName();
+      reply.writeNoException();
+      reply.writeString(_result);
+      ...
+}</code></pre>
+</div></details>
+<details><summary>C++ (cpp backend)</summary>
+<div class="two">
+<pre><code><span class="src">BpNamedCallback (client)</span>Status BpNamedCallback::GetName(String16* _aidl_return) {
+  Parcel _aidl_data;
+<span class="hw">  _aidl_data.writeInterfaceToken(getInterfaceDescriptor());</span>
+<span class="hw">  remote()-&gt;transact(BnNamedCallback::TRANSACTION_GetName,</span>
+<span class="hw">                     _aidl_data, &amp;_aidl_reply, 0);</span>
+  _aidl_status.readFromParcel(_aidl_reply);
+  _aidl_reply.readString16(_aidl_return);
+  ...
+}</code></pre>
+<pre><code><span class="src">BnNamedCallback (server)</span>status_t BnNamedCallback::onTransact(uint32_t code,
+        const Parcel&amp; data, Parcel* reply, uint32_t flags) {
+<span class="hw">  switch (code) {</span>
+  case TRANSACTION_GetName:
+<span class="hw">    if (!data.checkInterface(this)) return BAD_TYPE;</span>
+    Status s(GetName(&amp;_aidl_return));
+    s.writeToParcel(reply);
+    reply-&gt;writeString16(_aidl_return);
+  ...
+}</code></pre>
+</div></details>
+<details><summary>Rust</summary>
+<div class="two">
+<pre><code><span class="src">generated INamedCallback.rs (client side)</span>declare_binder_interface! {
+  INamedCallback["android.aidl.tests.INamedCallback"] {
+    native: BnNamedCallback(on_transact),
+    proxy: BpNamedCallback { },
+<span class="hg">    functionNames : [ c"GetName", ],</span>
+  }
+}
+fn build_parcel_GetName(&amp;self) -&gt; Result&lt;Parcel&gt; {
+<span class="hw">  let aidl_data = self.binder.prepare_transact()?;</span>  // writes the token
+  Ok(aidl_data)
+}</code></pre>
+<pre><code><span class="src">generated on_transact (server side)</span>fn on_transact(service: &amp;dyn INamedCallback,
+               code: TransactionCode,
+               data: &amp;BorrowedParcel,
+               reply: &amp;mut BorrowedParcel) -&gt; Result&lt;()&gt; {
+<span class="hw">  match code {</span>
+    transactions::r#GetName =&gt; {
+      let r = service.r#GetName();
+      reply.write(&amp;Status::from(StatusCode::OK))?;
+      reply.write(&amp;r?)?;
+      Ok(())
+    }
+    ...</code></pre>
+</div></details>
+<p>And the names, per backend. These lines are why a slice can say <code>isUserAMonkey</code> instead of <code>#42</code>:</p>
+<div class="two">
+<pre><code><span class="src">Java (in Stub)</span>public static String getDefaultTransactionName(int code) {
+  switch (code) {
+    case TRANSACTION_isUserAMonkey: return "isUserAMonkey";
+    ...
+  }
+}
+public String getTransactionName(int code) {
+  return getDefaultTransactionName(code);
+}</code></pre>
+<pre><code><span class="src">cpp (in IFoo.cpp)</span>static const char* IFoo_names[] = { "doFoo", "doBar" };
+alignas(16) static const TransactionCodeData IFoo_data = {
+  .totalSize   = sizeof(TransactionCodeData),
+  .backendType = "cpp",
+  .names       = IFoo_names,
+  .count       = 2,
+  .descriptor  = "android.foo.IFoo",   // added by this change
+};</code></pre>
+</div>
+<p>Stacked up, here is the whole path of our Java call:</p>
+<figure>
+<figcaption><b>One call, top to bottom and back up.</b> App code thinks it called a method. The generated Proxy turns the call into a code and a Parcel, the <code>BpBinder</code> hands them to the kernel, and on the other side the <code>BBinder</code> and the generated Stub turn them back into a method call.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="Call stack">
+  <text x="200" y="20" text-anchor="middle" class="th">app</text>
+  <text x="800" y="20" text-anchor="middle" class="th">system_server</text>
+  <rect x="60" y="30" width="280" height="38" rx="5" class="b0"/><text x="200" y="54" text-anchor="middle" class="tm">am.isUserAMonkey()</text>
+  <rect x="60" y="80" width="280" height="38" rx="5" class="b"/><text x="200" y="98" text-anchor="middle" class="tm">IActivityManager.Stub.Proxy</text><text x="200" y="112" text-anchor="middle" class="ts">generated: fill Parcel, pick code 42</text>
+  <rect x="60" y="130" width="280" height="38" rx="5" class="bg"/><text x="200" y="148" text-anchor="middle" class="tm">BpBinder::transact</text><text x="200" y="162" text-anchor="middle" class="ts">libbinder: "deliver to handle 7"</text>
+  <rect x="660" y="30" width="280" height="38" rx="5" class="b0"/><text x="800" y="54" text-anchor="middle" class="tm">ActivityManagerService.isUserAMonkey()</text>
+  <rect x="660" y="80" width="280" height="38" rx="5" class="b"/><text x="800" y="98" text-anchor="middle" class="tm">IActivityManager.Stub.onTransact</text><text x="800" y="112" text-anchor="middle" class="ts">generated: switch on code 42</text>
+  <rect x="660" y="130" width="280" height="38" rx="5" class="ba"/><text x="800" y="148" text-anchor="middle" class="tm">BBinder::transact</text><text x="800" y="162" text-anchor="middle" class="ts">libbinder: the real object</text>
+  <rect x="60" y="210" width="880" height="44" rx="6" class="b2"/><text x="500" y="237" text-anchor="middle" class="tb">kernel binder driver</text>
+  <path d="M200,68 L200,80" class="ln" marker-end="url(#ah)"/><path d="M200,118 L200,130" class="ln" marker-end="url(#ah)"/>
+  <path d="M200,168 L200,210" class="lna" marker-end="url(#aha)"/><text x="210" y="194" class="ts">code + Parcel</text>
+  <path d="M800,210 L800,168" class="lna" marker-end="url(#aha)"/>
+  <path d="M800,130 L800,118" class="ln" marker-end="url(#ah)"/><path d="M800,80 L800,68" class="ln" marker-end="url(#ah)"/>
+  <text x="500" y="285" text-anchor="middle" class="ts">The code number is illustrative: the real value is FIRST_CALL_TRANSACTION + this method's index in the .aidl file.</text>
+</svg>
+</figure>
+
+<h2 id="java"><span class="n">6</span>Java wears a native costume</h2>
+<p>Our app and system_server are written in Java. Does Java have its own binder? No: <b>every Java binder object is a thin wrapper around a native one</b>, connected through JNI, the bridge between Java and C++.</p>
+<figure>
+<figcaption><b>Java on top, native underneath.</b> A Java <code>Binder</code> (which the generated <code>Stub</code> extends) is backed by a native <code>JavaBBinder</code>, a kind of <code>BBinder</code>. A Java <code>BinderProxy</code> is backed by a native <code>BpBinder</code>. The real work always happens in libbinder.</figcaption>
+<svg viewBox="0 0 1000 230" role="img" aria-label="Java and native binders">
+  <text x="250" y="22" text-anchor="middle" class="th">client (app)</text><text x="750" y="22" text-anchor="middle" class="th">server (system_server)</text>
+  <rect x="80" y="34" width="340" height="44" rx="5" class="b"/><text x="250" y="54" text-anchor="middle" class="tm">Stub.Proxy → BinderProxy</text><text x="250" y="70" text-anchor="middle" class="ts">Java</text>
+  <rect x="580" y="34" width="340" height="44" rx="5" class="b"/><text x="750" y="54" text-anchor="middle" class="tm">Stub (extends Binder)</text><text x="750" y="70" text-anchor="middle" class="ts">Java</text>
+  <text x="500" y="112" text-anchor="middle" class="ts">— JNI bridge (android_util_Binder.cpp) —</text>
+  <line x1="40" y1="100" x2="960" y2="100" class="ln dash"/>
+  <rect x="80" y="126" width="340" height="44" rx="5" class="bg"/><text x="250" y="146" text-anchor="middle" class="tm">BpBinder</text><text x="250" y="162" text-anchor="middle" class="ts">native, libbinder</text>
+  <rect x="580" y="126" width="340" height="44" rx="5" class="ba"/><text x="750" y="146" text-anchor="middle" class="tm">JavaBBinder (a BBinder)</text><text x="750" y="162" text-anchor="middle" class="ts">native, holds a reference to the Java Stub</text>
+  <path d="M250,78 L250,126" class="ln" marker-end="url(#ah)"/><path d="M750,126 L750,78" class="ln" marker-end="url(#ah)"/>
+  <text x="260" y="104" class="ts">transactNative()</text><text x="760" y="122" class="ts">execTransact()</text>
+  <path d="M420,148 L580,148" class="lna dash" marker-end="url(#aha)"/><text x="500" y="140" text-anchor="middle" class="ts">kernel</text>
+  <text x="80" y="205" class="ts">Asymmetry to remember: the server's native object holds the Java Stub, which knows the method names.</text>
+  <text x="80" y="221" class="ts">The client's native object holds only a handle. BinderProxy is generic and has no idea which interface it serves.</text>
+</svg>
+</figure>
+<p>That last asymmetry is worth slowing down for. The server's <code>JavaBBinder</code> keeps a reference to the Java <code>Stub</code>, the object that <i>implements</i> the interface. So native code on the server can always ask it a question. The client's <code>BpBinder</code> is wrapped by a <code>BinderProxy</code>, but <code>BinderProxy</code> is one generic class for every interface. The generated <code>Stub.Proxy</code> points at the <code>BinderProxy</code>, not the other way round. From native code on the client, there's nobody to ask.</p>
+
+<h2 id="seq"><span class="n">7</span>All together: three sequence diagrams</h2>
+<p>Time to put every piece on one page. Read each diagram top to bottom: time flows down, each column is one layer, and each arrow is one call between layers. The two colored bars are trace slices: <b>blue</b> on the client, <b>green</b> on the server. Each diagram is one call, from start to finish, with tracing on.</p>
+<figure>
+<figcaption><b>Java → Java: <code>isUserAMonkey()</code> from an app to system_server.</b> Blue arrows are the request, green dashed arrows the reply. The blue bar on <code>BpBinder</code> is the new client slice; the green bar on <code>JavaBBinder</code> is the existing server slice. The client slice contains the whole server slice plus the two kernel hops.</figcaption>
+<svg viewBox="0 0 1000 520" role="img" aria-label="Java sequence diagram">
+<rect x="24" y="6" width="112" height="40" rx="5" class="b0"/>
+<text x="80" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">app code</text>
+<text x="80" y="39" text-anchor="middle" class="ts" style="font-size:10px">isUserAMonkey()</text>
+<line x1="80" y1="46" x2="80" y2="512" class="ln dash"/>
+<rect x="144" y="6" width="112" height="40" rx="5" class="b"/>
+<text x="200" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">Stub.Proxy</text>
+<text x="200" y="39" text-anchor="middle" class="ts" style="font-size:10px">generated Java</text>
+<line x1="200" y1="46" x2="200" y2="512" class="ln dash"/>
+<rect x="264" y="6" width="112" height="40" rx="5" class="b"/>
+<text x="320" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BinderProxy</text>
+<text x="320" y="39" text-anchor="middle" class="ts" style="font-size:10px">Java + JNI</text>
+<line x1="320" y1="46" x2="320" y2="512" class="ln dash"/>
+<rect x="384" y="6" width="112" height="40" rx="5" class="bg"/>
+<text x="440" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BpBinder</text>
+<text x="440" y="39" text-anchor="middle" class="ts" style="font-size:10px">libbinder</text>
+<line x1="440" y1="46" x2="440" y2="512" class="ln dash"/>
+<rect x="504" y="6" width="112" height="40" rx="5" class="b2"/>
+<text x="560" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">kernel</text>
+<text x="560" y="39" text-anchor="middle" class="ts" style="font-size:10px">binder driver</text>
+<line x1="560" y1="46" x2="560" y2="512" class="ln dash"/>
+<rect x="624" y="6" width="112" height="40" rx="5" class="ba"/>
+<text x="680" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">JavaBBinder</text>
+<text x="680" y="39" text-anchor="middle" class="ts" style="font-size:10px">libbinder (BBinder)</text>
+<line x1="680" y1="46" x2="680" y2="512" class="ln dash"/>
+<rect x="744" y="6" width="112" height="40" rx="5" class="b"/>
+<text x="800" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">Stub.onTransact</text>
+<text x="800" y="39" text-anchor="middle" class="ts" style="font-size:10px">generated Java</text>
+<line x1="800" y1="46" x2="800" y2="512" class="ln dash"/>
+<rect x="864" y="6" width="112" height="40" rx="5" class="b0"/>
+<text x="920" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">ActivityManager…</text>
+<text x="920" y="39" text-anchor="middle" class="ts" style="font-size:10px">service impl</text>
+<line x1="920" y1="46" x2="920" y2="512" class="ln dash"/>
+<rect x="433" y="154" width="14" height="264" class="ba"/>
+<rect x="673" y="226" width="14" height="120" class="bg"/>
+<path d="M88,58 L192,58" class="lna" marker-end="url(#aha)"/>
+<text x="140" y="54" text-anchor="middle" class="tms" style="font-size:10px">isUserAMonkey()</text>
+<rect x="210" y="71" width="192" height="15" rx="3" class="b2"/>
+<text x="215" y="82" class="tms" style="font-size:10px">writeInterfaceToken(DESCRIPTOR)</text>
+<path d="M208,106 L312,106" class="lna" marker-end="url(#aha)"/>
+<text x="260" y="102" text-anchor="middle" class="tms" style="font-size:10px">transact(code, data)</text>
+<path d="M328,130 L432,130" class="lna" marker-end="url(#aha)"/>
+<text x="380" y="126" text-anchor="middle" class="tms" style="font-size:10px">transactNative → transact</text>
+<rect x="450" y="143" width="161" height="15" rx="3" class="ba"/>
+<text x="455" y="154" class="tms" style="font-size:10px">B|…::isUserAMonkey::client</text>
+<path d="M448,178 L552,178" class="lna" marker-end="url(#aha)"/>
+<text x="500" y="174" text-anchor="middle" class="tms" style="font-size:10px">ioctl BC_TRANSACTION</text>
+<path d="M568,202 L672,202" class="lna" marker-end="url(#aha)"/>
+<text x="620" y="198" text-anchor="middle" class="tms" style="font-size:10px">BR_TRANSACTION</text>
+<rect x="690" y="215" width="161" height="15" rx="3" class="bg"/>
+<text x="695" y="226" class="tms" style="font-size:10px">B|…::isUserAMonkey::server</text>
+<path d="M688,250 L792,250" class="lna" marker-end="url(#aha)"/>
+<text x="740" y="246" text-anchor="middle" class="tms" style="font-size:10px">execTransact → onTransact(code)</text>
+<path d="M808,274 L912,274" class="lna" marker-end="url(#aha)"/>
+<text x="860" y="270" text-anchor="middle" class="tms" style="font-size:10px">isUserAMonkey()</text>
+<path d="M912,298 L808,298" class="lng dash" marker-end="url(#ahg)"/>
+<text x="860" y="294" text-anchor="middle" class="tms" style="font-size:10px">false</text>
+<path d="M792,322 L688,322" class="lng dash" marker-end="url(#ahg)"/>
+<text x="740" y="318" text-anchor="middle" class="tms" style="font-size:10px">reply Parcel</text>
+<rect x="690" y="335" width="60" height="15" rx="3" class="bg"/>
+<text x="695" y="346" class="tms" style="font-size:10px">E</text>
+<path d="M672,370 L568,370" class="lng dash" marker-end="url(#ahg)"/>
+<text x="620" y="366" text-anchor="middle" class="tms" style="font-size:10px">BC_REPLY</text>
+<path d="M552,394 L448,394" class="lng dash" marker-end="url(#ahg)"/>
+<text x="500" y="390" text-anchor="middle" class="tms" style="font-size:10px">BR_REPLY</text>
+<rect x="450" y="407" width="60" height="15" rx="3" class="ba"/>
+<text x="455" y="418" class="tms" style="font-size:10px">E</text>
+<path d="M432,442 L328,442" class="lng dash" marker-end="url(#ahg)"/>
+<text x="380" y="438" text-anchor="middle" class="tms" style="font-size:10px">reply</text>
+<path d="M312,466 L208,466" class="lng dash" marker-end="url(#ahg)"/>
+<text x="260" y="462" text-anchor="middle" class="tms" style="font-size:10px">reply</text>
+<path d="M192,490 L88,490" class="lng dash" marker-end="url(#ahg)"/>
+<text x="140" y="486" text-anchor="middle" class="tms" style="font-size:10px">false</text>
+</svg>
+</figure>
+<figure>
+<figcaption><b>cpp → cpp.</b> Same shape, without JNI. The only new thing is at the very top: when the generated <code>BpFoo</code> is constructed, it hands its <code>BpBinder</code> the static names table (the AIDL hookup CL). From then on <code>BpBinder::transact</code> can name every call.</figcaption>
+<svg viewBox="0 0 1000 520" role="img" aria-label="cpp sequence diagram">
+<rect x="24" y="6" width="129" height="40" rx="5" class="b0"/>
+<text x="89" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">app code</text>
+<text x="89" y="39" text-anchor="middle" class="ts" style="font-size:10px">foo-&gt;doFoo()</text>
+<line x1="89" y1="46" x2="89" y2="512" class="ln dash"/>
+<rect x="161" y="6" width="129" height="40" rx="5" class="b"/>
+<text x="226" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BpFoo</text>
+<text x="226" y="39" text-anchor="middle" class="ts" style="font-size:10px">generated C++</text>
+<line x1="226" y1="46" x2="226" y2="512" class="ln dash"/>
+<rect x="298" y="6" width="129" height="40" rx="5" class="bg"/>
+<text x="363" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BpBinder</text>
+<text x="363" y="39" text-anchor="middle" class="ts" style="font-size:10px">libbinder</text>
+<line x1="363" y1="46" x2="363" y2="512" class="ln dash"/>
+<rect x="435" y="6" width="129" height="40" rx="5" class="b2"/>
+<text x="500" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">kernel</text>
+<text x="500" y="39" text-anchor="middle" class="ts" style="font-size:10px">binder driver</text>
+<line x1="500" y1="46" x2="500" y2="512" class="ln dash"/>
+<rect x="573" y="6" width="129" height="40" rx="5" class="ba"/>
+<text x="637" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BBinder</text>
+<text x="637" y="39" text-anchor="middle" class="ts" style="font-size:10px">libbinder</text>
+<line x1="637" y1="46" x2="637" y2="512" class="ln dash"/>
+<rect x="710" y="6" width="129" height="40" rx="5" class="b"/>
+<text x="774" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BnFoo::onTransact</text>
+<text x="774" y="39" text-anchor="middle" class="ts" style="font-size:10px">generated C++</text>
+<line x1="774" y1="46" x2="774" y2="512" class="ln dash"/>
+<rect x="847" y="6" width="129" height="40" rx="5" class="b0"/>
+<text x="911" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">FooService</text>
+<text x="911" y="39" text-anchor="middle" class="ts" style="font-size:10px">service impl</text>
+<line x1="911" y1="46" x2="911" y2="512" class="ln dash"/>
+<rect x="356" y="160" width="14" height="264" class="ba"/>
+<rect x="630" y="232" width="14" height="120" class="bg"/>
+<rect x="236" y="47" width="242" height="15" rx="3" class="b2"/>
+<text x="241" y="58" class="tms" style="font-size:10px">ctor: setTransactionCodeMap(&amp;IFoo_data)</text>
+<path d="M97,88 L218,88" class="lna" marker-end="url(#aha)"/>
+<text x="157" y="84" text-anchor="middle" class="tms" style="font-size:10px">doFoo()</text>
+<rect x="236" y="101" width="192" height="15" rx="3" class="b2"/>
+<text x="241" y="112" class="tms" style="font-size:10px">writeInterfaceToken(descriptor)</text>
+<path d="M234,136 L355,136" class="lna" marker-end="url(#aha)"/>
+<text x="294" y="132" text-anchor="middle" class="tms" style="font-size:10px">remote()-&gt;transact(code)</text>
+<rect x="373" y="149" width="180" height="15" rx="3" class="ba"/>
+<text x="378" y="160" class="tms" style="font-size:10px">B|AIDL::cpp::…::doFoo::client</text>
+<path d="M371,184 L492,184" class="lna" marker-end="url(#aha)"/>
+<text x="431" y="180" text-anchor="middle" class="tms" style="font-size:10px">ioctl BC_TRANSACTION</text>
+<path d="M508,208 L629,208" class="lna" marker-end="url(#aha)"/>
+<text x="569" y="204" text-anchor="middle" class="tms" style="font-size:10px">BR_TRANSACTION</text>
+<rect x="647" y="221" width="180" height="15" rx="3" class="bg"/>
+<text x="652" y="232" class="tms" style="font-size:10px">B|AIDL::cpp::…::doFoo::server</text>
+<path d="M645,256 L766,256" class="lna" marker-end="url(#aha)"/>
+<text x="706" y="252" text-anchor="middle" class="tms" style="font-size:10px">onTransact(code)</text>
+<path d="M782,280 L903,280" class="lna" marker-end="url(#aha)"/>
+<text x="843" y="276" text-anchor="middle" class="tms" style="font-size:10px">doFoo()</text>
+<path d="M903,304 L782,304" class="lng dash" marker-end="url(#ahg)"/>
+<text x="843" y="300" text-anchor="middle" class="tms" style="font-size:10px">Status::ok()</text>
+<path d="M766,328 L645,328" class="lng dash" marker-end="url(#ahg)"/>
+<text x="706" y="324" text-anchor="middle" class="tms" style="font-size:10px">reply Parcel</text>
+<rect x="647" y="341" width="60" height="15" rx="3" class="bg"/>
+<text x="652" y="352" class="tms" style="font-size:10px">E</text>
+<path d="M629,376 L508,376" class="lng dash" marker-end="url(#ahg)"/>
+<text x="569" y="372" text-anchor="middle" class="tms" style="font-size:10px">BC_REPLY</text>
+<path d="M492,400 L371,400" class="lng dash" marker-end="url(#ahg)"/>
+<text x="431" y="396" text-anchor="middle" class="tms" style="font-size:10px">BR_REPLY</text>
+<rect x="373" y="413" width="60" height="15" rx="3" class="ba"/>
+<text x="378" y="424" class="tms" style="font-size:10px">E</text>
+<path d="M355,448 L234,448" class="lng dash" marker-end="url(#ahg)"/>
+<text x="294" y="444" text-anchor="middle" class="tms" style="font-size:10px">reply</text>
+<path d="M218,472 L97,472" class="lng dash" marker-end="url(#ahg)"/>
+<text x="157" y="468" text-anchor="middle" class="tms" style="font-size:10px">Status</text>
+</svg>
+</figure>
+<figure>
+<figcaption><b>Rust → Rust.</b> Rust binder sits on <code>libbinder_ndk</code>. The client slice comes from <code>AIBinder_transact</code> (it already existed), using the names the generated code registered with <code>declare_binder_interface!</code>. <code>BpBinder</code> has no table for these proxies, so it adds no second slice. Both ends are labelled <code>ndk</code>.</figcaption>
+<svg viewBox="0 0 1000 570" role="img" aria-label="Rust sequence diagram">
+<rect x="24" y="6" width="112" height="40" rx="5" class="b0"/>
+<text x="80" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">app code</text>
+<text x="80" y="39" text-anchor="middle" class="ts" style="font-size:10px">foo.doFoo()</text>
+<line x1="80" y1="46" x2="80" y2="562" class="ln dash"/>
+<rect x="144" y="6" width="112" height="40" rx="5" class="b"/>
+<text x="200" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BpFoo (Rust)</text>
+<text x="200" y="39" text-anchor="middle" class="ts" style="font-size:10px">generated Rust</text>
+<line x1="200" y1="46" x2="200" y2="562" class="ln dash"/>
+<rect x="264" y="6" width="112" height="40" rx="5" class="bv"/>
+<text x="320" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">libbinder_ndk</text>
+<text x="320" y="39" text-anchor="middle" class="ts" style="font-size:10px">AIBinder_*</text>
+<line x1="320" y1="46" x2="320" y2="562" class="ln dash"/>
+<rect x="384" y="6" width="112" height="40" rx="5" class="bg"/>
+<text x="440" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BpBinder</text>
+<text x="440" y="39" text-anchor="middle" class="ts" style="font-size:10px">libbinder</text>
+<line x1="440" y1="46" x2="440" y2="562" class="ln dash"/>
+<rect x="504" y="6" width="112" height="40" rx="5" class="b2"/>
+<text x="560" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">kernel</text>
+<text x="560" y="39" text-anchor="middle" class="ts" style="font-size:10px">binder driver</text>
+<line x1="560" y1="46" x2="560" y2="562" class="ln dash"/>
+<rect x="624" y="6" width="112" height="40" rx="5" class="ba"/>
+<text x="680" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">ABBinder</text>
+<text x="680" y="39" text-anchor="middle" class="ts" style="font-size:10px">BBinder in libbinder_ndk</text>
+<line x1="680" y1="46" x2="680" y2="562" class="ln dash"/>
+<rect x="744" y="6" width="112" height="40" rx="5" class="b"/>
+<text x="800" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">on_transact</text>
+<text x="800" y="39" text-anchor="middle" class="ts" style="font-size:10px">generated Rust</text>
+<line x1="800" y1="46" x2="800" y2="562" class="ln dash"/>
+<rect x="864" y="6" width="112" height="40" rx="5" class="b0"/>
+<text x="920" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">service</text>
+<text x="920" y="39" text-anchor="middle" class="ts" style="font-size:10px">impl</text>
+<line x1="920" y1="46" x2="920" y2="562" class="ln dash"/>
+<rect x="313" y="154" width="14" height="336" class="ba"/>
+<rect x="673" y="274" width="14" height="120" class="bg"/>
+<path d="M88,58 L192,58" class="lna" marker-end="url(#aha)"/>
+<text x="140" y="54" text-anchor="middle" class="tms" style="font-size:10px">doFoo()</text>
+<path d="M208,82 L312,82" class="lna" marker-end="url(#aha)"/>
+<text x="260" y="78" text-anchor="middle" class="tms" style="font-size:10px">prepare_transact</text>
+<rect x="330" y="95" width="118" height="15" rx="3" class="b2"/>
+<text x="335" y="106" class="tms" style="font-size:10px">writeInterfaceToken</text>
+<path d="M208,130 L312,130" class="lna" marker-end="url(#aha)"/>
+<text x="260" y="126" text-anchor="middle" class="tms" style="font-size:10px">submit_transact(code)</text>
+<rect x="330" y="143" width="180" height="15" rx="3" class="ba"/>
+<text x="335" y="154" class="tms" style="font-size:10px">B|AIDL::ndk::…::doFoo::client</text>
+<path d="M328,178 L432,178" class="lna" marker-end="url(#aha)"/>
+<text x="380" y="174" text-anchor="middle" class="tms" style="font-size:10px">transact(code)</text>
+<rect x="450" y="191" width="143" height="15" rx="3" class="b2"/>
+<text x="455" y="202" class="tms" style="font-size:10px">no table: no slice here</text>
+<path d="M448,226 L552,226" class="lna" marker-end="url(#aha)"/>
+<text x="500" y="222" text-anchor="middle" class="tms" style="font-size:10px">BC_TRANSACTION</text>
+<path d="M568,250 L672,250" class="lna" marker-end="url(#aha)"/>
+<text x="620" y="246" text-anchor="middle" class="tms" style="font-size:10px">BR_TRANSACTION</text>
+<rect x="690" y="263" width="180" height="15" rx="3" class="bg"/>
+<text x="695" y="274" class="tms" style="font-size:10px">B|AIDL::ndk::…::doFoo::server</text>
+<path d="M688,298 L792,298" class="lna" marker-end="url(#aha)"/>
+<text x="740" y="294" text-anchor="middle" class="tms" style="font-size:10px">on_transact(code)</text>
+<path d="M808,322 L912,322" class="lna" marker-end="url(#aha)"/>
+<text x="860" y="318" text-anchor="middle" class="tms" style="font-size:10px">doFoo()</text>
+<path d="M912,346 L808,346" class="lng dash" marker-end="url(#ahg)"/>
+<text x="860" y="342" text-anchor="middle" class="tms" style="font-size:10px">Ok</text>
+<path d="M792,370 L688,370" class="lng dash" marker-end="url(#ahg)"/>
+<text x="740" y="366" text-anchor="middle" class="tms" style="font-size:10px">reply</text>
+<rect x="690" y="383" width="60" height="15" rx="3" class="bg"/>
+<text x="695" y="394" class="tms" style="font-size:10px">E</text>
+<path d="M672,418 L568,418" class="lng dash" marker-end="url(#ahg)"/>
+<text x="620" y="414" text-anchor="middle" class="tms" style="font-size:10px">BC_REPLY</text>
+<path d="M552,442 L448,442" class="lng dash" marker-end="url(#ahg)"/>
+<text x="500" y="438" text-anchor="middle" class="tms" style="font-size:10px">BR_REPLY</text>
+<path d="M432,466 L328,466" class="lng dash" marker-end="url(#ahg)"/>
+<text x="380" y="462" text-anchor="middle" class="tms" style="font-size:10px">reply</text>
+<rect x="330" y="479" width="60" height="15" rx="3" class="ba"/>
+<text x="335" y="490" class="tms" style="font-size:10px">E</text>
+<path d="M312,514 L208,514" class="lng dash" marker-end="url(#ahg)"/>
+<text x="260" y="510" text-anchor="middle" class="tms" style="font-size:10px">reply</text>
+<path d="M192,538 L88,538" class="lng dash" marker-end="url(#ahg)"/>
+<text x="140" y="534" text-anchor="middle" class="tms" style="font-size:10px">Ok</text>
+</svg>
+</figure>
+<p>Three things to notice across the diagrams:</p>
+<ul>
+<li><b>The client slice always contains the server slice.</b> The client starts waiting before the server starts working, and stops after the server is done. The gap between them is the two kernel trips: copying the Parcel and waking threads.</li>
+<li><b>Exactly one layer emits each slice.</b> For Java and cpp clients it's <code>BpBinder</code>. For Rust and NDK clients it's <code>libbinder_ndk</code>, so <code>BpBinder</code> stays quiet for them and you never get two client slices for one call.</li>
+<li><b>Generated code never emits a slice in this design.</b> It only provides the names. Section 9 explains why.</li>
+</ul>
+
+<h2 id="trace"><span class="n">8</span>What a trace slice is</h2>
+<p>Now the tracing side. A <b>slice</b> in Perfetto is just a labeled bar on a thread's timeline: it starts at one moment and ends at another. The mechanism is old and simple, called <b>atrace</b>. To start a slice, the thread writes a line like <code>B|1234|AIDL::java::android.app.IActivityManager::isUserAMonkey::server</code> into a special kernel file (<code>trace_marker</code>). To end it, it writes <code>E|1234</code>. The kernel timestamps both lines, and Perfetto draws the bar.</p>
+<p>Writing those lines isn't free (each is a system call), so tracing is grouped into <b>categories</b>, and code checks a bit before doing any work. Binder's category is <code>aidl</code> (<code>ATRACE_TAG_AIDL</code>). When nobody is tracing <code>aidl</code>, the check is one load and one bit test, and nothing else happens.</p>
+<pre><code>if (atrace_enabled_tags &amp; ATRACE_TAG_AIDL) {     <span class="c">// nearly free when off</span>
+    trace_begin(ATRACE_TAG_AIDL, name);          <span class="c">// writes "B|pid|name"</span>
+}
+... do the work ...
+trace_end(ATRACE_TAG_AIDL);                        <span class="c">// writes "E|pid"</span></code></pre>
+
+<h2 id="who"><span class="n">9</span>Who should emit the slice: generated code or libbinder?</h2>
+<p>There are two places you could put the <code>trace_begin</code>/<code>trace_end</code> pair, and Android has tried both.</p>
+<p><b>Option A: in the generated code.</b> The AIDL compiler has a switch for this, <code>gen_trace</code>. When it's on, every generated method gets a trace line baked in. For the cpp backend it looks like this:</p>
+<pre><code><span class="src">generated with gen_trace = true (cpp)</span>Status BpFoo::doFoo() {
+<span class="hw">  ScopedTrace _aidl_trace(ATRACE_TAG_AIDL, "AIDL::cpp::IFoo::doFoo::cppClient");</span>
+  ...
+}
+status_t BnFoo::onTransact(...) {
+  case TRANSACTION_doFoo: {
+<span class="hw">    ScopedTrace _aidl_trace(ATRACE_TAG_AIDL, "AIDL::cpp::IFoo::doFoo::cppServer");</span>
+    ...</code></pre>
+<p>It works, but count the cost: two trace sites per method, each with its own string literal, compiled into every library that uses the interface, for every interface in the system. There are thousands of methods. And only interfaces built with the switch on get it.</p>
+<p><b>Option B: once, in libbinder.</b> Every call passes through <code>BBinder::transact</code> (server) and <code>BpBinder::transact</code> (client) no matter which interface it is. Put one trace site in each, and let generated code supply only the <i>names</i>, which it generates anyway. One copy of the tracing code serves the whole system, and every interface is covered.</p>
+<figure>
+<figcaption><b>Tracing in every generated method vs. tracing once in the library.</b> Left: N interfaces × M methods × 2 sides of baked-in trace code. Right: two trace sites in libbinder, which read names from the per-interface tables the compiler already emits.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Generated vs libbinder tracing">
+  <text x="240" y="22" text-anchor="middle" class="tb">A · gen_trace: in generated code</text>
+  <rect x="40" y="36" width="120" height="30" rx="4" class="bw"/><text x="100" y="56" text-anchor="middle" class="tms">IFoo::a trace</text>
+  <rect x="170" y="36" width="120" height="30" rx="4" class="bw"/><text x="230" y="56" text-anchor="middle" class="tms">IFoo::b trace</text>
+  <rect x="300" y="36" width="120" height="30" rx="4" class="bw"/><text x="360" y="56" text-anchor="middle" class="tms">IFoo::c trace</text>
+  <rect x="40" y="76" width="120" height="30" rx="4" class="bw"/><text x="100" y="96" text-anchor="middle" class="tms">IBar::a trace</text>
+  <rect x="170" y="76" width="120" height="30" rx="4" class="bw"/><text x="230" y="96" text-anchor="middle" class="tms">IBar::b trace</text>
+  <rect x="300" y="76" width="120" height="30" rx="4" class="bw"/><text x="360" y="96" text-anchor="middle" class="tms">… × thousands</text>
+  <text x="240" y="132" text-anchor="middle" class="ts">code and strings per method, per side; only if the interface opts in</text>
+  <line x1="500" y1="10" x2="500" y2="240" class="ln dash"/>
+  <text x="760" y="22" text-anchor="middle" class="tb">B · in libbinder (what Android does now)</text>
+  <rect x="560" y="36" width="190" height="34" rx="4" class="bg"/><text x="655" y="58" text-anchor="middle" class="tms">BpBinder::transact</text>
+  <rect x="780" y="36" width="190" height="34" rx="4" class="bg"/><text x="875" y="58" text-anchor="middle" class="tms">BBinder::transact</text>
+  <rect x="560" y="110" width="120" height="30" rx="4" class="b"/><text x="620" y="130" text-anchor="middle" class="tms">IFoo names</text>
+  <rect x="700" y="110" width="120" height="30" rx="4" class="b"/><text x="760" y="130" text-anchor="middle" class="tms">IBar names</text>
+  <rect x="840" y="110" width="130" height="30" rx="4" class="b"/><text x="905" y="130" text-anchor="middle" class="tms">… tables</text>
+  <path d="M655,70 L620,110" class="ln" marker-end="url(#ah)"/><path d="M655,70 L760,110" class="ln" marker-end="url(#ah)"/><path d="M875,70 L760,110" class="ln" marker-end="url(#ah)"/><path d="M875,70 L905,110" class="ln" marker-end="url(#ah)"/>
+  <text x="760" y="168" text-anchor="middle" class="ts">two trace sites total; names come from data the compiler emits anyway</text>
+  <text x="20" y="215" class="t">History: cpp server slices moved from A to B ( turned cpp gen_trace off by default; <tspan class="tm">BBinder::transact</tspan> now names</text>
+  <text x="20" y="235" class="t">them from the table). This change does the same for the client side, in <tspan class="tm">BpBinder::transact</tspan>.</text>
+</svg>
+</figure>
+<p>So the CL isn't inventing a new place to trace. It finishes a move Android had already started: tracing happens in libbinder, and generated code provides the names. The only open question was how the <i>client</i> end gets hold of those names, which is the next three sections. All of it is behind a read-only flag that is off by default.</p>
+
+<h2 id="server"><span class="n">10</span>How the server names its slice</h2>
+<p>libbinder already wraps every incoming call in a slice. It happens in <code>BBinder::transact()</code>, the box on the server side of the diagram in §5. To build the name <code>AIDL::&lt;backend&gt;::&lt;descriptor&gt;::&lt;method&gt;::server</code>, it needs two strings:</p>
+<ul>
+<li><b>The descriptor.</b> Easy: the <code>BBinder</code> <i>is</i> the object, so it simply knows its own interface name (<code>getInterfaceDescriptor()</code>, a local call).</li>
+<li><b>The method name.</b> It has the code (42), not the name, so it has to look it up:
+  <ul>
+  <li>cpp and NDK services: the generated constructor handed the <code>BBinder</code> a pointer to the names table (<code>setTransactionCodeMap(&amp;IFoo_data)</code>), so it reads <code>names[code − 1]</code>.</li>
+  <li>Java services: the <code>BBinder</code> is a <code>JavaBBinder</code>, which holds the Java Stub. libbinder calls <code>JavaBBinder::getFunctionName(code)</code>, which calls the Stub's generated <code>getTransactionName(code)</code> through JNI.</li>
+  </ul>
+</li>
+</ul>
+<figure>
+<figcaption><b>The server has everything it needs within arm's reach.</b> It is the object, so it knows the descriptor. Its method names are either a table it was handed, or a Java object it holds.</figcaption>
+<svg viewBox="0 0 1000 200" role="img" aria-label="Server naming">
+  <rect x="340" y="20" width="320" height="50" rx="6" class="ba"/><text x="500" y="42" text-anchor="middle" class="tm">BBinder::transact(code = 42)</text><text x="500" y="60" text-anchor="middle" class="ts">tag on → build the slice name</text>
+  <rect x="40" y="110" width="280" height="64" rx="6" class="b"/><text x="180" y="132" text-anchor="middle" class="tb">descriptor</text><text x="180" y="152" text-anchor="middle" class="tms">getInterfaceDescriptor()</text><text x="180" y="166" text-anchor="middle" class="ts">local: it's my own name</text>
+  <rect x="360" y="110" width="280" height="64" rx="6" class="bg"/><text x="500" y="132" text-anchor="middle" class="tb">method (cpp / NDK)</text><text x="500" y="152" text-anchor="middle" class="tms">names[code − 1]</text><text x="500" y="166" text-anchor="middle" class="ts">table set by generated constructor</text>
+  <rect x="680" y="110" width="280" height="64" rx="6" class="bg"/><text x="820" y="132" text-anchor="middle" class="tb">method (Java)</text><text x="820" y="152" text-anchor="middle" class="tms">Stub.getTransactionName(42)</text><text x="820" y="166" text-anchor="middle" class="ts">via JNI, from JavaBBinder</text>
+  <path d="M420,70 L180,110" class="ln" marker-end="url(#ah)"/><path d="M500,70 L500,110" class="ln" marker-end="url(#ah)"/><path d="M580,70 L820,110" class="ln" marker-end="url(#ah)"/>
+</svg>
+</figure>
+<p>Result: <code>AIDL::java::android.app.IActivityManager::isUserAMonkey::server</code> on system_server's binder thread. This part was already working before this change.</p>
+
+<h2 id="blind"><span class="n">11</span>Why the client was blind</h2>
+<p>Now stand on the client side, inside <code>BpBinder::transact()</code>, at the moment our call goes out. What do you have?</p>
+<ul>
+<li>A handle: 7. A phone number.</li>
+<li>A code: 42. A number.</li>
+<li>A Parcel: the envelope.</li>
+</ul>
+<p>To name the slice you'd want <code>android.app.IActivityManager</code> and <code>isUserAMonkey</code>. Neither is in your hands:</p>
+<ul>
+<li><b>Ask the remote for its descriptor?</b> <code>BpBinder::getInterfaceDescriptor()</code> exists, but on a phone number, asking a question means <i>making a call</i>. It sends a separate <code>INTERFACE_TRANSACTION</code> through the kernel. A second binder call, inside the slice for the first, just to label it, is exactly what tracing must never do.</li>
+<li><b>Look up the method name?</b> The names live in generated code. libbinder has no access to it, and the generic <code>BinderProxy</code> doesn't know which interface it's serving (§6).</li>
+</ul>
+<p>So the client end showed nothing: the app's thread sat blocked in the kernel with no label saying who it was waiting on. The rest of this note covers how the change gets those two strings without making any extra call.</p>
+
+<h2 id="cheat"><span class="n">12</span>Fix 1: hand the proxy a cheat sheet</h2>
+<p>For cpp clients the answer is pleasingly symmetric. The generated code already has the names table, the one it gives the server. So let the generated <b>client</b> constructor hand the same table to its <code>BpBinder</code>:</p>
+<pre><code><span class="src">generated BpFoo constructor (cpp)</span>BpFoo::BpFoo(const sp&lt;IBinder&gt;&amp; impl) : BpInterface&lt;IFoo&gt;(impl) {
+<span class="hg">  if (BpBinder* bp = impl-&gt;remoteBinder()) bp-&gt;setTransactionCodeMap(&amp;IFoo_data);</span>
+}</code></pre>
+<p>Now the phone number carries a sticky note. It's one pointer to a table that already exists, with the descriptor and all method names on it. <code>BpBinder::transact()</code> reads <code>names[code − 1]</code>, the same way the server does. The pointer even fits into padding the <code>BpBinder</code> object already had, so the object doesn't grow.</p>
+<figure>
+<figcaption><b>Both ends read the same sticky note.</b> One table per interface, generated once. The server's <code>BBinder</code> always had a pointer to it; now the client's <code>BpBinder</code> gets one too.</figcaption>
+<svg viewBox="0 0 1000 170" role="img" aria-label="Shared table">
+  <rect x="360" y="14" width="280" height="70" rx="6" class="bg"/><text x="500" y="36" text-anchor="middle" class="tb">IFoo_data (static)</text><text x="500" y="56" text-anchor="middle" class="tms">"android.foo.IFoo"</text><text x="500" y="72" text-anchor="middle" class="tms">{"doFoo", "doBar"}</text>
+  <rect x="60" y="110" width="260" height="44" rx="6" class="b"/><text x="190" y="130" text-anchor="middle" class="tm">BpBinder (client)</text><text x="190" y="146" text-anchor="middle" class="ts">new: points here</text>
+  <rect x="680" y="110" width="260" height="44" rx="6" class="b0"/><text x="810" y="130" text-anchor="middle" class="tm">BBinder (server)</text><text x="810" y="146" text-anchor="middle" class="ts">already pointed here</text>
+  <path d="M250,110 L420,84" class="lna" marker-end="url(#aha)"/><path d="M750,110 L580,84" class="ln" marker-end="url(#ah)"/>
+</svg>
+</figure>
+
+<h2 id="peek"><span class="n">13</span>Fix 2: Java proxies register their Stub</h2>
+<p>Java clients have no static native table to hand over, and <code>BpBinder</code> can't reach any Java object (§6). But the generated <code>Stub.Proxy</code> knows both facts: the interface name (<code>DESCRIPTOR</code>) and its own <code>Stub</code> class, which has the method names. So the Proxy hands them down once, when it is built:</p>
+<pre><code><span class="src">generated IActivityManager.Stub.Proxy constructor (Java, aidl --proxy_transaction_names)</span>Proxy(android.os.IBinder remote) {
+  mRemote = remote;
+<span class="hg">  android.os.BinderProxy.setTransactionNames(remote, DESCRIPTOR, Stub.class);</span>
+}</code></pre>
+<p>JNI turns that into a per-interface table and attaches it to the <code>BpBinder</code>, the same hook cpp uses. The table has no names array. Instead it has a function, <code>resolveName</code>, that asks the <code>Stub</code> class for a name the first time a code is traced, then caches it.</p>
+
+<h3 id="whoknows">Who knows what</h3>
+<p>Ask a literal question: <b>which piece of code knows which fact, and how does it reach libbinder?</b></p>
+<figure>
+<figcaption><b>The Java proxy knows everything; it hands libbinder a table once.</b> <code>Stub.Proxy.isUserAMonkey()</code> knows its method, its descriptor and its <code>Stub</code> class. Per call it still passes down only <code>transact(42, parcel)</code>. The descriptor and the route to the method names were attached to the <code>BpBinder</code> when the Proxy was built.</figcaption>
+<svg viewBox="0 0 1000 340" role="img" aria-label="Who knows what">
+  <rect x="20" y="16" width="960" height="120" rx="8" class="b" style="opacity:.6"/>
+  <text x="36" y="38" class="th">Java layer (generated code in framework.jar)</text>
+  <rect x="40" y="50" width="420" height="72" rx="6" class="b0"/>
+  <text x="250" y="72" text-anchor="middle" class="tm">IActivityManager.Stub.Proxy</text>
+  <text x="56" y="94" class="ts">knows the interface: DESCRIPTOR = "android.app.IActivityManager" ✓</text>
+  <text x="56" y="112" class="ts">knows its Stub class, and which method it is running ✓</text>
+  <rect x="520" y="50" width="440" height="72" rx="6" class="bg"/>
+  <text x="740" y="72" text-anchor="middle" class="tm">what it passes down</text>
+  <text x="536" y="94" class="tms">once: setTransactionNames(remote, DESC, Stub.class)</text>
+  <text x="536" y="112" class="tms">per call: mRemote.transact(42, parcel, reply, 0)</text>
+  <path d="M460,86 L520,86" class="ln" marker-end="url(#ah)"/>
+  <text x="500" y="160" text-anchor="middle" class="ts">— JNI: table attached once; transactNative(42, parcel) per call —</text>
+  <path d="M740,122 L740,186" class="lna" marker-end="url(#aha)"/>
+  <rect x="20" y="186" width="960" height="138" rx="8" class="bg" style="opacity:.5"/>
+  <text x="36" y="208" class="th">native layer (libbinder + JNI)</text>
+  <rect x="40" y="220" width="420" height="92" rx="6" class="b0"/>
+  <text x="250" y="242" text-anchor="middle" class="tm">BpBinder::transact(42, parcel)</text>
+  <text x="56" y="264" class="ts">holds: the kernel handle + one table pointer</text>
+  <text x="56" y="282" class="ts">interface name? the table's descriptor ✓</text>
+  <text x="56" y="298" class="ts tr">method name? only 42 → table-&gt;resolveName(42)</text>
+  <rect x="520" y="220" width="440" height="92" rx="6" class="ba"/>
+  <text x="740" y="242" text-anchor="middle" class="tm">per-interface table (built by JNI)</text>
+  <text x="536" y="264" class="ts">descriptor: copied from DESCRIPTOR at registration</text>
+  <text x="536" y="282" class="ts">method: Stub.getDefaultTransactionName(42) via JNI,</text>
+  <text x="536" y="298" class="ts">first time per code only, then cached</text>
+</svg>
+</figure>
+<table>
+<tr><th>Piece</th><th>Process side</th><th>Knows</th><th>Where it got it</th></tr>
+<tr><td><code>Stub.Proxy</code></td><td>client, Java</td><td>descriptor, its <code>Stub</code> class, the method being called</td><td>generated code</td></tr>
+<tr><td><code>BinderProxy</code></td><td>client, Java</td><td>which <code>BpBinder</code> it wraps; nothing about the interface</td><td>one generic class for all interfaces</td></tr>
+<tr><td><code>BpBinder</code></td><td>client, native</td><td>kernel handle + pointer to the table</td><td>table attached by <code>setTransactionNames</code> (Java) or the <code>BpFoo</code> constructor (cpp)</td></tr>
+<tr><td>Java table</td><td>client, native</td><td>descriptor, global ref to the <code>Stub</code> class, <code>jmethodID</code> of <code>getDefaultTransactionName</code>, name cache</td><td>built by JNI on the first registration for that descriptor</td></tr>
+<tr><td><code>JavaBBinder</code></td><td>server, native</td><td>the <code>Stub</code> object itself</td><td>it wraps the service</td></tr>
+</table>
+<p>So, to answer both halves directly:</p>
+<ul>
+<li><b>"Didn't the client already know the interface name?"</b> Yes: <code>DESCRIPTOR</code> is a constant in the generated Proxy. The slice is emitted one layer down, in <code>BpBinder</code>, which per call is handed only <code>(code, parcel)</code>. So the Proxy passes the name down once, at construction, instead of on every call. <code>BinderProxy.transact</code> keeps its signature.</li>
+<li><b>"Where does the method name come from?"</b> From a function the AIDL compiler already generates into every framework Stub, <code>getDefaultTransactionName(int code)</code>. The Proxy passes the <code>Stub</code> class, so JNI calls it directly. No class is looked up by name.</li>
+</ul>
+
+<h4>What is <code>getDefaultTransactionName</code>, and is it going away?</h4>
+<p>It is <b>not</b> leftover tracing code, and nothing plans to remove it. It's a small lookup table written as a <code>switch</code>, one <code>case</code> per method:</p>
+<pre><code><span class="src">generated into IActivityManager.Stub (framework.jar)</span>public static String getDefaultTransactionName(int transactionCode) {
+  switch (transactionCode) {
+    case TRANSACTION_isUserAMonkey: return "isUserAMonkey";
+    case TRANSACTION_getRunningAppProcesses: return "getRunningAppProcesses";
+    ...
+    default: return null;
+  }
+}</code></pre>
+<p>Where it comes from: <code>frameworks/base/Android.bp</code> sets <code>aidl: { generate_get_transaction_name: true }</code> for the framework, so the build runs the AIDL compiler with <code>--transaction_names</code>. That flag only emits this name lookup; it adds no tracing code. (<code>aidl_interface</code> modules get the same function when their Java backend sets <code>gen_trace</code>, which defaults to on for platform interfaces.)</p>
+<p>The registration line in the Proxy constructor comes from a separate AIDL option, <code>--proxy_transaction_names</code>. It is on for framework.jar's interfaces (<code>framework-minus-apex</code>), and for <code>aidl_interface</code> Java backends with <code>gen_trace</code>, platform APIs and no <code>sdk_version</code>, because <code>BinderProxy.setTransactionNames</code> is a hidden API.</p>
+<p>And it already has three users today. This change adds a fourth:</p>
+<figure>
+<figcaption><b>One generated lookup, several readers.</b> Built once into each framework Stub at compile time. At runtime, server-side tracing, binder call statistics and binder latency stats already read it. The client trace table is a new reader of the same function, not a new mechanism.</figcaption>
+<svg viewBox="0 0 1000 250" role="img" aria-label="Users of getDefaultTransactionName">
+  <rect x="20" y="20" width="230" height="56" rx="6" class="b0"/><text x="135" y="42" text-anchor="middle" class="tm">IActivityManager.aidl</text><text x="135" y="62" text-anchor="middle" class="ts">build: aidl --transaction_names</text>
+  <path d="M250,48 L330,48" class="ln" marker-end="url(#ah)"/>
+  <rect x="330" y="14" width="300" height="68" rx="6" class="bg"/><text x="480" y="38" text-anchor="middle" class="tm">Stub.getDefaultTransactionName(code)</text><text x="480" y="56" text-anchor="middle" class="ts">a switch of string literals</text><text x="480" y="72" text-anchor="middle" class="ts">in framework.jar</text>
+  <rect x="690" y="10" width="290" height="44" rx="5" class="b"/><text x="835" y="30" text-anchor="middle" class="tm">server slice names (Java services)</text><text x="835" y="46" text-anchor="middle" class="ts">JavaBBinder → Stub.getTransactionName</text>
+  <rect x="690" y="62" width="290" height="44" rx="5" class="b"/><text x="835" y="82" text-anchor="middle" class="tm">BinderCallsStats</text><text x="835" y="98" text-anchor="middle" class="ts">via BinderTransactionNameResolver</text>
+  <rect x="690" y="114" width="290" height="44" rx="5" class="b"/><text x="835" y="134" text-anchor="middle" class="tm">BinderLatencyObserver</text><text x="835" y="150" text-anchor="middle" class="ts">via BinderTransactionNameResolver</text>
+  <rect x="690" y="172" width="290" height="50" rx="5" class="ba"/><text x="835" y="194" text-anchor="middle" class="tm">client slice names (new)</text><text x="835" y="212" text-anchor="middle" class="ts">table-&gt;resolveName, cached jmethodID</text>
+  <path d="M630,40 L690,32" class="ln" marker-end="url(#ah)"/><path d="M630,52 L690,84" class="ln" marker-end="url(#ah)"/><path d="M630,62 L690,136" class="ln" marker-end="url(#ah)"/><path d="M630,72 L690,196" class="lna" marker-end="url(#aha)"/>
+  <text x="20" y="200" class="ts">getTransactionName(code) is the instance version the server calls;</text>
+  <text x="20" y="218" class="ts">it just returns getDefaultTransactionName(code). Same strings, same source.</text>
+</svg>
+</figure>
+
+<h4>Both ends get names from generated code; only the route differs</h4>
+<p>libbinder has no method names of its own, on either side. The server's slice names come from AIDL-generated code too. The only difference is <i>how</i> libbinder reaches that code, because the server holds the object and the client holds only a handle:</p>
+<table>
+<tr><th>Backend</th><th>Server: how libbinder gets the name (existing)</th><th>Client: how libbinder gets the name (this change)</th><th>New generated code?</th></tr>
+<tr><td>Java</td><td><code>JavaBBinder</code> holds the <b>Stub instance</b> → calls <code>stub.getTransactionName(code)</code> (generated; returns <code>getDefaultTransactionName(code)</code>)</td><td>No Stub instance on the client → the table calls the <b>static</b> <code>Stub.getDefaultTransactionName(code)</code> on the <code>Stub</code> class the Proxy registered</td><td>One line in the <code>Stub.Proxy</code> constructor (<code>--proxy_transaction_names</code>)</td></tr>
+<tr><td>cpp</td><td>Generated <code>BnFoo</code> constructor attaches <code>IFoo_names</code> table to the <code>BBinder</code></td><td>Generated <code>BpFoo</code> constructor attaches the <b>same</b> table to the <code>BpBinder</code></td><td>One line in the <code>BpFoo</code> constructor (AIDL hookup CL)</td></tr>
+<tr><td>NDK / Rust</td><td>Names array registered on <code>AIBinder_Class</code>; <code>ABBinder</code> attaches it</td><td>Already done by <code>libbinder_ndk</code> (<code>AIBinder_transact</code>)</td><td>No</td></tr>
+</table>
+<p>Could the Java client call the exact same instance method the server calls? Only if it had a Stub object, and a client usually doesn't: it has a <code>Stub.Proxy</code>. The static function is the same switch the instance method returns, so the strings are identical.</p>
+
+<h4>Registration and lookup, step by step</h4>
+<p>Two moments matter: when the Proxy is built (once per proxy object), and when a traced call goes out (every call, but Java runs only the first time per code).</p>
+<figure>
+<figcaption><b>Register once, resolve lazily.</b> Phase 1 runs in every Proxy constructor, but after the first proxy for a given <code>BpBinder</code> it stops at one pointer check. The table itself is built once per interface per process (capped at 4096 interfaces, never freed). Phase 2 runs only with the <code>aidl</code> tag on. The JNI call (dashed frame) happens the first time each code is traced; after that, <code>resolveName</code> is a mutex and a hash lookup in native code.</figcaption>
+<svg viewBox="0 0 1000 575" role="img" aria-label="Java registration and lookup sequence">
+  <rect x="10" y="6" width="120" height="40" rx="5" class="b0"/><text x="70" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">Stub.Proxy</text><text x="70" y="39" text-anchor="middle" class="ts" style="font-size:10px">generated Java</text>
+  <rect x="260" y="6" width="140" height="40" rx="5" class="b0"/><text x="330" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BinderProxy JNI</text><text x="330" y="39" text-anchor="middle" class="ts" style="font-size:10px">frameworks/base</text>
+  <rect x="500" y="6" width="120" height="40" rx="5" class="ba"/><text x="560" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">Java table</text><text x="560" y="39" text-anchor="middle" class="ts" style="font-size:10px">one per interface</text>
+  <rect x="700" y="6" width="120" height="40" rx="5" class="bg"/><text x="760" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">BpBinder</text><text x="760" y="39" text-anchor="middle" class="ts" style="font-size:10px">libbinder</text>
+  <rect x="880" y="6" width="110" height="40" rx="5" class="b0"/><text x="935" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">Stub class</text><text x="935" y="39" text-anchor="middle" class="ts" style="font-size:10px">generated Java</text>
+  <line x1="70" y1="46" x2="70" y2="506" class="ln dash"/>
+  <line x1="330" y1="46" x2="330" y2="506" class="ln dash"/>
+  <line x1="560" y1="46" x2="560" y2="506" class="ln dash"/>
+  <line x1="760" y1="46" x2="760" y2="506" class="ln dash"/>
+  <line x1="935" y1="46" x2="935" y2="506" class="ln dash"/>
+
+  <rect x="10" y="58" width="980" height="20" rx="3" class="b2"/><text x="18" y="72" class="tb" style="font-size:11.5px">1 · once per proxy: asInterface(b) → new Stub.Proxy(b)</text>
+  <path d="M70,96 L328,96" class="lna" marker-end="url(#aha)"/>
+  <text x="200" y="91" text-anchor="middle" class="tms" style="font-size:10px">setTransactionNames(b, DESC, Stub)</text>
+  <rect x="340" y="106" width="210" height="34" rx="3" class="b2"/>
+  <text x="348" y="120" class="tms" style="font-size:10px">return early if flag off, not a</text>
+  <text x="348" y="133" class="tms" style="font-size:10px">BpBinder, or it has a table</text>
+  <path d="M330,160 L558,160" class="lna" marker-end="url(#aha)"/>
+  <text x="445" y="155" text-anchor="middle" class="tms" style="font-size:10px">getOrCreate(DESC)</text>
+  <rect x="570" y="170" width="180" height="48" rx="3" class="ba"/>
+  <text x="578" y="184" class="tms" style="font-size:10px">first time per interface:</text>
+  <text x="578" y="198" class="tms" style="font-size:10px">GlobalRef(Stub class)</text>
+  <text x="578" y="212" class="tms" style="font-size:10px">GetStaticMethodID(…)</text>
+  <path d="M330,240 L758,240" class="lna" marker-end="url(#aha)"/>
+  <text x="545" y="235" text-anchor="middle" class="tms" style="font-size:10px">bp-&gt;setTransactionCodeMap(&amp;t-&gt;data)</text>
+  <rect x="770" y="250" width="120" height="20" rx="3" class="bg"/>
+  <text x="778" y="264" class="tms" style="font-size:10px">first table wins</text>
+
+  <rect x="10" y="296" width="980" height="20" rx="3" class="b2"/><text x="18" y="310" class="tb" style="font-size:11.5px">2 · every traced call: proxy.isUserAMonkey() → transact(42, data)</text>
+  <path d="M70,334 L758,334" class="lna" marker-end="url(#aha)"/>
+  <text x="200" y="329" text-anchor="middle" class="tms" style="font-size:10px">transact(42, data)</text>
+  <rect x="770" y="344" width="150" height="20" rx="3" class="bg"/>
+  <text x="778" y="358" class="tms" style="font-size:10px">tag on, no names[]</text>
+  <path d="M760,384 L562,384" class="lna" marker-end="url(#aha)"/>
+  <text x="660" y="379" text-anchor="middle" class="tms" style="font-size:10px">resolveName(t, 42)</text>
+  <rect x="545" y="396" width="445" height="62" rx="4" class="panel" style="stroke-dasharray:4 3;stroke:var(--fg3)"/>
+  <text x="552" y="408" class="ts" style="font-size:10px">first time for code 42</text>
+  <path d="M560,422 L933,422" class="lna" marker-end="url(#aha)"/>
+  <text x="747" y="417" text-anchor="middle" class="tms" style="font-size:10px">getDefaultTransactionName(42)</text>
+  <path d="M935,446 L562,446" class="lng dash" marker-end="url(#ahg)"/>
+  <text x="850" y="442" text-anchor="middle" class="tms" style="font-size:10px">"isUserAMonkey"</text>
+  <rect x="410" y="464" width="140" height="20" rx="3" class="b2"/><text x="418" y="478" class="tms" style="font-size:10px">copy to cache[42]</text>
+  <path d="M560,498 L758,498" class="lng dash" marker-end="url(#ahg)"/>
+  <text x="660" y="493" text-anchor="middle" class="tms" style="font-size:10px">"isUserAMonkey"</text>
+  <rect x="330" y="512" width="600" height="22" rx="3" class="ba"/>
+  <text x="630" y="527" text-anchor="middle" class="tms" style="font-size:10px">trace_begin("AIDL::java::android.app.IActivityManager::isUserAMonkey::client")</text>
+  <text x="630" y="556" text-anchor="middle" class="ts">then ioctl → kernel → reply, and trace_end</text>
+</svg>
+</figure>
+<ol>
+<li><code>IActivityManager.Stub.asInterface(binder)</code> builds a <code>Stub.Proxy</code>. Its constructor calls <code>BinderProxy.setTransactionNames(remote, "android.app.IActivityManager", IActivityManager.Stub.class)</code>.</li>
+<li>JNI (<code>@FastNative</code>) returns at once if the flag is off, the binder is not a <code>BpBinder</code>, or the <code>BpBinder</code> already has a table. That last case is the common one: one pointer check.</li>
+<li>Otherwise it gets or creates the table for that descriptor and calls <code>bp-&gt;setTransactionCodeMap(&amp;table-&gt;data)</code>.</li>
+<li>On a traced call, <code>BpBinder</code> sees a table without names and calls <code>resolveName(table, 42)</code>. The first time, that is one JNI call to <code>Stub.getDefaultTransactionName(42)</code> through the cached <code>jmethodID</code>. The string is copied into native memory and cached.</li>
+<li><code>BpBinder</code> builds <code>AIDL::java::android.app.IActivityManager::isUserAMonkey::client</code> from the table's descriptor and that name.</li>
+</ol>
+<p>If the Stub has no name for a code, <code>resolveName</code> returns nothing and the slice shows <code>#42</code>, which is also what the server shows. A Java proxy built without <code>--proxy_transaction_names</code> never registers, so its calls get no client slice.</p>
+
+<blockquote class="key"><p><b>Alternative: Option B, reflection in BinderProxy</b> (its own read-write flag, off by default; land A or B, not both)</p>
+<ul>
+<li><b>How:</b> <code>BinderProxy.transact()</code> opens the slice in Java and closes it in <code>finally</code> when the code is a user code, its flag is on and the <code>aidl</code> tag is on. One file.</li>
+<li><b>Cache:</b> the same scheme the server-side <code>Binder.getTransactionTraceName()</code> used: a static map from descriptor to an array of finished slice names, plus a <code>volatile</code> reference on each <code>BinderProxy</code>. A traced call after the first is one field read and one array read.</li>
+<li><b>Descriptor:</b> read once per <code>BinderProxy</code> from the start of the Parcel (the interface token the Proxy just wrote).</li>
+<li><b>Method name:</b> the generated <code>Stub.Proxy</code> is on the calling stack; its enclosing class is the Stub. <code>getDefaultTransactionName(code)</code> is found once per interface and called once per code. No match → <code>#&lt;code&gt;</code>.</li>
+<li><b>Trade-off:</b> it covers every Java proxy, including mainline modules and apps, without touching AIDL or JNI. But the Stub is matched by name against the descriptor (true for generated AIDL, not a contract), it is Java-only, and it adds a flag read and a tag check to every <code>BinderProxy.transact</code>.</li>
+</ul>
+<figure>
+<figcaption><b>Option B.</b> Green: every traced call (one field read, one array read; no lock, no allocation). Blue: first traced call on each <code>BinderProxy</code>. Amber: first call per interface (find the Stub) and per code (call it). The tracing-off path is the grey check only.</figcaption>
+<svg viewBox="0 0 1000 400" role="img" aria-label="Option B">
+  <rect x="20" y="20" width="220" height="50" rx="5" class="b0"/><text x="130" y="41" text-anchor="middle" class="tm">IFoo.Stub.Proxy.doFoo()</text><text x="130" y="58" text-anchor="middle" class="ts">mRemote.transact(code, data)</text>
+  <rect x="280" y="20" width="440" height="50" rx="5" class="b0"/><text x="500" y="41" text-anchor="middle" class="tm">BinderProxy.transact</text><text x="500" y="58" text-anchor="middle" class="tms">user code &amp;&amp; flag &amp;&amp; Trace.isTagEnabled(AIDL)</text>
+  <path d="M240,45 L280,45" class="ln" marker-end="url(#ah)"/>
+  <path d="M720,45 L800,45" class="ln dash" marker-end="url(#ah)"/><text x="760" y="38" text-anchor="middle" class="ts">false</text>
+  <rect x="800" y="20" width="180" height="50" rx="5" class="b0"/><text x="890" y="41" text-anchor="middle" class="tm">transactNative</text><text x="890" y="58" text-anchor="middle" class="ts">no slice</text>
+  <path d="M500,70 L500,96" class="ln" marker-end="url(#ah)"/><text x="508" y="88" class="ts">true</text>
+
+  <rect x="280" y="96" width="440" height="50" rx="5" class="bg"/><text x="500" y="117" text-anchor="middle" class="tms">names = this.mAidlTraceNames   (volatile)</text><text x="500" y="134" text-anchor="middle" class="tms">name = names.mNames.getAcquire(code - 1)</text>
+  <path d="M720,121 L800,121" class="ln" marker-end="url(#ah)"/><text x="760" y="114" text-anchor="middle" class="ts">hit</text>
+  <rect x="800" y="96" width="180" height="50" rx="5" class="bg"/><text x="890" y="117" text-anchor="middle" class="tm">Trace.traceBegin</text><text x="890" y="134" text-anchor="middle" class="ts">…::doFoo::client</text>
+
+  <path d="M280,121 L240,121 L240,190" class="lna" marker-end="url(#aha)"/><text x="232" y="160" text-anchor="end" class="ts">names == null</text>
+  <rect x="20" y="190" width="440" height="66" rx="5" class="ba"/><text x="240" y="210" text-anchor="middle" class="tm">once per BinderProxy</text><text x="240" y="228" text-anchor="middle" class="tms">desc = peek interface token in data</text><text x="240" y="245" text-anchor="middle" class="tms">Cache.map.computeIfAbsent(desc) → this.mAidlTraceNames</text>
+
+  <path d="M600,146 L600,190" class="ln" marker-end="url(#ah)"/><text x="608" y="172" class="ts">miss (null)</text>
+  <rect x="500" y="190" width="480" height="66" rx="5" class="bw"/><text x="740" y="210" text-anchor="middle" class="tm">once per interface: find the Stub</text><text x="740" y="228" text-anchor="middle" class="tms">Stub.Proxy frame on the stack → enclosing class</text><text x="740" y="245" text-anchor="middle" class="ts">else Class.forName(desc + "$Stub"); getMethod("getDefaultTransactionName")</text>
+  <path d="M740,256 L740,280" class="ln" marker-end="url(#ah)"/>
+  <rect x="500" y="280" width="480" height="50" rx="5" class="bw"/><text x="740" y="301" text-anchor="middle" class="tm">once per code: invoke(code) → "doFoo"</text><text x="740" y="318" text-anchor="middle" class="ts">null or failure → "#&lt;code&gt;"; build the full name; setRelease</text>
+  <path d="M980,305 L990,305 L990,121 L980,121" class="ln" marker-end="url(#ah)"/>
+
+  <rect x="20" y="280" width="440" height="100" rx="5" class="b"/>
+  <text x="34" y="300" class="th">per-interface object (shared by all proxies)</text>
+  <text x="34" y="322" class="tms">AidlTraceNames {</text>
+  <text x="50" y="340" class="tms">String descriptor; Method getName;</text>
+  <text x="50" y="358" class="tms">AtomicReferenceArray&lt;String&gt; mNames;  // grows to 1025</text>
+  <text x="34" y="374" class="tms">}</text>
+  <path d="M240,256 L240,280" class="ln" marker-end="url(#ah)"/>
+</svg>
+</figure></blockquote>
+
+<p>Here's the satisfying part. The client name and the server name are built from the <i>same strings</i>: the descriptor constant the proxy registered (the same one it writes into every Parcel and the server checks), and the method name from the same generated <code>switch</code>. So they match exactly.</p>
+<p>(Rust and NDK clients don't need any of this: their generated code registers a names table with <code>libbinder_ndk</code>, which already emits the client slice. See the report's "Where names come from" table.)</p>
+
+<h2 id="result"><span class="n">14</span>What you see now</h2>
+<figure>
+<figcaption><b>Our call in Perfetto.</b> On the app thread, the client slice spans the whole wait: from handing the envelope to the kernel until the reply arrives. On a system_server binder thread, the server slice spans the actual work. Same name, two ends. The kernel's binder events (dashed) are what link the two threads.</figcaption>
+<svg viewBox="0 0 1000 170" role="img" aria-label="Trace timeline">
+  <text x="10" y="44" class="th">app main thread</text>
+  <rect x="200" y="28" width="640" height="26" rx="3" class="ba"/><text x="210" y="45" class="tms">AIDL::java::android.app.IActivityManager::isUserAMonkey::client   ~60 µs</text>
+  <text x="10" y="114" class="th">system_server binder thread</text>
+  <rect x="420" y="98" width="200" height="26" rx="3" class="bg"/><text x="428" y="115" class="tms">…::isUserAMonkey::server  ~14 µs</text>
+  <path d="M210,56 L420,96" class="ln dash" marker-end="url(#ah)"/><text x="260" y="88" class="ts">request</text>
+  <path d="M620,96 L830,56" class="ln dash" marker-end="url(#ah)"/><text x="740" y="88" class="ts">reply</text>
+  <text x="200" y="155" class="ts">The gap between the bars is time spent in the kernel and waking threads. You can now see it from the app's side, labeled.</text>
+</svg>
+</figure>
+<p>On the test device, a 12 s whole-system trace while opening Settings showed Java client slices in system_server (460), permissioncontroller (716), Settings (194), SystemUI (152), the keyboard, the launcher and phone. It had 255 distinct Java client names, none numeric; 251 of them also appeared with an identical <code>::server</code> name. 1635 of 1923 Java server slices (85%) had a matching client slice. The rest came from proxies not built with <code>--proxy_transaction_names</code> (mainline modules such as <code>ISafetyCenterManager</code>, framework-location's <code>ILocationManager</code>) and from hand-written native clients.</p>
+
+<h2 id="cost"><span class="n">15</span>How the costs were measured</h2>
+<p>"It's cheap" is a claim; here's how each number was actually produced, so you can judge it, or rerun it. Everything ran on one cuttlefish VM: x86_64, 4 virtual CPUs, Android userdebug, idle. On that build <code>libbinder.so</code> is really <code>libcore_bundle.so</code>, so that's the library that was rebuilt.</p>
+
+<h3>Rule 1: compare two builds that differ only by the change</h3>
+<p>The baseline library was built from the same source tree with the change removed. Its md5 matched the library already on the device, so "baseline" really is "what the phone runs today". Test programs loaded one library or the other via <code>LD_LIBRARY_PATH</code>, so nothing else on the device changed between runs.</p>
+
+<h3>Memory: read it out of the binary</h3>
+<ul>
+<li><b>Object size.</b> <code>new BpBinder(...)</code> compiles to <code>operator new(SIZE)</code> with a constant. Disassembling <code>BpBinder::create</code> shows <code>movl $0xa0, %edi</code> in both builds: 160 bytes. Appending the pointer naively would give <code>$0xa8</code>, 168 bytes. Android's allocator (scudo) adds a 16-byte header and rounds up to a fixed size class: 176 fits exactly, but 184 rounds up to 192. So the naive version would cost 16 real bytes per proxy. Moving one 4-byte field into a gap avoids it.</li>
+<li><b>Library size.</b> <code>llvm-size -A</code> on both libraries, section by section. <code>.text</code> grew by 1.4 KB (shared, clean, read from the file). <code>.data.rel.ro</code>, which each process gets a private copy of, grew 16 bytes and needed no new page.</li>
+</ul>
+
+<h3>CPU with tracing off: count instructions, then confirm with a stopwatch</h3>
+<p>A few nanoseconds is far below what a stopwatch can resolve on a 40 µs operation. So the primary evidence is the machine code: <code>llvm-objdump</code> of <code>BpBinder::transact</code> in both builds, diffed. The diff is about 9 instructions: load the tag word, test bit 24, branch, and store/reload a flag. Then a benchmark checks that nothing <i>else</i> changed:</p>
+<ul>
+<li><b>Native:</b> <code>binderClientTraceBenchmark</code> forks a server and makes empty synchronous calls to it. The same binary was run against both libraries, alternating baseline and patched, 8 rounds × 5 repetitions × ≥2 s each.</li>
+<li><b>Java:</b> a small Java program run with <code>app_process</code> calls <code>isUserAMonkey</code>, <code>isSafeMode</code> and <code>isInteractive</code> on system_server through their real generated proxies: 500 warm-up calls, then 30,000 timed. Again alternated stock vs patched, 8 rounds.</li>
+</ul>
+<figure>
+<figcaption><b>Tracing off: same height.</b> Medians of 40 runs (native) and 8 runs × 30,000 calls (Java). Whiskers are ±1 standard deviation across runs, so they show the run-to-run noise, about 1.3–3.9 µs. The real difference is a few nanoseconds, roughly a thousand times smaller than the whiskers.</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="tracing off chart">
+<line x1="80" y1="240.0" x2="980" y2="240.0" class="ln" style="opacity:.25"/>
+<text x="72" y="244.0" text-anchor="end" class="ts">0.0</text>
+<line x1="80" y1="196.0" x2="980" y2="196.0" class="ln" style="opacity:.25"/>
+<text x="72" y="200.0" text-anchor="end" class="ts">12.0</text>
+<line x1="80" y1="152.0" x2="980" y2="152.0" class="ln" style="opacity:.25"/>
+<text x="72" y="156.0" text-anchor="end" class="ts">24.0</text>
+<line x1="80" y1="108.0" x2="980" y2="108.0" class="ln" style="opacity:.25"/>
+<text x="72" y="112.0" text-anchor="end" class="ts">36.0</text>
+<line x1="80" y1="64.0" x2="980" y2="64.0" class="ln" style="opacity:.25"/>
+<text x="72" y="68.0" text-anchor="end" class="ts">48.0</text>
+<line x1="80" y1="20.0" x2="980" y2="20.0" class="ln" style="opacity:.25"/>
+<text x="72" y="24.0" text-anchor="end" class="ts">60.0</text>
+<text x="16" y="130" class="ts" transform="rotate(-90 16 130)" text-anchor="middle">µs per call (median, ±1 sd)</text>
+<rect x="230.0" y="98.4" width="70.0" height="141.6" class="b2"/>
+<line x1="265.0" y1="91.2" x2="265.0" y2="105.6" class="ln"/>
+<line x1="259.0" y1="91.2" x2="271.0" y2="91.2" class="ln"/>
+<line x1="259.0" y1="105.6" x2="271.0" y2="105.6" class="ln"/>
+<text x="265.0" y="85.2" text-anchor="middle" class="tms">38.6</text>
+<text x="265.0" y="256" text-anchor="middle" class="ts">baseline</text>
+<rect x="310.0" y="98.3" width="70.0" height="141.7" class="bg"/>
+<line x1="345.0" y1="93.6" x2="345.0" y2="103.0" class="ln"/>
+<line x1="339.0" y1="93.6" x2="351.0" y2="93.6" class="ln"/>
+<line x1="339.0" y1="103.0" x2="351.0" y2="103.0" class="ln"/>
+<text x="345.0" y="87.6" text-anchor="middle" class="tms">38.6</text>
+<text x="345.0" y="256" text-anchor="middle" class="ts">patched</text>
+<text x="305.0" y="278" text-anchor="middle" class="tb">native: empty sync call</text>
+<rect x="680.0" y="45.7" width="70.0" height="194.3" class="b2"/>
+<line x1="715.0" y1="36.3" x2="715.0" y2="55.2" class="ln"/>
+<line x1="709.0" y1="36.3" x2="721.0" y2="36.3" class="ln"/>
+<line x1="709.0" y1="55.2" x2="721.0" y2="55.2" class="ln"/>
+<text x="715.0" y="30.3" text-anchor="middle" class="tms">53.0</text>
+<text x="715.0" y="256" text-anchor="middle" class="ts">stock</text>
+<rect x="760.0" y="45.9" width="70.0" height="194.1" class="bg"/>
+<line x1="795.0" y1="31.6" x2="795.0" y2="60.2" class="ln"/>
+<line x1="789.0" y1="31.6" x2="801.0" y2="31.6" class="ln"/>
+<line x1="789.0" y1="60.2" x2="801.0" y2="60.2" class="ln"/>
+<text x="795.0" y="25.6" text-anchor="middle" class="tms">52.9</text>
+<text x="795.0" y="256" text-anchor="middle" class="ts">patched</text>
+<text x="755.0" y="278" text-anchor="middle" class="tb">Java: BinderProxy call</text>
+<line x1="80" y1="240" x2="980" y2="240" class="ln"/>
+</svg>
+</figure>
+<p>Why alternate instead of running all baseline runs, then all patched runs? Because the machine drifts (thermal state, other work, cache state). Running the two back to back and looking at their <i>difference</i> cancels most of the drift:</p>
+<figure>
+<figcaption><b>Why interleaving and repeats matter.</b> Each dot is one round: baseline and patched run back to back, and the dot shows their difference. With the tag off the dots scatter on both sides of zero: that scatter is the VM's noise, not the change. One Java round alone could have shown anything from −3 to +9 µs, for a change that costs nanoseconds.</figcaption>
+<svg viewBox="0 0 1000 170" role="img" aria-label="paired deltas">
+<line x1="200.0" y1="20" x2="200.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="200.0" y="143" text-anchor="middle" class="ts">-10</text>
+<line x1="276.0" y1="20" x2="276.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="276.0" y="143" text-anchor="middle" class="ts">-8</text>
+<line x1="352.0" y1="20" x2="352.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="352.0" y="143" text-anchor="middle" class="ts">-6</text>
+<line x1="428.0" y1="20" x2="428.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="428.0" y="143" text-anchor="middle" class="ts">-4</text>
+<line x1="504.0" y1="20" x2="504.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="504.0" y="143" text-anchor="middle" class="ts">-2</text>
+<line x1="580.0" y1="20" x2="580.0" y2="125" class="ln" style="opacity:0.6"/>
+<text x="580.0" y="143" text-anchor="middle" class="ts">+0</text>
+<line x1="656.0" y1="20" x2="656.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="656.0" y="143" text-anchor="middle" class="ts">+2</text>
+<line x1="732.0" y1="20" x2="732.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="732.0" y="143" text-anchor="middle" class="ts">+4</text>
+<line x1="808.0" y1="20" x2="808.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="808.0" y="143" text-anchor="middle" class="ts">+6</text>
+<line x1="884.0" y1="20" x2="884.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="884.0" y="143" text-anchor="middle" class="ts">+8</text>
+<line x1="960.0" y1="20" x2="960.0" y2="125" class="ln" style="opacity:0.2"/>
+<text x="960.0" y="143" text-anchor="middle" class="ts">+10</text>
+<text x="580" y="161" text-anchor="middle" class="ts">patched − baseline, µs per call (each dot is one interleaved round)</text>
+<text x="188" y="44.0" text-anchor="end" class="t">native, tag off</text>
+<circle cx="454.3" cy="40.0" r="5" class="fg"/>
+<circle cx="593.8" cy="40.0" r="5" class="fg"/>
+<circle cx="633.9" cy="40.0" r="5" class="fg"/>
+<circle cx="492.7" cy="40.0" r="5" class="fg"/>
+<circle cx="602.2" cy="40.0" r="5" class="fg"/>
+<circle cx="544.7" cy="40.0" r="5" class="fg"/>
+<circle cx="608.3" cy="40.0" r="5" class="fg"/>
+<circle cx="562.3" cy="40.0" r="5" class="fg"/>
+<line x1="561.5" y1="28.0" x2="561.5" y2="52.0" class="lnr" style="stroke-width:2"/>
+<text x="567.5" y="28.0" class="tms tr">mean -0.5</text>
+<text x="188" y="109.0" text-anchor="end" class="t">Java, tag off</text>
+<circle cx="475.6" cy="105.0" r="5" class="fg"/>
+<circle cx="902.9" cy="105.0" r="5" class="fg"/>
+<circle cx="478.6" cy="105.0" r="5" class="fg"/>
+<circle cx="593.4" cy="105.0" r="5" class="fg"/>
+<circle cx="582.8" cy="105.0" r="5" class="fg"/>
+<circle cx="614.5" cy="105.0" r="5" class="fg"/>
+<circle cx="711.4" cy="105.0" r="5" class="fg"/>
+<circle cx="531.1" cy="105.0" r="5" class="fg"/>
+<line x1="611.3" y1="93.0" x2="611.3" y2="117.0" class="lnr" style="stroke-width:2"/>
+<text x="617.3" y="93.0" class="tms tr">mean +0.8</text>
+</svg>
+</figure>
+
+<h3>CPU with tracing on: measure the parts, then the whole</h3>
+<ul>
+<li><b>Parts:</b> two microbenchmarks in a tight loop. <code>BM_formatName</code> is the same <code>snprintf</code> that builds the name: 118 ns. <code>BM_traceBeginEnd</code> is one <code>atrace_begin</code> + <code>atrace_end</code>, i.e. two writes to <code>trace_marker</code>: 887 ns.</li>
+<li><b>Whole, native:</b> the benchmark has two services in the same server process: one proxy <i>with</i> a table, one <i>without</i>. With the <code>aidl</code> tag on, both pay for the server's slice; only one pays for the client's. The difference between them is the client slice: +2.35 µs (n = 15 runs each, standard error 0.65 µs).</li>
+<li><b>Whole, Java:</b> not cleanly measured. With the tag on, the server slices turn on too, and on this VM the end-to-end Java numbers were too noisy to isolate the client part. By construction, a traced Java call does the native work plus, after the first call per code, one mutex and one hash lookup in <code>resolveName</code>. With tracing off, Java adds nothing per call; registration costs one JNI pointer check per Proxy construction.</li>
+</ul>
+<figure>
+<figcaption><b>Tracing on: what each slice adds.</b> Left: the two parts measured on their own in a tight loop. Right: the measured difference between calls with and without a client slice, inside a real binder call (whiskers: ±1 standard error). The in-context cost is higher than the parts because the <code>trace_marker</code> writes run with cold caches right after the binder context switch. Native only: the Java tag-on cost was not cleanly measured (see above).</figcaption>
+<svg viewBox="0 0 1000 300" role="img" aria-label="tracing on chart">
+<line x1="80" y1="240.0" x2="980" y2="240.0" class="ln" style="opacity:.25"/>
+<text x="72" y="244.0" text-anchor="end" class="ts">0.00</text>
+<line x1="80" y1="196.0" x2="980" y2="196.0" class="ln" style="opacity:.25"/>
+<text x="72" y="200.0" text-anchor="end" class="ts">1.20</text>
+<line x1="80" y1="152.0" x2="980" y2="152.0" class="ln" style="opacity:.25"/>
+<text x="72" y="156.0" text-anchor="end" class="ts">2.40</text>
+<line x1="80" y1="108.0" x2="980" y2="108.0" class="ln" style="opacity:.25"/>
+<text x="72" y="112.0" text-anchor="end" class="ts">3.60</text>
+<line x1="80" y1="64.0" x2="980" y2="64.0" class="ln" style="opacity:.25"/>
+<text x="72" y="68.0" text-anchor="end" class="ts">4.80</text>
+<line x1="80" y1="20.0" x2="980" y2="20.0" class="ln" style="opacity:.25"/>
+<text x="72" y="24.0" text-anchor="end" class="ts">6.00</text>
+<text x="16" y="130" class="ts" transform="rotate(-90 16 130)" text-anchor="middle">µs added per call</text>
+<rect x="230.0" y="235.7" width="70.0" height="4.3" class="ba"/>
+<text x="265.0" y="229.7" text-anchor="middle" class="tms">0.12</text>
+<text x="265.0" y="256" text-anchor="middle" class="ts">snprintf</text>
+<rect x="310.0" y="207.5" width="70.0" height="32.5" class="ba"/>
+<text x="345.0" y="201.5" text-anchor="middle" class="tms">0.89</text>
+<text x="345.0" y="256" text-anchor="middle" class="ts">B+E writes</text>
+<text x="305.0" y="278" text-anchor="middle" class="tb">parts (hot loop)</text>
+<rect x="680.0" y="153.9" width="70.0" height="86.1" class="bw"/>
+<line x1="715.0" y1="130.2" x2="715.0" y2="177.7" class="ln"/>
+<line x1="709.0" y1="130.2" x2="721.0" y2="130.2" class="ln"/>
+<line x1="709.0" y1="177.7" x2="721.0" y2="177.7" class="ln"/>
+<text x="715.0" y="124.2" text-anchor="middle" class="tms">2.35</text>
+<text x="715.0" y="256" text-anchor="middle" class="ts">native</text>
+<text x="795.0" y="214" text-anchor="middle" class="ts">not</text>
+<text x="795.0" y="228" text-anchor="middle" class="ts">measured</text>
+<text x="795.0" y="256" text-anchor="middle" class="ts">Java</text>
+<text x="755.0" y="278" text-anchor="middle" class="tb">whole client slice (in context)</text>
+<line x1="80" y1="240" x2="980" y2="240" class="ln"/>
+</svg>
+</figure>
+
+<h3>Trace size: let the kernel count</h3>
+<p>The ftrace buffer keeps per-CPU statistics, including how many bytes it holds. The measurement:</p>
+<ol>
+<li>Enlarge the buffer to 32 MiB per CPU, so nothing gets overwritten.</li>
+<li>Clear it, and run exactly 10,000 calls without a table. Read the bytes: 1,221,512. Those are the server's slices.</li>
+<li>Clear it, and run exactly 10,000 calls with a table. Read the bytes: 2,421,964. That's the server's slices plus the client's.</li>
+<li>Check: overruns 0, and 10,000 client slices counted in the text.</li>
+</ol>
+<p>The difference divided by 10,000 is 120.0 bytes per client slice.</p>
+<figure>
+<figcaption><b>Trace bytes per client slice grow with the name length.</b> The line is <code>57 + strlen(name)</code>: two ftrace events with about 22 bytes of fixed header each, plus the text <code>"B|pid|" + name</code> and <code>"E|pid"</code>. The dot is the measurement: 10,000 calls with a 63-character name added 1,200,452 bytes to the ftrace buffer, 120.0 per call, with 0 overruns. The shaded band is the 10th–90th percentile of 1,850 real client slice names in the whole-device trace (59–87 characters, median 76, so about 133 bytes per slice).</figcaption>
+<svg viewBox="0 0 1000 270" role="img" aria-label="bytes per slice">
+<rect x="455" y="20" width="178" height="200" class="bg" style="opacity:.35"/>
+<line x1="563.1" y1="20" x2="563.1" y2="220" class="lng dash"/>
+<text x="544" y="34" text-anchor="middle" class="ts tg">real names: 10th–90th percentile, median 76</text>
+<line x1="80.0" y1="220.0" x2="80.0" y2="225.0" class="ln"/>
+<text x="80.0" y="238.0" text-anchor="middle" class="ts">0</text>
+<line x1="207.1" y1="220.0" x2="207.1" y2="225.0" class="ln"/>
+<text x="207.1" y="238.0" text-anchor="middle" class="ts">20</text>
+<line x1="334.3" y1="220.0" x2="334.3" y2="225.0" class="ln"/>
+<text x="334.3" y="238.0" text-anchor="middle" class="ts">40</text>
+<line x1="461.4" y1="220.0" x2="461.4" y2="225.0" class="ln"/>
+<text x="461.4" y="238.0" text-anchor="middle" class="ts">60</text>
+<line x1="588.6" y1="220.0" x2="588.6" y2="225.0" class="ln"/>
+<text x="588.6" y="238.0" text-anchor="middle" class="ts">80</text>
+<line x1="715.7" y1="220.0" x2="715.7" y2="225.0" class="ln"/>
+<text x="715.7" y="238.0" text-anchor="middle" class="ts">100</text>
+<line x1="842.9" y1="220.0" x2="842.9" y2="225.0" class="ln"/>
+<text x="842.9" y="238.0" text-anchor="middle" class="ts">120</text>
+<line x1="970.0" y1="220.0" x2="970.0" y2="225.0" class="ln"/>
+<text x="970.0" y="238.0" text-anchor="middle" class="ts">140</text>
+<line x1="80" y1="220.0" x2="970" y2="220.0" class="ln" style="opacity:.2"/>
+<text x="72" y="224.0" text-anchor="end" class="ts">0</text>
+<line x1="80" y1="170.0" x2="970" y2="170.0" class="ln" style="opacity:.2"/>
+<text x="72" y="174.0" text-anchor="end" class="ts">50</text>
+<line x1="80" y1="120.0" x2="970" y2="120.0" class="ln" style="opacity:.2"/>
+<text x="72" y="124.0" text-anchor="end" class="ts">100</text>
+<line x1="80" y1="70.0" x2="970" y2="70.0" class="ln" style="opacity:.2"/>
+<text x="72" y="74.0" text-anchor="end" class="ts">150</text>
+<line x1="80" y1="20.0" x2="970" y2="20.0" class="ln" style="opacity:.2"/>
+<text x="72" y="24.0" text-anchor="end" class="ts">200</text>
+<path d="M80.0,163.0 L970.0,23.0" class="lna" style="stroke-width:2"/>
+<circle cx="480.5" cy="100.0" r="6" class="fr"/>
+<text x="490.5" y="104.0" class="tms tr">measured: 63 chars → 120 B</text>
+<text x="525" y="264" text-anchor="middle" class="ts">slice name length (characters)</text>
+<text x="18" y="120" class="ts" transform="rotate(-90 18 120)" text-anchor="middle">bytes per call</text>
+</svg>
+</figure>
+
+<h3>Correctness: count slices, match names</h3>
+<p>A cost is only interesting if the feature works. Every trace run was checked with SQL over the trace (trace_processor):</p>
+<ul>
+<li><b>Counts:</b> N calls must give exactly N client slices. 2000 calls gave 2000 slices; 800 gave 800.</li>
+<li><b>Names:</b> client and server names must match. In the Java end-to-end test (800 calls each to <code>isUserAMonkey</code>, <code>isSafeMode</code>, <code>isInteractive</code>) client and server names were identical. Across the whole-device trace, of 255 distinct Java client names (none numeric), 251 had an identical server name in the same trace.</li>
+<li><b>No duplicates from libbinder:</b> no call got two libbinder client slices. NDK and Rust proxies have no <code>BpBinder</code> table, so <code>BpBinder</code> doesn't add a second slice to the one <code>libbinder_ndk</code> already emits. The only doubled names come from interfaces that still bake in <code>gen_trace</code> slices (<code>…::cppClient</code>, §9).</li>
+</ul>
+<p>The raw numbers, benchmark JSON and trace files are linked from <a href="index.html">the report</a>.</p>
+
+<h2 id="glossary">Glossary</h2>
+<table>
+<tr><th>Term</th><th>One line</th></tr>
+<tr><td>Process</td><td>A running program with its own private memory.</td></tr>
+<tr><td>Binder</td><td>The kernel driver that carries a call from a thread in one process to a thread in another, and the reply back.</td></tr>
+<tr><td>Transaction</td><td>One binder call: a code, a Parcel, and (usually) a reply.</td></tr>
+<tr><td>Transaction code</td><td>The number that says which method. AIDL assigns 1, 2, 3… in declaration order.</td></tr>
+<tr><td>Parcel</td><td>The byte buffer that carries a call's data. It has a read position that moves as you read.</td></tr>
+<tr><td>Interface descriptor / token</td><td>The interface's name (<code>"android.app.IActivityManager"</code>), written first into every AIDL call's Parcel.</td></tr>
+<tr><td><code>IBinder</code></td><td>"Something you can <code>transact()</code> with." Either a <code>BBinder</code> or a <code>BpBinder</code>.</td></tr>
+<tr><td><code>BBinder</code></td><td>The real object, in the process that implements it (the person).</td></tr>
+<tr><td><code>BpBinder</code></td><td>A stand-in for an object in another process, holding a kernel handle (the phone number).</td></tr>
+<tr><td>Handle</td><td>A small integer the kernel maps to a specific remote <code>BBinder</code>, like a file descriptor.</td></tr>
+<tr><td>AIDL</td><td>The interface language and compiler that generate the Proxy (client) and Stub (server) code.</td></tr>
+<tr><td>Proxy / Stub</td><td>Generated classes: Proxy turns a method call into code + Parcel; Stub turns them back into a method call.</td></tr>
+<tr><td><code>BinderProxy</code></td><td>Java's generic wrapper around a native <code>BpBinder</code>.</td></tr>
+<tr><td><code>JavaBBinder</code></td><td>The native <code>BBinder</code> behind a Java <code>Binder</code>/<code>Stub</code>; it holds the Java object.</td></tr>
+<tr><td>JNI</td><td>The bridge that lets C++ and Java call each other.</td></tr>
+<tr><td>atrace / slice</td><td>Lines written to the kernel's <code>trace_marker</code> ("B|…" / "E|…") that Perfetto draws as labeled bars.</td></tr>
+<tr><td><code>ATRACE_TAG_AIDL</code></td><td>The <code>aidl</code> trace category; binder slices are only emitted when it's on.</td></tr>
+<tr><td><code>TransactionCodeData</code></td><td>The per-interface table a <code>BpBinder</code> points at: the descriptor plus either a names array (cpp) or a <code>resolveName</code> function (Java).</td></tr>
+<tr><td><code>setTransactionNames</code></td><td>Hidden <code>BinderProxy</code> method the generated Java Proxy constructor calls to attach that table.</td></tr>
+</table>
+<footer class="site-foot">
+  <a href="../index.html">&larr; All notes</a>
+  <a href="#top">Back to top &uarr;</a>
+</footer>
+</main>
+</body>
+</html>

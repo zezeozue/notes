@@ -29,6 +29,7 @@ Notes:
 | `java_sdk_zero_copy/` | Zero-copy Java to native on ART |
 | `native_memory_elf_malloc/` | Native memory on Android: ELF, the dynamic linker, mmap and malloc |
 | `parcel_native_memory/` | How Parcel holds native memory across Binder calls and in system_server |
+| `binder_client_trace/` | Client-side AIDL trace slices from BpBinder, plus a Binder-from-scratch primer |
 | `oom_adjuster/` | How Android decides which processes to kill, slow down or freeze |
 | `input_display_pipeline/` | How a touch becomes pixels, and how Android decides a frame was late |
 | `kotlin_coroutines_flows/` | Kotlin coroutines, flows, Views and Compose |
