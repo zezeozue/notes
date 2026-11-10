@@ -593,7 +593,7 @@ alignas(16) static const TransactionCodeData IFoo_data = {
 </svg>
 </figure>
 <figure>
-<figcaption><b>cpp → cpp.</b> Same shape, without JNI. The only new thing is at the very top: when the generated <code>BpFoo</code> is constructed, it hands its <code>BpBinder</code> the static names table (the AIDL hookup CL). From then on <code>BpBinder::transact</code> can name every call.</figcaption>
+<figcaption><b>cpp → cpp.</b> Same shape, without JNI. The only new thing is at the very top: when the generated <code>BpFoo</code> is constructed, it hands its <code>BpBinder</code> the static names table (the AIDL hookup change). From then on <code>BpBinder::transact</code> can name every call.</figcaption>
 <svg viewBox="0 0 1000 520" role="img" aria-label="cpp sequence diagram">
 <rect x="24" y="6" width="129" height="40" rx="5" class="b0"/>
 <text x="89" y="24" text-anchor="middle" class="tb" style="font-size:11.5px">app code</text>
@@ -797,7 +797,7 @@ status_t BnFoo::onTransact(...) {
   <text x="20" y="235" class="t">them from the table). This change does the same for the client side, in <tspan class="tm">BpBinder::transact</tspan>.</text>
 </svg>
 </figure>
-<p>So the CL isn't inventing a new place to trace. It finishes a move Android had already started: tracing happens in libbinder, and generated code provides the names. The only open question was how the <i>client</i> end gets hold of those names, which is the next three sections. All of it is behind a read-only flag that is off by default.</p>
+<p>So the proposal isn't inventing a new place to trace. It finishes a move Android had already started: tracing happens in libbinder, and generated code provides the names. The only open question was how the <i>client</i> end gets hold of those names, which is the next three sections. All of it is behind a read-only flag that is off by default.</p>
 
 <h2 id="server"><span class="n">10</span>How the server names its slice</h2>
 <p>libbinder already wraps every incoming call in a slice. It happens in <code>BBinder::transact()</code>, the box on the server side of the diagram in §5. To build the name <code>AIDL::&lt;backend&gt;::&lt;descriptor&gt;::&lt;method&gt;::server</code>, it needs two strings:</p>
@@ -940,7 +940,7 @@ status_t BnFoo::onTransact(...) {
 <table>
 <tr><th>Backend</th><th>Server: how libbinder gets the name (existing)</th><th>Client: how libbinder gets the name (this change)</th><th>New generated code?</th></tr>
 <tr><td>Java</td><td><code>JavaBBinder</code> holds the <b>Stub instance</b> → calls <code>stub.getTransactionName(code)</code> (generated; returns <code>getDefaultTransactionName(code)</code>)</td><td>No Stub instance on the client → the table calls the <b>static</b> <code>Stub.getDefaultTransactionName(code)</code> on the <code>Stub</code> class the Proxy registered</td><td>One line in the <code>Stub.Proxy</code> constructor (<code>--proxy_transaction_names</code>)</td></tr>
-<tr><td>cpp</td><td>Generated <code>BnFoo</code> constructor attaches <code>IFoo_names</code> table to the <code>BBinder</code></td><td>Generated <code>BpFoo</code> constructor attaches the <b>same</b> table to the <code>BpBinder</code></td><td>One line in the <code>BpFoo</code> constructor (AIDL hookup CL)</td></tr>
+<tr><td>cpp</td><td>Generated <code>BnFoo</code> constructor attaches <code>IFoo_names</code> table to the <code>BBinder</code></td><td>Generated <code>BpFoo</code> constructor attaches the <b>same</b> table to the <code>BpBinder</code></td><td>One line in the <code>BpFoo</code> constructor (AIDL hookup change)</td></tr>
 <tr><td>NDK / Rust</td><td>Names array registered on <code>AIBinder_Class</code>; <code>ABBinder</code> attaches it</td><td>Already done by <code>libbinder_ndk</code> (<code>AIBinder_transact</code>)</td><td>No</td></tr>
 </table>
 <p>Could the Java client call the exact same instance method the server calls? Only if it had a Stub object, and a client usually doesn't: it has a <code>Stub.Proxy</code>. The static function is the same switch the instance method returns, so the strings are identical.</p>
