@@ -59,13 +59,12 @@ details > summary { cursor: pointer; color: var(--muted, #666); }
   <a href="#peek">13 · Fix 2: Java proxies register their Stub</a>
   <a href="#whoknows" style="padding-left:18px">who knows what; registration step by step</a>
   <a href="#result">14 · What you see now</a>
-  <a href="#cost">15 · How the costs were measured</a>
   <a href="#glossary">Glossary</a>
 </nav>
 
 <main id="top">
 <h1>Binder from scratch: how a call crosses processes, and how both ends get a name in the trace</h1>
-<p class="lead">An app asks system_server a question: <i>"is a monkey driving this phone?"</i> (<code>IActivityManager.isUserAMonkey()</code>). The two programs share no memory. Yet the call looks like an ordinary method call in the app's code, and with the change in <a href="index.html">the companion report</a>, a trace labels both ends with the same name. This note follows that one call from start to finish and introduces each piece only when the call needs it.</p>
+<p class="lead">An app asks system_server a question: <i>"is a monkey driving this phone?"</i> (<code>IActivityManager.isUserAMonkey()</code>). The two programs share no memory. Yet the call looks like an ordinary method call in the app's code, and with the change in <a href="index.html">the design proposal</a>, a trace labels both ends with the same name. This note follows that one call from start to finish and introduces each piece only when the call needs it.</p>
 
 <h2 id="big"><span class="n">0</span>The whole story in five pictures</h2>
 <p>If you only read one section, read this one. Each picture answers one question, and the rest of the note unpacks them.</p>
@@ -219,7 +218,7 @@ details > summary { cursor: pointer; color: var(--muted, #666); }
 
 <h3>Picture 5 · Why it's cheap</h3>
 <figure>
-<figcaption><b>Per call, to scale where it can be.</b> The whole binder call (grey) is about 40 µs on this VM. With tracing off, the change adds about 9 instructions, a few nanoseconds: about a ten-thousandth of the bar, too thin to draw, so it is shown magnified a thousand times. With <code>aidl</code> tracing on, a client slice adds about 2.35 µs (measured on native calls), mostly the two writes to the kernel's trace buffer. Everything sits behind a read-only build flag, <code>android.os.binder.flags.bpbinder_client_trace</code>, which is <b>off by default</b> and compiles the whole thing out.</figcaption>
+<figcaption><b>Per call, to scale where it can be.</b> The whole binder call (grey) is about 40 µs on this VM. With tracing off, the change adds about 9 instructions, a few nanoseconds: about a ten-thousandth of the bar, too thin to draw, so it is shown magnified a thousand times. With <code>aidl</code> tracing on, a client slice adds about 2.35 µs, mostly the two writes to the kernel's trace buffer. Everything sits behind a read-only build flag, <code>android.os.binder.flags.bpbinder_client_trace</code>, which is <b>off by default</b> and compiles the whole thing out.</figcaption>
 <svg viewBox="0 0 1000 230" role="img" aria-label="Cost to scale">
   <text x="20" y="44" class="t">tracing off</text>
   <rect x="160" y="28" width="760" height="26" class="b2"/><text x="540" y="46" text-anchor="middle" class="tms">binder call ≈ 40 µs</text>
@@ -234,7 +233,7 @@ details > summary { cursor: pointer; color: var(--muted, #666); }
   <text x="160" y="218" class="ts">memory: BpBinder stays 160 bytes; libbinder +1.4 KB of shared code</text>
 </svg>
 </figure>
-<p>The rest of the note builds these pictures up from scratch: what a process boundary is, what a Parcel is, what <code>BpBinder</code> and <code>BBinder</code> are, what the AIDL compiler generates, and how each number above was measured.</p>
+<p>The rest of the note builds these pictures up from scratch: what a process boundary is, what a Parcel is, what <code>BpBinder</code> and <code>BBinder</code> are, what the AIDL compiler generates.</p>
 
 <h2 id="wall"><span class="n">1</span>Two processes, one wall</h2>
 <p>Every Android app and every system service runs in its own <b>process</b>. A process gets its own private address space: the app's address <code>0x7f00…</code> and system_server's <code>0x7f00…</code> are completely different bytes. So the app cannot just jump into system_server's code, or hand it a pointer. There's a wall between them.</p>
@@ -1066,223 +1065,7 @@ status_t BnFoo::onTransact(...) {
   <text x="200" y="155" class="ts">The gap between the bars is time spent in the kernel and waking threads. You can now see it from the app's side, labeled.</text>
 </svg>
 </figure>
-<p>On the test device, a 12 s whole-system trace while opening Settings showed Java client slices in system_server (460), permissioncontroller (716), Settings (194), SystemUI (152), the keyboard, the launcher and phone. It had 255 distinct Java client names, none numeric; 251 of them also appeared with an identical <code>::server</code> name. 1635 of 1923 Java server slices (85%) had a matching client slice. The rest came from proxies not built with <code>--proxy_transaction_names</code> (mainline modules such as <code>ISafetyCenterManager</code>, framework-location's <code>ILocationManager</code>) and from hand-written native clients.</p>
 
-<h2 id="cost"><span class="n">15</span>How the costs were measured</h2>
-<p>"It's cheap" is a claim; here's how each number was actually produced, so you can judge it, or rerun it. Everything ran on one cuttlefish VM: x86_64, 4 virtual CPUs, Android userdebug, idle. On that build <code>libbinder.so</code> is really <code>libcore_bundle.so</code>, so that's the library that was rebuilt.</p>
-
-<h3>Rule 1: compare two builds that differ only by the change</h3>
-<p>The baseline library was built from the same source tree with the change removed. Its md5 matched the library already on the device, so "baseline" really is "what the phone runs today". Test programs loaded one library or the other via <code>LD_LIBRARY_PATH</code>, so nothing else on the device changed between runs.</p>
-
-<h3>Memory: read it out of the binary</h3>
-<ul>
-<li><b>Object size.</b> <code>new BpBinder(...)</code> compiles to <code>operator new(SIZE)</code> with a constant. Disassembling <code>BpBinder::create</code> shows <code>movl $0xa0, %edi</code> in both builds: 160 bytes. Appending the pointer naively would give <code>$0xa8</code>, 168 bytes. Android's allocator (scudo) adds a 16-byte header and rounds up to a fixed size class: 176 fits exactly, but 184 rounds up to 192. So the naive version would cost 16 real bytes per proxy. Moving one 4-byte field into a gap avoids it.</li>
-<li><b>Library size.</b> <code>llvm-size -A</code> on both libraries, section by section. <code>.text</code> grew by 1.4 KB (shared, clean, read from the file). <code>.data.rel.ro</code>, which each process gets a private copy of, grew 16 bytes and needed no new page.</li>
-</ul>
-
-<h3>CPU with tracing off: count instructions, then confirm with a stopwatch</h3>
-<p>A few nanoseconds is far below what a stopwatch can resolve on a 40 µs operation. So the primary evidence is the machine code: <code>llvm-objdump</code> of <code>BpBinder::transact</code> in both builds, diffed. The diff is about 9 instructions: load the tag word, test bit 24, branch, and store/reload a flag. Then a benchmark checks that nothing <i>else</i> changed:</p>
-<ul>
-<li><b>Native:</b> <code>binderClientTraceBenchmark</code> forks a server and makes empty synchronous calls to it. The same binary was run against both libraries, alternating baseline and patched, 8 rounds × 5 repetitions × ≥2 s each.</li>
-<li><b>Java:</b> a small Java program run with <code>app_process</code> calls <code>isUserAMonkey</code>, <code>isSafeMode</code> and <code>isInteractive</code> on system_server through their real generated proxies: 500 warm-up calls, then 30,000 timed. Again alternated stock vs patched, 8 rounds.</li>
-</ul>
-<figure>
-<figcaption><b>Tracing off: same height.</b> Medians of 40 runs (native) and 8 runs × 30,000 calls (Java). Whiskers are ±1 standard deviation across runs, so they show the run-to-run noise, about 1.3–3.9 µs. The real difference is a few nanoseconds, roughly a thousand times smaller than the whiskers.</figcaption>
-<svg viewBox="0 0 1000 300" role="img" aria-label="tracing off chart">
-<line x1="80" y1="240.0" x2="980" y2="240.0" class="ln" style="opacity:.25"/>
-<text x="72" y="244.0" text-anchor="end" class="ts">0.0</text>
-<line x1="80" y1="196.0" x2="980" y2="196.0" class="ln" style="opacity:.25"/>
-<text x="72" y="200.0" text-anchor="end" class="ts">12.0</text>
-<line x1="80" y1="152.0" x2="980" y2="152.0" class="ln" style="opacity:.25"/>
-<text x="72" y="156.0" text-anchor="end" class="ts">24.0</text>
-<line x1="80" y1="108.0" x2="980" y2="108.0" class="ln" style="opacity:.25"/>
-<text x="72" y="112.0" text-anchor="end" class="ts">36.0</text>
-<line x1="80" y1="64.0" x2="980" y2="64.0" class="ln" style="opacity:.25"/>
-<text x="72" y="68.0" text-anchor="end" class="ts">48.0</text>
-<line x1="80" y1="20.0" x2="980" y2="20.0" class="ln" style="opacity:.25"/>
-<text x="72" y="24.0" text-anchor="end" class="ts">60.0</text>
-<text x="16" y="130" class="ts" transform="rotate(-90 16 130)" text-anchor="middle">µs per call (median, ±1 sd)</text>
-<rect x="230.0" y="98.4" width="70.0" height="141.6" class="b2"/>
-<line x1="265.0" y1="91.2" x2="265.0" y2="105.6" class="ln"/>
-<line x1="259.0" y1="91.2" x2="271.0" y2="91.2" class="ln"/>
-<line x1="259.0" y1="105.6" x2="271.0" y2="105.6" class="ln"/>
-<text x="265.0" y="85.2" text-anchor="middle" class="tms">38.6</text>
-<text x="265.0" y="256" text-anchor="middle" class="ts">baseline</text>
-<rect x="310.0" y="98.3" width="70.0" height="141.7" class="bg"/>
-<line x1="345.0" y1="93.6" x2="345.0" y2="103.0" class="ln"/>
-<line x1="339.0" y1="93.6" x2="351.0" y2="93.6" class="ln"/>
-<line x1="339.0" y1="103.0" x2="351.0" y2="103.0" class="ln"/>
-<text x="345.0" y="87.6" text-anchor="middle" class="tms">38.6</text>
-<text x="345.0" y="256" text-anchor="middle" class="ts">patched</text>
-<text x="305.0" y="278" text-anchor="middle" class="tb">native: empty sync call</text>
-<rect x="680.0" y="45.7" width="70.0" height="194.3" class="b2"/>
-<line x1="715.0" y1="36.3" x2="715.0" y2="55.2" class="ln"/>
-<line x1="709.0" y1="36.3" x2="721.0" y2="36.3" class="ln"/>
-<line x1="709.0" y1="55.2" x2="721.0" y2="55.2" class="ln"/>
-<text x="715.0" y="30.3" text-anchor="middle" class="tms">53.0</text>
-<text x="715.0" y="256" text-anchor="middle" class="ts">stock</text>
-<rect x="760.0" y="45.9" width="70.0" height="194.1" class="bg"/>
-<line x1="795.0" y1="31.6" x2="795.0" y2="60.2" class="ln"/>
-<line x1="789.0" y1="31.6" x2="801.0" y2="31.6" class="ln"/>
-<line x1="789.0" y1="60.2" x2="801.0" y2="60.2" class="ln"/>
-<text x="795.0" y="25.6" text-anchor="middle" class="tms">52.9</text>
-<text x="795.0" y="256" text-anchor="middle" class="ts">patched</text>
-<text x="755.0" y="278" text-anchor="middle" class="tb">Java: BinderProxy call</text>
-<line x1="80" y1="240" x2="980" y2="240" class="ln"/>
-</svg>
-</figure>
-<p>Why alternate instead of running all baseline runs, then all patched runs? Because the machine drifts (thermal state, other work, cache state). Running the two back to back and looking at their <i>difference</i> cancels most of the drift:</p>
-<figure>
-<figcaption><b>Why interleaving and repeats matter.</b> Each dot is one round: baseline and patched run back to back, and the dot shows their difference. With the tag off the dots scatter on both sides of zero: that scatter is the VM's noise, not the change. One Java round alone could have shown anything from −3 to +9 µs, for a change that costs nanoseconds.</figcaption>
-<svg viewBox="0 0 1000 170" role="img" aria-label="paired deltas">
-<line x1="200.0" y1="20" x2="200.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="200.0" y="143" text-anchor="middle" class="ts">-10</text>
-<line x1="276.0" y1="20" x2="276.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="276.0" y="143" text-anchor="middle" class="ts">-8</text>
-<line x1="352.0" y1="20" x2="352.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="352.0" y="143" text-anchor="middle" class="ts">-6</text>
-<line x1="428.0" y1="20" x2="428.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="428.0" y="143" text-anchor="middle" class="ts">-4</text>
-<line x1="504.0" y1="20" x2="504.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="504.0" y="143" text-anchor="middle" class="ts">-2</text>
-<line x1="580.0" y1="20" x2="580.0" y2="125" class="ln" style="opacity:0.6"/>
-<text x="580.0" y="143" text-anchor="middle" class="ts">+0</text>
-<line x1="656.0" y1="20" x2="656.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="656.0" y="143" text-anchor="middle" class="ts">+2</text>
-<line x1="732.0" y1="20" x2="732.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="732.0" y="143" text-anchor="middle" class="ts">+4</text>
-<line x1="808.0" y1="20" x2="808.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="808.0" y="143" text-anchor="middle" class="ts">+6</text>
-<line x1="884.0" y1="20" x2="884.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="884.0" y="143" text-anchor="middle" class="ts">+8</text>
-<line x1="960.0" y1="20" x2="960.0" y2="125" class="ln" style="opacity:0.2"/>
-<text x="960.0" y="143" text-anchor="middle" class="ts">+10</text>
-<text x="580" y="161" text-anchor="middle" class="ts">patched − baseline, µs per call (each dot is one interleaved round)</text>
-<text x="188" y="44.0" text-anchor="end" class="t">native, tag off</text>
-<circle cx="454.3" cy="40.0" r="5" class="fg"/>
-<circle cx="593.8" cy="40.0" r="5" class="fg"/>
-<circle cx="633.9" cy="40.0" r="5" class="fg"/>
-<circle cx="492.7" cy="40.0" r="5" class="fg"/>
-<circle cx="602.2" cy="40.0" r="5" class="fg"/>
-<circle cx="544.7" cy="40.0" r="5" class="fg"/>
-<circle cx="608.3" cy="40.0" r="5" class="fg"/>
-<circle cx="562.3" cy="40.0" r="5" class="fg"/>
-<line x1="561.5" y1="28.0" x2="561.5" y2="52.0" class="lnr" style="stroke-width:2"/>
-<text x="567.5" y="28.0" class="tms tr">mean -0.5</text>
-<text x="188" y="109.0" text-anchor="end" class="t">Java, tag off</text>
-<circle cx="475.6" cy="105.0" r="5" class="fg"/>
-<circle cx="902.9" cy="105.0" r="5" class="fg"/>
-<circle cx="478.6" cy="105.0" r="5" class="fg"/>
-<circle cx="593.4" cy="105.0" r="5" class="fg"/>
-<circle cx="582.8" cy="105.0" r="5" class="fg"/>
-<circle cx="614.5" cy="105.0" r="5" class="fg"/>
-<circle cx="711.4" cy="105.0" r="5" class="fg"/>
-<circle cx="531.1" cy="105.0" r="5" class="fg"/>
-<line x1="611.3" y1="93.0" x2="611.3" y2="117.0" class="lnr" style="stroke-width:2"/>
-<text x="617.3" y="93.0" class="tms tr">mean +0.8</text>
-</svg>
-</figure>
-
-<h3>CPU with tracing on: measure the parts, then the whole</h3>
-<ul>
-<li><b>Parts:</b> two microbenchmarks in a tight loop. <code>BM_formatName</code> is the same <code>snprintf</code> that builds the name: 118 ns. <code>BM_traceBeginEnd</code> is one <code>atrace_begin</code> + <code>atrace_end</code>, i.e. two writes to <code>trace_marker</code>: 887 ns.</li>
-<li><b>Whole, native:</b> the benchmark has two services in the same server process: one proxy <i>with</i> a table, one <i>without</i>. With the <code>aidl</code> tag on, both pay for the server's slice; only one pays for the client's. The difference between them is the client slice: +2.35 µs (n = 15 runs each, standard error 0.65 µs).</li>
-<li><b>Whole, Java:</b> not cleanly measured. With the tag on, the server slices turn on too, and on this VM the end-to-end Java numbers were too noisy to isolate the client part. By construction, a traced Java call does the native work plus, after the first call per code, one mutex and one hash lookup in <code>resolveName</code>. With tracing off, Java adds nothing per call; registration costs one JNI pointer check per Proxy construction.</li>
-</ul>
-<figure>
-<figcaption><b>Tracing on: what each slice adds.</b> Left: the two parts measured on their own in a tight loop. Right: the measured difference between calls with and without a client slice, inside a real binder call (whiskers: ±1 standard error). The in-context cost is higher than the parts because the <code>trace_marker</code> writes run with cold caches right after the binder context switch. Native only: the Java tag-on cost was not cleanly measured (see above).</figcaption>
-<svg viewBox="0 0 1000 300" role="img" aria-label="tracing on chart">
-<line x1="80" y1="240.0" x2="980" y2="240.0" class="ln" style="opacity:.25"/>
-<text x="72" y="244.0" text-anchor="end" class="ts">0.00</text>
-<line x1="80" y1="196.0" x2="980" y2="196.0" class="ln" style="opacity:.25"/>
-<text x="72" y="200.0" text-anchor="end" class="ts">1.20</text>
-<line x1="80" y1="152.0" x2="980" y2="152.0" class="ln" style="opacity:.25"/>
-<text x="72" y="156.0" text-anchor="end" class="ts">2.40</text>
-<line x1="80" y1="108.0" x2="980" y2="108.0" class="ln" style="opacity:.25"/>
-<text x="72" y="112.0" text-anchor="end" class="ts">3.60</text>
-<line x1="80" y1="64.0" x2="980" y2="64.0" class="ln" style="opacity:.25"/>
-<text x="72" y="68.0" text-anchor="end" class="ts">4.80</text>
-<line x1="80" y1="20.0" x2="980" y2="20.0" class="ln" style="opacity:.25"/>
-<text x="72" y="24.0" text-anchor="end" class="ts">6.00</text>
-<text x="16" y="130" class="ts" transform="rotate(-90 16 130)" text-anchor="middle">µs added per call</text>
-<rect x="230.0" y="235.7" width="70.0" height="4.3" class="ba"/>
-<text x="265.0" y="229.7" text-anchor="middle" class="tms">0.12</text>
-<text x="265.0" y="256" text-anchor="middle" class="ts">snprintf</text>
-<rect x="310.0" y="207.5" width="70.0" height="32.5" class="ba"/>
-<text x="345.0" y="201.5" text-anchor="middle" class="tms">0.89</text>
-<text x="345.0" y="256" text-anchor="middle" class="ts">B+E writes</text>
-<text x="305.0" y="278" text-anchor="middle" class="tb">parts (hot loop)</text>
-<rect x="680.0" y="153.9" width="70.0" height="86.1" class="bw"/>
-<line x1="715.0" y1="130.2" x2="715.0" y2="177.7" class="ln"/>
-<line x1="709.0" y1="130.2" x2="721.0" y2="130.2" class="ln"/>
-<line x1="709.0" y1="177.7" x2="721.0" y2="177.7" class="ln"/>
-<text x="715.0" y="124.2" text-anchor="middle" class="tms">2.35</text>
-<text x="715.0" y="256" text-anchor="middle" class="ts">native</text>
-<text x="795.0" y="214" text-anchor="middle" class="ts">not</text>
-<text x="795.0" y="228" text-anchor="middle" class="ts">measured</text>
-<text x="795.0" y="256" text-anchor="middle" class="ts">Java</text>
-<text x="755.0" y="278" text-anchor="middle" class="tb">whole client slice (in context)</text>
-<line x1="80" y1="240" x2="980" y2="240" class="ln"/>
-</svg>
-</figure>
-
-<h3>Trace size: let the kernel count</h3>
-<p>The ftrace buffer keeps per-CPU statistics, including how many bytes it holds. The measurement:</p>
-<ol>
-<li>Enlarge the buffer to 32 MiB per CPU, so nothing gets overwritten.</li>
-<li>Clear it, and run exactly 10,000 calls without a table. Read the bytes: 1,221,512. Those are the server's slices.</li>
-<li>Clear it, and run exactly 10,000 calls with a table. Read the bytes: 2,421,964. That's the server's slices plus the client's.</li>
-<li>Check: overruns 0, and 10,000 client slices counted in the text.</li>
-</ol>
-<p>The difference divided by 10,000 is 120.0 bytes per client slice.</p>
-<figure>
-<figcaption><b>Trace bytes per client slice grow with the name length.</b> The line is <code>57 + strlen(name)</code>: two ftrace events with about 22 bytes of fixed header each, plus the text <code>"B|pid|" + name</code> and <code>"E|pid"</code>. The dot is the measurement: 10,000 calls with a 63-character name added 1,200,452 bytes to the ftrace buffer, 120.0 per call, with 0 overruns. The shaded band is the 10th–90th percentile of 1,850 real client slice names in the whole-device trace (59–87 characters, median 76, so about 133 bytes per slice).</figcaption>
-<svg viewBox="0 0 1000 270" role="img" aria-label="bytes per slice">
-<rect x="455" y="20" width="178" height="200" class="bg" style="opacity:.35"/>
-<line x1="563.1" y1="20" x2="563.1" y2="220" class="lng dash"/>
-<text x="544" y="34" text-anchor="middle" class="ts tg">real names: 10th–90th percentile, median 76</text>
-<line x1="80.0" y1="220.0" x2="80.0" y2="225.0" class="ln"/>
-<text x="80.0" y="238.0" text-anchor="middle" class="ts">0</text>
-<line x1="207.1" y1="220.0" x2="207.1" y2="225.0" class="ln"/>
-<text x="207.1" y="238.0" text-anchor="middle" class="ts">20</text>
-<line x1="334.3" y1="220.0" x2="334.3" y2="225.0" class="ln"/>
-<text x="334.3" y="238.0" text-anchor="middle" class="ts">40</text>
-<line x1="461.4" y1="220.0" x2="461.4" y2="225.0" class="ln"/>
-<text x="461.4" y="238.0" text-anchor="middle" class="ts">60</text>
-<line x1="588.6" y1="220.0" x2="588.6" y2="225.0" class="ln"/>
-<text x="588.6" y="238.0" text-anchor="middle" class="ts">80</text>
-<line x1="715.7" y1="220.0" x2="715.7" y2="225.0" class="ln"/>
-<text x="715.7" y="238.0" text-anchor="middle" class="ts">100</text>
-<line x1="842.9" y1="220.0" x2="842.9" y2="225.0" class="ln"/>
-<text x="842.9" y="238.0" text-anchor="middle" class="ts">120</text>
-<line x1="970.0" y1="220.0" x2="970.0" y2="225.0" class="ln"/>
-<text x="970.0" y="238.0" text-anchor="middle" class="ts">140</text>
-<line x1="80" y1="220.0" x2="970" y2="220.0" class="ln" style="opacity:.2"/>
-<text x="72" y="224.0" text-anchor="end" class="ts">0</text>
-<line x1="80" y1="170.0" x2="970" y2="170.0" class="ln" style="opacity:.2"/>
-<text x="72" y="174.0" text-anchor="end" class="ts">50</text>
-<line x1="80" y1="120.0" x2="970" y2="120.0" class="ln" style="opacity:.2"/>
-<text x="72" y="124.0" text-anchor="end" class="ts">100</text>
-<line x1="80" y1="70.0" x2="970" y2="70.0" class="ln" style="opacity:.2"/>
-<text x="72" y="74.0" text-anchor="end" class="ts">150</text>
-<line x1="80" y1="20.0" x2="970" y2="20.0" class="ln" style="opacity:.2"/>
-<text x="72" y="24.0" text-anchor="end" class="ts">200</text>
-<path d="M80.0,163.0 L970.0,23.0" class="lna" style="stroke-width:2"/>
-<circle cx="480.5" cy="100.0" r="6" class="fr"/>
-<text x="490.5" y="104.0" class="tms tr">measured: 63 chars → 120 B</text>
-<text x="525" y="264" text-anchor="middle" class="ts">slice name length (characters)</text>
-<text x="18" y="120" class="ts" transform="rotate(-90 18 120)" text-anchor="middle">bytes per call</text>
-</svg>
-</figure>
-
-<h3>Correctness: count slices, match names</h3>
-<p>A cost is only interesting if the feature works. Every trace run was checked with SQL over the trace (trace_processor):</p>
-<ul>
-<li><b>Counts:</b> N calls must give exactly N client slices. 2000 calls gave 2000 slices; 800 gave 800.</li>
-<li><b>Names:</b> client and server names must match. In the Java end-to-end test (800 calls each to <code>isUserAMonkey</code>, <code>isSafeMode</code>, <code>isInteractive</code>) client and server names were identical. Across the whole-device trace, of 255 distinct Java client names (none numeric), 251 had an identical server name in the same trace.</li>
-<li><b>No duplicates from libbinder:</b> no call got two libbinder client slices. NDK and Rust proxies have no <code>BpBinder</code> table, so <code>BpBinder</code> doesn't add a second slice to the one <code>libbinder_ndk</code> already emits. The only doubled names come from interfaces that still bake in <code>gen_trace</code> slices (<code>…::cppClient</code>, §9).</li>
-</ul>
-<p>The raw numbers, benchmark JSON and trace files are linked from <a href="index.html">the report</a>.</p>
 
 <h2 id="glossary">Glossary</h2>
 <table>

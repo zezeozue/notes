@@ -47,27 +47,25 @@ details > summary { cursor: pointer; color: var(--muted, #666); }
   <a href="#how">1 · How it works</a>
   <a href="#java">2 · Java: two options</a>
   <a href="#flag">3 · Flag</a>
-  <a href="#cost">4 · Cost</a>
-  <a href="#evidence">5 · Evidence</a>
-  <a href="#open">6 · Open issues</a>
-  <a href="#method">Method</a>
+  <a href="#cost">4 · Expected cost</a>
+  <a href="#open">5 · Open questions</a>
 </nav>
 
 <main id="top">
 <h1>Client-side AIDL slices from BpBinder</h1>
-<p class="lead">libbinder already emits <code>AIDL::&lt;backend&gt;::&lt;descriptor&gt;::&lt;method&gt;::server</code> for every incoming AIDL call. This change makes <code>BpBinder::transact()</code> emit the matching <code>::client</code> slice, with the same name, through the existing <code>aidl</code> atrace category. Everything sits behind a flag that is off by default.</p>
-<p class="m">Status: a prototype of changes to AOSP's libbinder, frameworks/base and the AIDL compiler, not merged. Numbers are from a Cuttlefish x86_64 userdebug build.</p>
+<p class="lead">libbinder already emits <code>AIDL::&lt;backend&gt;::&lt;descriptor&gt;::&lt;method&gt;::server</code> for every incoming AIDL call. This proposal makes <code>BpBinder::transact()</code> emit the matching <code>::client</code> slice, with the same name, through the existing <code>aidl</code> atrace category. Everything sits behind a flag that is off by default.</p>
+<p class="m">This is a design proposal for AOSP's libbinder, <code>frameworks/base</code> and the AIDL compiler.</p>
 <p class="m">New to binder? <a href="basics.html">Binder from scratch</a> walks through Parcels, BpBinder/BBinder, generated code and how each end gets its name.</p>
 
 <h2 id="tldr">TL;DR</h2>
 <ul>
-<li><b>Mechanism:</b> a proxy's <code>BpBinder</code> gets one pointer to its interface's <code>TransactionCodeData</code>. With the <code>aidl</code> tag on, <code>transact()</code> wraps user calls in <code>AIDL::&lt;backend&gt;::&lt;descriptor&gt;::&lt;method&gt;::client</code>.</li>
+<li><b>Problem:</b> libbinder names the server end of every AIDL call (<code>AIDL::&lt;backend&gt;::&lt;descriptor&gt;::&lt;method&gt;::server</code>), but for cpp and Java clients the calling thread only shows that it is blocked in binder.</li>
+<li><b>Proposal:</b> give each proxy's <code>BpBinder</code> one pointer to its interface's <code>TransactionCodeData</code>. With the <code>aidl</code> atrace tag on, <code>BpBinder::transact()</code> wraps user calls in <code>…::client</code>, with the same name as the server slice.</li>
 <li><b>cpp:</b> the generated <code>BpFoo</code> constructor attaches the static table AIDL already generates for the server.</li>
-<li><b>Java (Option A):</b> the generated <code>Stub.Proxy</code> constructor calls <code>BinderProxy.setTransactionNames(remote, DESCRIPTOR, Stub.class)</code>. Method names come from that Stub's generated <code>getDefaultTransactionName()</code>, fetched once per method and cached. No reflection, no guessing.</li>
-<li><b>Java (Option B, separate CL):</b> one file, <code>BinderProxy.java</code>. Its cache uses the same scheme as the old server-side <code>Binder.getTransactionTraceName()</code>: a static map from descriptor to a name array, plus a <code>volatile</code> reference on each proxy. A traced call costs one field read and one array read; the tracing-off check costs 6 ns. The Stub is found by name from the <code>Stub.Proxy</code> frame on the stack. It covers more proxies (97–98% vs 77–85% of Java server slices paired), but matching the Stub to the descriptor by name is a convention, not a contract. Land A or B, not both.</li>
+<li><b>Java, option A:</b> the generated <code>Stub.Proxy</code> constructor calls <code>BinderProxy.setTransactionNames(remote, DESCRIPTOR, Stub.class)</code>. The method names come from that Stub's generated <code>getDefaultTransactionName()</code>, fetched once per method and cached. There is no reflection and no guessing.</li>
+<li><b>Java, option B:</b> a self-contained change to <code>BinderProxy.java</code> that finds the Stub by reflection and caches names the way the old server-side <code>Binder.getTransactionTraceName()</code> did. It is smaller and covers more proxies, but matching the Stub to the descriptor by name is a convention, not a contract. Pick one, not both.</li>
 <li><b>NDK/Rust:</b> already traced by <code>libbinder_ndk</code>; no change.</li>
-<li><b>Cost:</b> <code>sizeof(BpBinder)</code> unchanged. With tracing off, about 9 instructions per call and no measurable difference. With tracing on, +2.35 µs per native call and about 57 + strlen(name) bytes per slice.</li>
-<li><b>Verified, both options, on device:</b> Java client names are identical to the server names, and no client is numeric where the server has a name. Share of Java server slices with a matching client slice: A 77–85% (misses proxies not built with the new option), B 97–98%.</li>
+<li><b>Cost:</b> <code>sizeof(BpBinder)</code> is unchanged. With tracing off, a few instructions per call. Everything is behind a flag that is off by default.</li>
 </ul>
 
 <h2 id="how">1 · How it works</h2>
@@ -154,7 +152,7 @@ if (traced) trace_end(ATRACE_TAG_AIDL);</code></pre>
 <li><b>Opt-in</b> per build rule, because <code>BinderProxy.setTransactionNames</code> is hidden API. It is on for <code>framework-minus-apex</code>, and for <code>aidl_interface</code> Java backends with <code>gen_trace</code>, <code>platform_apis</code> and no <code>sdk_version</code>.</li>
 </ul>
 
-<h3>Option B: reflection in BinderProxy (separate CL)</h3>
+<h3>Option B: reflection in BinderProxy</h3>
 <p>Everything happens in <code>BinderProxy.transact()</code>, in Java. The cache uses the same scheme as the server-side cache that <code>Binder.getTransactionTraceName()</code> used before Java binder tracing moved to libbinder: a static map from descriptor to an array of finished slice names, and a per-object reference to that array so later calls skip the map.</p>
 <figure>
 <figcaption><b>Option B.</b> Green: every traced call (one field read, one array read; no lock, no allocation). Blue: first traced call on each <code>BinderProxy</code>. Amber: first call per interface (find the Stub) and per code (call it). The tracing-off path is the grey check only.</figcaption>
@@ -210,103 +208,40 @@ private String getAidlTraceName(Parcel data, int code) {
 </table>
 <table>
 <tr><th></th><th>A: registration</th><th>B: reflection</th></tr>
-<tr><td>Size</td><td>3 CLs: libbinder, JNI + BinderProxy, AIDL codegen</td><td class="good">1 file, ~140 lines with comments; own flag <code>android.os.binder_proxy_client_trace</code></td></tr>
+<tr><td>Size</td><td>3 changes: libbinder, JNI + BinderProxy, AIDL codegen</td><td class="good">1 file, ~140 lines with comments; own flag <code>android.os.binder_proxy_client_trace</code></td></tr>
 <tr><td>How the Stub is found</td><td class="good">passed in by the Proxy that owns it</td><td class="warn">matched by name: the <code>&lt;descriptor&gt;.Stub.Proxy</code> frame on the calling stack, else <code>Class.forName(&lt;descriptor&gt;$Stub)</code></td></tr>
 <tr><td>Assumes</td><td>proxy built with <code>--proxy_transaction_names</code></td><td>descriptor == Java interface name (true for generated AIDL); one interface per BinderProxy (as the server cache assumed per Binder)</td></tr>
-<tr><td>Coverage</td><td class="warn">only opted-in build rules (77–85% of Java server slices in §5)</td><td class="good">every Java proxy whose Stub is loadable, incl. mainline modules and apps (97–98%)</td></tr>
-<tr><td>Tracing off, per call</td><td class="good">nothing in Java; ~9 instructions in BpBinder</td><td>6 ns with its flag on (<code>Trace.isTagEnabled</code>), ~0 with it off (microbenchmark)</td></tr>
+<tr><td>Coverage</td><td class="warn">only proxies built with the new AIDL option</td><td class="good">every Java proxy whose Stub is loadable, incl. mainline modules and apps</td></tr>
+<tr><td>Tracing off, per call</td><td class="good">nothing in Java; ~9 instructions in BpBinder</td><td>one flag read and one <code>Trace.isTagEnabled</code> check in <code>BinderProxy.transact</code></td></tr>
 <tr><td>Tracing on, per call</td><td>native lookup</td><td>field read + array read; no lock, no allocation (peek once per BinderProxy)</td></tr>
-<tr><td>cpp clients</td><td class="good">same mechanism</td><td>not covered (needs the libbinder + AIDL cpp CLs anyway)</td></tr>
+<tr><td>cpp clients</td><td class="good">same mechanism</td><td>not covered (needs the libbinder + AIDL cpp changes anyway)</td></tr>
 </table>
-<div><b>Tested on its own</b> (flag on via <code>aflags</code>, Option A not installed):<ul><li>Java e2e: 800/800 client slices per method, with names identical to the server.</li><li>Whole device: 276 distinct Java client names. The 22 <code>#&lt;code&gt;</code> ones are <code>#&lt;code&gt;</code> on the server too (no generated names, e.g. <code>ILauncherProxy</code>, <code>IContentProvider</code>). <b>97–98%</b> of Java server slices have a matching client slice.</li><li>A hand-written nested interface (<code>test.LoaderTest.IFoo</code>), called with a null context class loader, is named through the <code>Stub.Proxy</code> frame. Option A gives it no slice, because it is not registered.</li><li>Cost: 6 ns per call with tracing off (0 with the flag off); +2.3 µs median per traced call, the same as native libbinder.</li></ul></div>
+
 
 <h2 id="flag">3 · Flag</h2>
-<p><code>android.os.binder.flags.bpbinder_client_trace</code> lives in <code>libs/binder/flags.aconfig</code>, next to <code>binder_stats_v3</code> (namespace <code>system_performance</code>). It is <b>off by default</b> and fixed read-only, like every flag in that package (libbinder runs before <code>/metadata</code> is mounted). That makes it a <code>constexpr</code>: when off, <code>setTransactionCodeMap()</code> returns immediately, the check in <code>transact()</code> compiles away, and <code>BinderProxy.setTransactionNames</code> returns at once. The Java and AIDL CLs have no flag of their own; everything they do goes through the libbinder flag.</p>
+<p><code>android.os.binder.flags.bpbinder_client_trace</code> lives in <code>libs/binder/flags.aconfig</code>, next to <code>binder_stats_v3</code> (namespace <code>system_performance</code>). It is <b>off by default</b> and fixed read-only, like every flag in that package (libbinder runs before <code>/metadata</code> is mounted). That makes it a <code>constexpr</code>: when off, <code>setTransactionCodeMap()</code> returns immediately, the check in <code>transact()</code> compiles away, and <code>BinderProxy.setTransactionNames</code> returns at once. The Java and AIDL change have no flag of their own; everything they do goes through the libbinder flag.</p>
 
-<h2 id="cost">4 · Cost</h2>
+<h2 id="cost">4 · Expected cost</h2>
 <table>
-<tr><th>What</th><th>Cost</th><th>Source</th></tr>
-<tr><td><code>BpBinder</code> object</td><td class="good">0 B (160 → 160)</td><td><code>operator new</code> size in the built binary</td></tr>
-<tr><td><code>transact()</code>, tracing off</td><td class="good">~9 instructions; 38.6 µs both builds</td><td>disassembly diff; interleaved A/B</td></tr>
-<tr><td>Java call, tracing off</td><td class="good">52.98 → 52.94 µs</td><td>app_process client, 8 interleaved runs × 30k calls</td></tr>
-<tr><td>Proxy construction (Java, A)</td><td class="good">1 JNI call; returns after a pointer check once the BpBinder has a table</td><td>code</td></tr>
-<tr><td>Traced native call</td><td class="warn">+2.35 µs ± 0.65</td><td>benchmark, table vs no table, tag on</td></tr>
-<tr><td>Traced Java call, B</td><td class="warn">+2.3 µs median (per-run noise ±4 µs)</td><td>same boot, B's flag toggled with <code>aflags -i</code>, 10 interleaved rounds × 30k calls</td></tr>
-<tr><td>Traced Java call, A</td><td>≈ +2.3 µs, low confidence</td><td>across boots: A's tag on−off delta (11.5 µs) minus server-only delta (9.2 µs); A's flag is a constexpr and cannot be toggled</td></tr>
-<tr><td>Tracing-off check, B</td><td class="good">6 ns/call with flag on; ~0 off</td><td>microbenchmark, 20M iterations × 5</td></tr>
-<tr><td>Trace buffer</td><td class="warn">≈ 57 + strlen(name) B per slice (median name 76 chars)</td><td>ftrace stats, 10,000 calls</td></tr>
-<tr><td>libbinder</td><td>+1.4 KB .text, +16 B .data.rel.ro</td><td><code>llvm-size -A</code></td></tr>
+<tr><th>What</th><th>Cost</th></tr>
+<tr><td><code>BpBinder</code> object</td><td class="good">0 B: the pointer reuses existing padding (moving <code>mTrackedUid</code> next to <code>mStability</code>)</td></tr>
+<tr><td><code>transact()</code>, tracing off</td><td class="good">one load and one bit test of the atrace tag word (~9 instructions)</td></tr>
+<tr><td>Java proxy creation, option A</td><td class="good">one JNI call that returns after a pointer check once the <code>BpBinder</code> has a table</td></tr>
+<tr><td>Java <code>transact()</code>, tracing off, option B</td><td>one flag read and one <code>Trace.isTagEnabled</code> check (a few ns)</td></tr>
+<tr><td>Traced call</td><td class="warn">one <code>snprintf</code> into a stack buffer plus an atrace begin/end (low µs, dominated by the atrace write); after the first call per method, the name lookup is a table or array read</td></tr>
+<tr><td>Trace buffer</td><td class="warn">≈ 57 + strlen(name) bytes per slice</td></tr>
+<tr><td>libbinder size</td><td>about 1.4 KB of text</td></tr>
 </table>
-<details><summary>Object layout, instructions, A/B tables</summary>
-<p>Moving <code>mTrackedUid</code> next to <code>mStability</code> merges two 4-byte holes into one 8-byte slot for the pointer. Appending it instead would make the object 168 B, which scudo rounds up from the 176-byte to the 192-byte class.</p>
-<pre><code>movq   GOT(atrace_enabled_tags)(%rip), %rax
-testb  $0x1, 0x3(%rax)             <span class="c"># bit 24 = ATRACE_TAG_AIDL</span>
-jne    &lt;trace path&gt;
-movl   $0x0, -0x64(%rbp)           <span class="c"># traced = false</span>
-…      2 spill/reload movs
-callq  IPCThreadState::transact
-cmpb   $0x0, -0x64(%rbp)
-je     …</code></pre>
-<table>
-<tr><th>Measurement</th><th>Result</th></tr>
-<tr><td>A/B tracing off, baseline / with CL</td><td>38,617 / 38,642 ns median (n = 40 each); paired delta −51 ns, noise 1.6 µs</td></tr>
-<tr><td>Tag on, proxy without / with table</td><td>42,830 / 45,177 ns (n = 15 each)</td></tr>
-<tr><td><code>snprintf</code> of the name; <code>atrace_begin</code> + <code>end</code> hot loop</td><td>118 ns; 887 ns</td></tr>
-<tr><td>ftrace bytes, 10,000 calls, 63-char name</td><td>1,200,452 B → 120 B/slice, 0 overruns</td></tr>
-</table>
-</details>
-
-<h2 id="evidence">5 · Evidence</h2>
-<p>All three CLs built into one image and installed on cuttlefish with the flag set on locally. Captures:</p>
-<ul>
-<li><code>bct_clean_system_wide.pftrace</code>: <b>Option A, whole device</b> while launching Settings (12 s).
-<table>
-<tr><th>Process</th><th>Java <code>::client</code></th><th>Java <code>::server</code></th><th>cpp <code>::client</code></th></tr>
-<tr><td>system_server</td><td>435</td><td>757</td><td>253</td></tr>
-<tr><td>com.android.settings</td><td>194</td><td>56</td><td>100</td></tr>
-<tr><td>com.android.systemui</td><td>144</td><td>240</td><td>150</td></tr>
-<tr><td>com.android.permissioncontroller</td><td>78</td><td>7</td><td>2</td></tr>
-<tr><td>com.android.inputmethod.latin</td><td>69</td><td>25</td><td>20</td></tr>
-<tr><td>com.android.launcher3</td><td>46</td><td>141</td><td>129</td></tr>
-</table>
-248 distinct Java client names; the 2 numeric ones are numeric on the server too. <b>Coverage:</b> 971 of 1,258 Java server slices (77%; 85% in an earlier run) have a matching client slice. The gaps are proxies not built with <code>--proxy_transaction_names</code>:
-<ul>
-<li>mainline modules: <code>ISafetyCenterManager</code>, <code>INetworkStatsService</code>;</li>
-<li><code>framework-location</code>: <code>ILocationManager</code>;</li>
-<li>AIDL built without transaction names, e.g. <code>ILauncherProxy</code>;</li>
-<li>hand-written native clients.</li>
-</ul></li>
-<li><code>bct_clean_java_client.pftrace</code>: <b>Option A, Java</b>. An <code>app_process</code> client calls <code>IActivityManager.isUserAMonkey</code>, <code>IPackageManager.isSafeMode</code> and <code>IPowerManager.isInteractive</code> 800 times each. Result: 800 <code>::client</code> slices each, one for one with system_server's <code>::server</code>.</li>
-<li><code>bct_rpcbench.pftrace</code>: <b>cpp</b>, 2000 <code>AIDL::cpp::IBinderRpcBenchmark::repeatString::client</code> slices.</li>
-<li><code>bct_rust.pftrace</code>: <b>Rust</b>, no change needed. <code>AIDL::ndk::…::client</code> slices come from <code>libbinder_ndk</code>.</li>
-<li><code>bct_reflect_system_wide.pftrace</code>, <code>bct_reflect_java_client.pftrace</code>, <code>bct_reflect_loader_test.pftrace</code>: the same captures with <b>Option B</b> instead of A, plus the class-loader / nested-interface test.</li>
-</ul>
-<details><summary>Tests</summary>
-<table>
-<tr><th>Suite</th><th>Result (flag on, on device)</th></tr>
-<tr><td><code>binderClientTraceTest</code> (new): exact names read back from ftrace, B/E balance including oneway, unknown codes, legacy-sized tables, resolver path, no slice without a table / for control codes / with the tag off</td><td>17 pass, 1 skipped (the flag-off case)</td></tr>
-<tr><td><code>binderUnitTest</code> / <code>binderLibTest</code> / <code>binderAllocationLimits</code></td><td>119 / 91 / 16 pass</td></tr>
-<tr><td><code>aidl_unittests</code>, golden check</td><td>1172 pass; goldens updated</td></tr>
-</table>
-</details>
-
-<h2 id="open">6 · Open issues</h2>
+<h2 id="open">5 · Open questions</h2>
 <ul>
 <li><b>Coverage (A):</b> proxies built outside opted-in rules get no Java client slice. That covers mainline modules, <code>framework-location</code> and apps. Extending it means turning on <code>--proxy_transaction_names</code> in more rules; module SDK builds would need a non-hidden API. Option B does not have this gap.</li>
-<li><b>Hidden API (A):</b> a non-platform-signed app linking a <code>platform_apis</code> AIDL library calls <code>@hide</code> <code>setTransactionNames</code>. Untested.</li>
+<li><b>Hidden API (A):</b> a non-platform-signed app linking a <code>platform_apis</code> AIDL library calls <code>@hide</code> <code>setTransactionNames</code>. To be checked.</li>
 <li><b>Lifetime:</b> a cpp table pointer dangles if its library is <code>dlclose</code>d while a proxy holds it. Java tables are never freed.</li>
 <li><b>Duplicates:</b> interfaces that still set cpp <code>gen_trace</code> also emit <code>…::cppClient</code>. Remove cpp <code>gen_trace</code> after this lands.</li>
-<li><b>Measurement:</b> isolate the traced Java cost and rerun the benchmarks on arm64.</li>
+<li><b>Measurement:</b> benchmark both Java options on arm64 hardware before choosing.</li>
 </ul>
 
-<details id="method"><summary>Method</summary>
-<ul>
-<li>Device: cuttlefish <code>aosp_cf_x86_64_only_phone</code> userdebug, 4 vCPU. The full build was installed with <code>adevice update</code>; the flag was enabled with a local release-config value that is not part of the CLs.</li>
-<li>A/B timings come from earlier runs: same tree, baseline vs patched <code>libcore_bundle.so</code> loaded through <code>LD_LIBRARY_PATH</code>, 8 alternating rounds. Tag on: <code>debug.atrace.tags.enableflags=0x1000000</code>, <code>tracing_on=1</code>.</li>
-<li>Bytes: <code>buffer_size_kb=32768</code>, exactly 10,000 calls, sum of <code>bytes:</code> in <code>per_cpu/*/stats</code>.</li>
-<li>Coverage query: Java <code>::server</code> slices whose name (with the backend normalized) has any <code>::client</code> slice in the trace.</li>
-</ul>
-</details>
+
 <footer class="site-foot">
   <a href="../index.html">&larr; All notes</a>
   <a href="#top">Back to top &uarr;</a>
